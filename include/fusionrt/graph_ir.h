@@ -120,7 +120,8 @@ struct MiniGraph {
 
 inline constexpr bool supports_q8_1_decode(DType dtype) {
     return dtype == DType::Q4_A || dtype == DType::Q8_A || dtype == DType::Q6_K ||
-           dtype == DType::Q4_K || dtype == DType::Q5_K;
+           dtype == DType::Q4_K || dtype == DType::Q5_K ||
+           dtype == DType::Q4_KA || dtype == DType::Q6_A;
 }
 
 // Compiler optimization passes:

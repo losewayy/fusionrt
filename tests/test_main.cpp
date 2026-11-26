@@ -807,6 +807,71 @@ void test_cuda_wave1_decode(CudaContext& ctx) {
     ctx.weight_arena().reset(weights_mark);
 }
 
+void test_repacked_k_quants(CudaContext& ctx) {
+    constexpr int M = 64, N = 1025, K = 256;
+    std::mt19937_64 rng(91);
+    auto& arena = ctx.scratch_arena();
+    const auto mark = arena.mark();
+    const auto x = ctx.upload(rand_f32({M, K}, rng), false);
+    const auto qx = arena.alloc_tensor({M, K}, DType::Q8_1);
+    const auto y = arena.alloc_tensor({M, N}, DType::F32);
+    cuda_ops::quantize_x_q8_1(x.ptr<float>(), nullptr, nullptr, nullptr, qx.ptr(), M, K, 0, ctx.stream());
+    const auto activation = ctx.download(qx);
+    std::vector<float> full_x(M * K);
+    for (int i = 0; i < M * K; ++i) {
+        const auto& blk = activation.data<BlockQ8_1>()[i / 32];
+        full_x[i] = blk.d * reinterpret_cast<const int8_t*>(blk.qs)[i % 32];
+    }
+    auto ids = HostTensor::create({2}, DType::I32);
+    ids.data<int32_t>()[0] = N - 1;
+    ids.data<int32_t>()[1] = 0;
+    const auto d_ids = ctx.upload(ids, false);
+    const auto embeddings = arena.alloc_tensor({2, K}, DType::F32);
+    auto check = [&]<typename Raw, typename Packed>(DType raw_type, DType packed_type,
+        void (*repack)(const Raw*, Packed*, int64_t), void (*dequant)(const Raw*, float*, int64_t),
+        void (*unpack)(const Packed*, float*, int64_t), auto gemv, auto mmq) {
+        auto raw = HostTensor::create({N, K}, raw_type);
+        auto packed = HostTensor::create({N, K}, packed_type);
+        for (auto& byte : raw.storage) byte = static_cast<uint8_t>(rng());
+        for (int n = 0; n < N; ++n) {
+            raw.data<Raw>()[n].d = fp32_to_fp16(0.00021f);
+            if constexpr (std::is_same_v<Raw, BlockQ4_K>) raw.data<Raw>()[n].dmin = fp32_to_fp16(0.00031f);
+        }
+        std::vector<float> reference(N * K), restored(N * K);
+        repack(raw.data<Raw>(), packed.data<Packed>(), N * K);
+        dequant(raw.data<Raw>(), reference.data(), N * K);
+        unpack(packed.data<Packed>(), restored.data(), N * K);
+        if (reference != restored) throw std::runtime_error("K-quant repacking changed dequantized weights");
+
+        const std::string label = dtype_name(packed_type);
+        const auto w = ctx.upload(packed, false);
+        cuda_ops::embed_lookup_f32(w.ptr(), packed_type, d_ids.ptr<int32_t>(), embeddings.ptr<float>(), 2, K, ctx.stream());
+        const auto embed = ctx.download(embeddings);
+        std::vector<double> expect_embed(reference.end() - K, reference.end());
+        expect_embed.insert(expect_embed.end(), reference.begin(), reference.begin() + K);
+        expect_close({embed.data<float>(), embed.data<float>() + 2 * K}, expect_embed, 1e-6, 1e-6, label + " embedding");
+
+        std::vector<double> expected(M * N);
+        for (int m = 0; m < M; ++m) {
+            for (int n = 0; n < N; ++n) {
+                for (int k = 0; k < K; ++k) expected[m * N + n] += double(full_x[m * K + k]) * reference[n * K + k];
+            }
+        }
+        gemv(qx.ptr(), w.ptr(), y.ptr<float>(), N, K, ctx.stream(), GemvGeometry{4, 2});
+        auto got = ctx.download(y);
+        expect_close({got.data<float>(), got.data<float>() + N}, {expected.begin(), expected.begin() + N},
+                     3e-5, 1e-5, label + " GEMV");
+        mmq(qx.ptr(), w.ptr(), y.ptr<float>(), M, N, K, ctx.stream());
+        got = ctx.download(y);
+        expect_close({got.data<float>(), got.data<float>() + M * N}, expected, 3e-5, 1e-5, label + " MMQ");
+    };
+    check(DType::Q4_K, DType::Q4_KA, repack_q4_k_to_q4_ka, dequantize_row_q4_k, dequantize_row_q4_ka,
+          cuda_ops::gemv_q4_ka_q8_1, cuda_ops::mmq_q4_ka_q8_1);
+    check(DType::Q6_K, DType::Q6_A, repack_q6_k_to_q6_a, dequantize_row_q6_k, dequantize_row_q6_a,
+          cuda_ops::gemv_q6_a_q8_1, cuda_ops::mmq_q6_a_q8_1);
+    arena.reset(mark);
+}
+
 void test_cuda_wave2_prefill(CudaContext& ctx) {
     std::cout << "Testing INT8 MMQ, chunkwise GatedDeltaNet, and tiled GQA prefill...\n";
     std::mt19937_64 rng(452);
@@ -1708,7 +1773,7 @@ void test_chunked_prefill_and_k_quant_gdn() {
         throw std::runtime_error("K-quant GDN GGUF load failed: " + error);
     }
     const auto& layer = model.gdn_layers().front();
-    if (layer.qkv_proj.dtype != DType::Q4_K || layer.z_proj.dtype != DType::Q4_K ||
+    if (layer.qkv_proj.dtype != DType::Q4_KA || layer.z_proj.dtype != DType::Q4_KA ||
         layer.a_proj.dtype != DType::F32 || layer.b_proj.dtype != DType::F32) {
         throw std::runtime_error("GDN projections must preserve their weight precision");
     }
@@ -1739,6 +1804,7 @@ int main() {
         test_cuda_qk_rope_and_gqa_64k(cuda_ctx);
         test_cuda_graph_and_moe_offload(cuda_ctx);
         test_cuda_wave1_decode(cuda_ctx);
+        test_repacked_k_quants(cuda_ctx);
         test_cuda_wave2_prefill(cuda_ctx);
 #endif
 #ifdef FUSIONRT_ENABLE_VULKAN

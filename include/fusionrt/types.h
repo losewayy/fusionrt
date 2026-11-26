@@ -24,6 +24,8 @@ enum class DType : uint8_t {
     Q4_A = 11, // block size 256: 16B-aligned repacked Q4_0 x8 (144 bytes)
     Q8_A = 12, // block size 256: 16B-aligned repacked Q8_0 x8 (272 bytes)
     Q8_1 = 13, // block size 32: packed activation quants, scale and sums (48 bytes)
+    Q4_KA = 14, // CUDA: 256 weights in 160 aligned bytes
+    Q6_A = 15,  // CUDA: 256 weights in 224 aligned bytes
 };
 
 enum class Backend : uint8_t {
@@ -98,6 +100,22 @@ struct alignas(16) BlockQ8_1 {
 static_assert(sizeof(BlockQ8_1) == 48);
 #pragma pack(pop)
 
+struct alignas(16) BlockQ4_KA {
+    uint8_t q[8][16];
+    // Keep the products exact: the base FP16 values and expanded integer factors are lossless.
+    uint16_t d, dmin;
+    uint8_t scale[8], min[8];
+};
+static_assert(sizeof(BlockQ4_KA) == 160);
+
+struct alignas(16) BlockQ6_A {
+    uint8_t ql[8][16];
+    uint8_t qh[4][16];
+    int8_t scale[16];
+    uint16_t d;
+};
+static_assert(sizeof(BlockQ6_A) == 224);
+
 inline constexpr size_t dtype_block_size(DType dt) {
     switch (dt) {
         case DType::Q8_0: return 32;
@@ -106,7 +124,9 @@ inline constexpr size_t dtype_block_size(DType dt) {
         case DType::Q4_1: return 32;
         case DType::Q4_K: return 256;
         case DType::Q5_K: return 256;
-        case DType::Q6_K: return 256;
+        case DType::Q6_K:
+        case DType::Q4_KA:
+        case DType::Q6_A: return 256;
         case DType::Q4_A: return 256;
         case DType::Q8_A: return 256;
         default: return 1;
@@ -116,7 +136,8 @@ inline constexpr size_t dtype_block_size(DType dt) {
 inline constexpr bool dtype_is_quantized(DType dt) {
     return dt == DType::Q8_0 || dt == DType::Q4_0 || dt == DType::Q4_1 ||
            dt == DType::Q4_K || dt == DType::Q5_K || dt == DType::Q6_K ||
-           dt == DType::Q4_A || dt == DType::Q8_A || dt == DType::Q8_1;
+           dt == DType::Q4_A || dt == DType::Q8_A || dt == DType::Q8_1 ||
+           dt == DType::Q4_KA || dt == DType::Q6_A;
 }
 
 inline constexpr size_t dtype_type_size(DType dt) {
@@ -132,6 +153,8 @@ inline constexpr size_t dtype_type_size(DType dt) {
         case DType::Q4_K: return sizeof(BlockQ4_K);
         case DType::Q5_K: return sizeof(BlockQ5_K);
         case DType::Q6_K: return sizeof(BlockQ6_K);
+        case DType::Q4_KA: return sizeof(BlockQ4_KA);
+        case DType::Q6_A: return sizeof(BlockQ6_A);
         case DType::Q4_A: return sizeof(BlockQ4_A);
         case DType::Q8_A: return sizeof(BlockQ8_A);
         case DType::Q8_1: return sizeof(BlockQ8_1);
@@ -161,6 +184,8 @@ inline const char* dtype_name(DType dt) {
         case DType::Q4_K: return "Q4_K";
         case DType::Q5_K: return "Q5_K";
         case DType::Q6_K: return "Q6_K";
+        case DType::Q4_KA: return "Q4_KA";
+        case DType::Q6_A: return "Q6_A";
         case DType::Q4_A: return "Q4_A";
         case DType::Q8_A: return "Q8_A";
         case DType::Q8_1: return "Q8_1";

@@ -167,6 +167,11 @@ void dequantize_row_q4_1(const BlockQ4_1* src, float* dst, int64_t cols);
 void dequantize_row_q4_k(const BlockQ4_K* src, float* dst, int64_t cols);
 void dequantize_row_q5_k(const BlockQ5_K* src, float* dst, int64_t cols);
 void dequantize_row_q6_k(const BlockQ6_K* src, float* dst, int64_t cols);
+void repack_q4_k_to_q4_ka(const BlockQ4_K* src, BlockQ4_KA* dst, int64_t cols);
+void repack_q6_k_to_q6_a(const BlockQ6_K* src, BlockQ6_A* dst, int64_t cols);
+void dequantize_row_q4_ka(const BlockQ4_KA* src, float* dst, int64_t cols);
+void dequantize_row_q6_a(const BlockQ6_A* src, float* dst, int64_t cols);
+
 void repack_q4_0_to_q4_a(const BlockQ4_0* src, BlockQ4_A* dst, int64_t cols);
 void repack_q8_0_to_q8_a(const BlockQ8_0* src, BlockQ8_A* dst, int64_t cols);
 void dequantize_row_q4_a(const BlockQ4_A* src, float* dst, int64_t cols);

@@ -138,6 +138,14 @@ HostTensor to_f32_host(const HostTensor& ht) {
             int64_t nbk = cols / 256;
             const auto* src = reinterpret_cast<const BlockQ6_K*>(ht.storage.data());
             for (int64_t r = 0; r < rows; ++r) dequantize_row_q6_k(src + r * nbk, out.data<float>() + r * cols, cols);
+        } else if (ht.desc.dtype == DType::Q4_KA) {
+            const auto* src = ht.data<BlockQ4_KA>();
+            for (int64_t r = 0; r < rows; ++r)
+                dequantize_row_q4_ka(src + r * (cols / 256), out.data<float>() + r * cols, cols);
+        } else if (ht.desc.dtype == DType::Q6_A) {
+            const auto* src = ht.data<BlockQ6_A>();
+            for (int64_t r = 0; r < rows; ++r)
+                dequantize_row_q6_a(src + r * (cols / 256), out.data<float>() + r * cols, cols);
         } else if (ht.desc.dtype == DType::Q4_A) {
             int64_t nsa = cols / 256;
             const auto* src = reinterpret_cast<const BlockQ4_A*>(ht.storage.data());

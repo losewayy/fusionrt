@@ -1156,7 +1156,20 @@ __global__ void k_fused_qk_norm_rope_kv_append(
 // Fusion 4: Tensor Core (WMMA FP16) Prefill GEMM + Vectorized W16 & Embed Lookup
 // =============================================================================
 // Weight kind enum for unified WMMA prefill kernel:
-// 0=F16, 1=BF16, 2=Q8_0, 3=Q4_0, 4=Q4_1, 5=Q4_K, 6=Q6_K, 7=Q5_K
+// 0=F16, 1=BF16, 2=Q8_0, 3=Q4_0, 4=Q4_1, 5=Q4_K, 6=Q6_K, 7=Q5_K, 8=Q4_KA, 9=Q6_A
+__device__ __forceinline__ float repacked_k_value(const BlockQ4_KA& b, int i) {
+    const int sub = i / 32;
+    const int q = (b.q[sub][i % 16] >> ((i / 16 % 2) * 4)) & 15;
+    return half_bits_to_f32(b.d) * b.scale[sub] * q - half_bits_to_f32(b.dmin) * b.min[sub];
+}
+
+__device__ __forceinline__ float repacked_k_value(const BlockQ6_A& b, int i) {
+    const int sub = i / 32;
+    const int half = i / 16 % 2;
+    const int lo = (b.ql[sub][i % 16] >> (half * 4)) & 15;
+    const int hi = (b.qh[sub / 2][i % 16] >> (sub % 2 * 4 + half * 2)) & 3;
+    return half_bits_to_f32(b.d) * b.scale[i / 16] * ((lo | (hi << 4)) - 32);
+}
 template <int WK>
 __device__ __forceinline__ float dequant_weight_elem(const void* w, int n, int k0, int c, int K) {
     if constexpr (WK == 0) {
@@ -1194,6 +1207,10 @@ __device__ __forceinline__ float dequant_weight_elem(const void* w, int n, int k
         if constexpr (WK == 7) q |= ((__ldg(&blk.qh[c]) >> j) & 1) << 4;
         return half_bits_to_f32(__ldg(&blk.d)) * static_cast<float>(sc) * static_cast<float>(q)
              - half_bits_to_f32(__ldg(&blk.dmin)) * static_cast<float>(mn);
+    } else if constexpr (WK == 8 || WK == 9) {
+        using W = std::conditional_t<WK == 8, BlockQ4_KA, BlockQ6_A>;
+        const int64_t block = static_cast<int64_t>(n) * (K / 256) + k0 / 256;
+        return repacked_k_value(static_cast<const W*>(w)[block], (k0 + c) % 256);
     } else {
         int nb = K >> 8;
         const BlockQ6_K& blk = reinterpret_cast<const BlockQ6_K*>(w)[static_cast<int64_t>(n) * nb + (k0 >> 8)];
@@ -1692,14 +1709,15 @@ __global__ void k_embed_lookup_repacked_f32(const Block* __restrict__ table,
     const int col = blockIdx.x;
     const int lane = threadIdx.x;
     const auto& b = table[static_cast<int64_t>(token_ids[row]) * blocks_per_row + col];
-    const float d = half_bits_to_f32(b.d[lane >> 5]);
     float val;
     if constexpr (std::is_same_v<Block, BlockQ4_A>) {
         const int i = lane & 31;
         const uint8_t packed = reinterpret_cast<const uint8_t*>(b.qs)[(lane >> 5) * 16 + (i & 15)];
-        val = d * ((i < 16 ? packed & 15 : packed >> 4) - 8);
+        val = half_bits_to_f32(b.d[lane >> 5]) * ((i < 16 ? packed & 15 : packed >> 4) - 8);
+    } else if constexpr (std::is_same_v<Block, BlockQ8_A>) {
+        val = half_bits_to_f32(b.d[lane >> 5]) * reinterpret_cast<const int8_t*>(b.qs)[lane];
     } else {
-        val = d * reinterpret_cast<const int8_t*>(b.qs)[lane];
+        val = repacked_k_value(b, lane);
     }
     out[(static_cast<int64_t>(row) * blocks_per_row + col) * 256 + lane] = val;
 }
@@ -2115,6 +2133,17 @@ __device__ __forceinline__ uint4 unpack_q6_words(const uint8_t* ql, const uint8_
                       lo.w | (((hi.w >> shift) & mask) << 4));
 }
 
+__device__ __forceinline__ unsigned unpack_q6_a(unsigned low, unsigned high, int half, int parity) {
+    const unsigned lo = (low >> (half * 4)) & kNibbleMask;
+    const unsigned hi = (high >> (parity * 4 + half * 2)) & 0x03030303u;
+    return lo | (hi << 4);
+}
+
+__device__ __forceinline__ uint4 unpack_q6_a(uint4 low, uint4 high, int half, int parity) {
+    return make_uint4(unpack_q6_a(low.x, high.x, half, parity), unpack_q6_a(low.y, high.y, half, parity),
+                      unpack_q6_a(low.z, high.z, half, parity), unpack_q6_a(low.w, high.w, half, parity));
+}
+
 template <typename W>
 __device__ __forceinline__ float dot_q8_1(const W& w, int sub, uint4 lo, uint4 hi, float4 x) {
     if constexpr (std::is_same_v<W, BlockQ4_A>) {
@@ -2125,6 +2154,18 @@ __device__ __forceinline__ float dot_q8_1(const W& w, int sub, uint4 lo, uint4 h
         const auto* qs = reinterpret_cast<const uint4*>(&w.qs[8 * sub]);
         int dot = dot_q8_words(__ldg(qs), lo) + dot_q8_words(__ldg(qs + 1), hi);
         return half_bits_to_f32(__ldg(&w.d[sub])) * x.x * dot;
+    } else if constexpr (std::is_same_v<W, BlockQ4_KA>) {
+        const uint4 q = __ldg(reinterpret_cast<const uint4*>(w.q[sub]));
+        int dot = dot_q8_words(unpack_q4_words(q, 0), lo) + dot_q8_words(unpack_q4_words(q, 4), hi);
+        return half_bits_to_f32(w.d) * w.scale[sub] * x.x * dot - half_bits_to_f32(w.dmin) * w.min[sub] * x.w;
+    } else if constexpr (std::is_same_v<W, BlockQ6_A>) {
+        const uint4 low = __ldg(reinterpret_cast<const uint4*>(w.ql[sub]));
+        const uint4 high = __ldg(reinterpret_cast<const uint4*>(w.qh[sub / 2]));
+        int dot_lo = dot_q8_words(unpack_q6_a(low, high, 0, sub % 2), lo);
+        int dot_hi = dot_q8_words(unpack_q6_a(low, high, 1, sub % 2), hi);
+        return half_bits_to_f32(w.d) *
+               (w.scale[2 * sub] * (x.x * dot_lo - 32.0f * x.y) +
+                w.scale[2 * sub + 1] * (x.x * dot_hi - 32.0f * x.z));
     } else if constexpr (std::is_same_v<W, BlockQ6_K>) {
         int part = sub & 3;
         const uint8_t* ql = w.ql + (sub >> 2) * 64 + (part & 1) * 32;
@@ -2170,7 +2211,15 @@ struct MmqWeight {
 };
 
 template <typename W>
-constexpr bool mmq_packed_q4 = std::is_same_v<W, BlockQ4_A> || std::is_same_v<W, BlockQ4_K>;
+constexpr bool mmq_packed_q4 =
+    std::is_same_v<W, BlockQ4_A> || std::is_same_v<W, BlockQ4_K> || std::is_same_v<W, BlockQ4_KA>;
+
+template <typename W>
+constexpr bool mmq_async = mmq_packed_q4<W> || std::is_same_v<W, BlockQ6_A> || std::is_same_v<W, BlockQ5_K>;
+
+template <typename W>
+constexpr bool mmq_has_min =
+    std::is_same_v<W, BlockQ4_K> || std::is_same_v<W, BlockQ4_KA> || std::is_same_v<W, BlockQ5_K>;
 
 template <typename W>
 __device__ __forceinline__ float2 mmq_k_scales(const W& w, int sub) {
@@ -2196,38 +2245,22 @@ __device__ __forceinline__ unsigned mmq_signed_q4(unsigned q) {
     return ((q & kNibbleMask) + 0x78787878u) ^ 0x80808080u;
 }
 
-template <typename W>
-__device__ __forceinline__ MmqWeight load_mmq_weight(const W& w, int sub, int word) {
+__device__ __forceinline__ MmqWeight load_raw_q6_mmq_weight(const BlockQ6_K& w, int sub, int word) {
     MmqWeight v;
-    if constexpr (std::is_same_v<W, BlockQ6_K>) {
-        int part = sub & 3;
-        auto* ql = w.ql + (sub >> 2) * 64 + (part & 1) * 32 + 4 * word;
-        auto* qh = w.qh + (sub >> 2) * 32 + 4 * word;
-        unsigned lo = load_word_unaligned(ql);
-        unsigned hi = load_word_unaligned(ql + 16);
-        unsigned h0 = load_word_unaligned(qh);
-        unsigned h1 = load_word_unaligned(qh + 16);
-        v.lo = ((((lo >> ((part >> 1) * 4)) & kNibbleMask) |
-                 (((h0 >> (part * 2)) & 0x03030303u) << 4)) + 0x60606060u) ^ 0x80808080u;
-        v.hi = ((((hi >> ((part >> 1) * 4)) & kNibbleMask) |
-                 (((h1 >> (part * 2)) & 0x03030303u) << 4)) + 0x60606060u) ^ 0x80808080u;
-        float d = half_bits_to_f32(__ldg(&w.d));
-        v.scale = d * __ldg(w.scales + 2 * sub);
-        v.other = d * __ldg(w.scales + 2 * sub + 1);
-    } else {
-        auto* qs = reinterpret_cast<const unsigned*>(w.qs) + (sub >> 1) * 8 + word;
-        int shift = (sub & 1) * 4;
-        v.lo = (__ldg(qs) >> shift) & kNibbleMask;
-        v.hi = (__ldg(qs + 4) >> shift) & kNibbleMask;
-        if constexpr (std::is_same_v<W, BlockQ5_K>) {
-            auto* qh = reinterpret_cast<const unsigned*>(w.qh) + word;
-            v.lo |= ((__ldg(qh) >> sub) & 0x01010101u) << 4;
-            v.hi |= ((__ldg(qh + 4) >> sub) & 0x01010101u) << 4;
-        }
-        const float2 scales = mmq_k_scales(w, sub);
-        v.scale = scales.x;
-        v.other = scales.y;
-    }
+    int part = sub & 3;
+    auto* ql = w.ql + (sub >> 2) * 64 + (part & 1) * 32 + 4 * word;
+    auto* qh = w.qh + (sub >> 2) * 32 + 4 * word;
+    unsigned lo = load_word_unaligned(ql);
+    unsigned hi = load_word_unaligned(ql + 16);
+    unsigned h0 = load_word_unaligned(qh);
+    unsigned h1 = load_word_unaligned(qh + 16);
+    v.lo = ((((lo >> ((part >> 1) * 4)) & kNibbleMask) |
+             (((h0 >> (part * 2)) & 0x03030303u) << 4)) + 0x60606060u) ^ 0x80808080u;
+    v.hi = ((((hi >> ((part >> 1) * 4)) & kNibbleMask) |
+             (((h1 >> (part * 2)) & 0x03030303u) << 4)) + 0x60606060u) ^ 0x80808080u;
+    float d = half_bits_to_f32(__ldg(&w.d));
+    v.scale = d * __ldg(w.scales + 2 * sub);
+    v.other = d * __ldg(w.scales + 2 * sub + 1);
     return v;
 }
 
@@ -2238,6 +2271,15 @@ __device__ __forceinline__ int4 mma_s8(unsigned a0, unsigned a1, unsigned a2, un
         "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%10,%10,%10,%10};"
         : "=r"(c.x), "=r"(c.y), "=r"(c.z), "=r"(c.w)
         : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1), "r"(0));
+    return c;
+}
+
+__device__ __forceinline__ int4 mma_s8_k16(unsigned a0, unsigned a1, unsigned b0) {
+    int4 c;
+    asm("mma.sync.aligned.m16n8k16.row.col.s32.s8.s8.s32 "
+        "{%0,%1,%2,%3}, {%4,%5}, {%6}, {%7,%7,%7,%7};"
+        : "=r"(c.x), "=r"(c.y), "=r"(c.z), "=r"(c.w)
+        : "r"(a0), "r"(a1), "r"(b0), "r"(0));
     return c;
 }
 
@@ -2258,11 +2300,11 @@ __device__ __forceinline__ void mmq_copy_async(void* dst, const void* src) {
 template <typename W, int BM, int BN, int BK>
 __device__ __forceinline__ void load_mmq_tile(
     const BlockQ8_1* x, const W* w,
-    MmqTile<BM, BK, 8, std::is_same_v<W, BlockQ4_K> || std::is_same_v<W, BlockQ5_K>>& xs,
+    MmqTile<BM, BK, 8, mmq_has_min<W>>& xs,
     MmqTile<BN, BK, mmq_packed_q4<W> ? 4 : 8,
             !std::is_same_v<W, BlockQ4_A> && !std::is_same_v<W, BlockQ8_A>>& ws,
     int m0, int n0, int M, int N, int K, int kb) {
-    constexpr bool async = mmq_packed_q4<W>;
+    constexpr bool async = mmq_async<W>;
     int slot = threadIdx.x % BK;
     int xstride = K / 32, wstride = K / 256;
     int sub = (kb + slot) % 8;
@@ -2278,10 +2320,9 @@ __device__ __forceinline__ void load_mmq_tile(
             dst[1] = __ldg(src + 1);
             xs.scale[slot][m] = __uint_as_float(__ldg(&src[2].x));
         }
-        if constexpr (std::is_same_v<W, BlockQ4_K>) {
-            mmq_copy_async<4>(&xs.other[slot][m], &src[2].w);
-        } else if constexpr (std::is_same_v<W, BlockQ5_K>) {
-            xs.other[slot][m] = __uint_as_float(__ldg(&src[2].w));
+        if constexpr (mmq_has_min<W>) {
+            if constexpr (async) mmq_copy_async<4>(&xs.other[slot][m], &src[2].w);
+            else xs.other[slot][m] = __uint_as_float(__ldg(&src[2].w));
         }
     }
     for (int n = threadIdx.x / BK; n < BN; n += blockDim.x / BK) {
@@ -2298,16 +2339,33 @@ __device__ __forceinline__ void load_mmq_tile(
             const float2 scales = mmq_k_scales(src, sub);
             ws.scale[slot][n] = scales.x;
             ws.other[slot][n] = scales.y;
+        } else if constexpr (std::is_same_v<W, BlockQ4_KA>) {
+            mmq_copy_async<16>(dst, src.q[sub]);
+            ws.scale[slot][n] = half_bits_to_f32(src.d) * src.scale[sub];
+            ws.other[slot][n] = -half_bits_to_f32(src.dmin) * src.min[sub];
+        } else if constexpr (std::is_same_v<W, BlockQ6_A>) {
+            mmq_copy_async<16>(dst, src.ql[sub]);
+            mmq_copy_async<16>(dst + 1, src.qh[sub / 2]);
+            const float d = half_bits_to_f32(src.d);
+            ws.scale[slot][n] = d * src.scale[2 * sub];
+            ws.other[slot][n] = d * src.scale[2 * sub + 1];
+        } else if constexpr (std::is_same_v<W, BlockQ5_K>) {
+            // Adjacent slots stage the low/high halves consumed by each 32-element dot.
+            mmq_copy_async<16>(dst, reinterpret_cast<const uint4*>(src.qs) + sub);
+            mmq_copy_async<16>(dst + 1, reinterpret_cast<const uint4*>(src.qh) + sub % 2);
+            const float2 scales = mmq_k_scales(src, sub);
+            ws.scale[slot][n] = scales.x;
+            ws.other[slot][n] = scales.y;
         } else if constexpr (std::is_same_v<W, BlockQ8_A>) {
             auto* ptr = reinterpret_cast<const uint4*>(src.qs) + 2 * sub;
             dst[0] = __ldg(ptr);
             dst[1] = __ldg(ptr + 1);
             ws.scale[slot][n] = half_bits_to_f32(__ldg(src.d + sub));
         } else {
-            MmqWeight a = load_mmq_weight(src, sub, 0);
-            MmqWeight b = load_mmq_weight(src, sub, 1);
-            MmqWeight c = load_mmq_weight(src, sub, 2);
-            MmqWeight d = load_mmq_weight(src, sub, 3);
+            MmqWeight a = load_raw_q6_mmq_weight(src, sub, 0);
+            MmqWeight b = load_raw_q6_mmq_weight(src, sub, 1);
+            MmqWeight c = load_raw_q6_mmq_weight(src, sub, 2);
+            MmqWeight d = load_raw_q6_mmq_weight(src, sub, 3);
             dst[0] = make_uint4(a.lo, b.lo, c.lo, d.lo);
             dst[1] = make_uint4(a.hi, b.hi, c.hi, d.hi);
             ws.scale[slot][n] = a.scale;
@@ -2342,8 +2400,8 @@ __device__ __forceinline__ unsigned mmq_load_packed_q4(const unsigned* ptr) {
 
 template <typename W, int BM, int BN, int BK>
 struct MmqBuffers {
-    static constexpr bool split_scale = std::is_same_v<W, BlockQ6_K>;
-    static constexpr bool min_scale = std::is_same_v<W, BlockQ4_K> || std::is_same_v<W, BlockQ5_K>;
+    static constexpr bool split_scale = std::is_same_v<W, BlockQ6_K> || std::is_same_v<W, BlockQ6_A>;
+    static constexpr bool min_scale = mmq_has_min<W>;
     static constexpr int weight_words = mmq_packed_q4<W> ? 4 : 8;
 
     MmqTile<BM, BK, 8, min_scale> xs[2];
@@ -2363,7 +2421,7 @@ __device__ __forceinline__ void mmq_q8_1_tile(const BlockQ8_1* __restrict__ x, c
     float4 acc[WM][WN] = {};
 
     load_mmq_tile<W, BM, BN, BK>(x, w, xs[0], ws[0], m0, n0, M, N, K, 0);
-    if constexpr (mmq_packed_q4<W>) asm volatile("cp.async.wait_group 0;" ::: "memory");
+    if constexpr (mmq_async<W>) asm volatile("cp.async.wait_group 0;" ::: "memory");
     __syncthreads();
     for (int kb = 0; kb < K / 32; kb += BK) {
         const auto& a = xs[(kb / BK) & 1];
@@ -2383,11 +2441,28 @@ __device__ __forceinline__ void mmq_q8_1_tile(const BlockQ8_1* __restrict__ x, c
                 if constexpr (std::is_same_v<W, BlockQ4_A>) {
                     const unsigned packed = mmq_load_packed_q4(b.qs[j + lane % 8] + slot * 4);
                     bv = make_uint2(mmq_signed_q4(packed), mmq_signed_q4(packed >> 4));
+                } else if constexpr (std::is_same_v<W, BlockQ4_KA>) {
+                    const unsigned packed = mmq_load_packed_q4(b.qs[j + lane % 8] + slot * 4);
+                    bv = make_uint2(packed & kNibbleMask, (packed >> 4) & kNibbleMask);
+                } else if constexpr (std::is_same_v<W, BlockQ6_A>) {
+                    const unsigned* row = b.qs[j + lane % 8] + slot * 8;
+                    const auto low = mmq_load_packed_q4(row);
+                    const auto high = mmq_load_packed_q4(row + 4);
+                    bv = make_uint2((unpack_q6_a(low, high, 0, slot % 2) + 0x60606060u) ^ 0x80808080u,
+                                    (unpack_q6_a(low, high, 1, slot % 2) + 0x60606060u) ^ 0x80808080u);
                 } else if constexpr (std::is_same_v<W, BlockQ4_K>) {
                     const auto* row = b.qs[j + lane % 8] + (slot & ~1) * 4;
                     const uint2 packed = mmq_load_b(row + ((lane / 8) % 2) * 4);
                     const int shift = (slot & 1) * 4;
                     bv = make_uint2((packed.x >> shift) & kNibbleMask, (packed.y >> shift) & kNibbleMask);
+                } else if constexpr (std::is_same_v<W, BlockQ5_K>) {
+                    const auto* row = b.qs[j + lane % 8] + ((slot & ~1) + (lane / 8) % 2) * 8;
+                    const uint2 packed = mmq_load_b(row);
+                    const uint2 high = mmq_load_b(row + 4);
+                    const int shift = (slot & 1) * 4;
+                    const int bit = (kb + slot) % 8;
+                    bv = make_uint2(((packed.x >> shift) & kNibbleMask) | (((high.x >> bit) & 0x01010101u) << 4),
+                                    ((packed.y >> shift) & kNibbleMask) | (((high.y >> bit) & 0x01010101u) << 4));
                 } else {
                     bv = mmq_load_b(b.qs[j + lane % 8] + slot * 8 + ((lane / 8) % 2) * 4);
                 }
@@ -2405,10 +2480,14 @@ __device__ __forceinline__ void mmq_q8_1_tile(const BlockQ8_1* __restrict__ x, c
                     int i0 = mi * 16 + group, i1 = i0 + 8;
                     uint4 av = mmq_load_a(a.qs[mi * 16 + lane % 16] + slot * 8 + (lane / 16) * 4);
                     float ax = a.scale[slot][i0], ay = a.scale[slot][i1];
-                    int4 c = mma_s8(av.x, av.y, av.z, av.w, bv.x, split_scale ? 0u : bv.y);
+                    int4 c;
+                    if constexpr (std::is_same_v<W, BlockQ6_A>) c = mma_s8_k16(av.x, av.y, bv.x);
+                    else c = mma_s8(av.x, av.y, av.z, av.w, bv.x, split_scale ? 0u : bv.y);
                     auto& f = acc[mi][ni];
                     if constexpr (split_scale) {
-                        int4 hi = mma_s8(0, 0, av.z, av.w, 0, bv.y);
+                        int4 hi;
+                        if constexpr (std::is_same_v<W, BlockQ6_A>) hi = mma_s8_k16(av.z, av.w, bv.y);
+                        else hi = mma_s8(0, 0, av.z, av.w, 0, bv.y);
                         float hx = b.other[slot][j0], hy = b.other[slot][j1];
                         f.x = fmaf(ax, fmaf(hx, hi.x, bx * c.x), f.x);
                         f.y = fmaf(ax, fmaf(hy, hi.y, by * c.y), f.y);
@@ -2431,7 +2510,7 @@ __device__ __forceinline__ void mmq_q8_1_tile(const BlockQ8_1* __restrict__ x, c
                 }
             }
         }
-        if constexpr (mmq_packed_q4<W>) asm volatile("cp.async.wait_group 0;" ::: "memory");
+        if constexpr (mmq_async<W>) asm volatile("cp.async.wait_group 0;" ::: "memory");
         __syncthreads();
     }
     #pragma unroll
@@ -2451,8 +2530,15 @@ __device__ __forceinline__ void mmq_q8_1_tile(const BlockQ8_1* __restrict__ x, c
 
 template <typename W, int BM, int BN, int WN, int BK = 4>
 __global__ void k_mmq_q8_1(const BlockQ8_1* x, const W* w, float* y, int M, int N, int K) {
-    __shared__ MmqBuffers<W, BM, BN, BK> storage;
-    mmq_q8_1_tile<W, BM, BN, WN, BK>(x, w, y, M, N, K, blockIdx.y * BM, blockIdx.x * BN, storage);
+    using Buffers = MmqBuffers<W, BM, BN, BK>;
+    if constexpr (sizeof(Buffers) > 48 * 1024) {
+        extern __shared__ __align__(16) unsigned char mmq_smem[];
+        auto& storage = *reinterpret_cast<Buffers*>(mmq_smem);
+        mmq_q8_1_tile<W, BM, BN, WN, BK>(x, w, y, M, N, K, blockIdx.y * BM, blockIdx.x * BN, storage);
+    } else {
+        __shared__ Buffers storage;
+        mmq_q8_1_tile<W, BM, BN, WN, BK>(x, w, y, M, N, K, blockIdx.y * BM, blockIdx.x * BN, storage);
+    }
 }
 
 // Use the same tiles as the large Q4 projection and queue the narrow Q8 projection in the same launch.
@@ -2477,7 +2563,19 @@ template <typename W, int BM, int BN, int WN, int BK = 4>
 void launch_mmq_tile(const BlockQ8_1* x, const W* w, float* y, int M, int N, int K, cudaStream_t stream) {
     constexpr int threads = BN / (WN * 8) * 32;
     dim3 grid((N + BN - 1) / BN, (M + BM - 1) / BM);
-    k_mmq_q8_1<W, BM, BN, WN, BK><<<grid, threads, 0, stream>>>(x, w, y, M, N, K);
+    constexpr int bytes = sizeof(MmqBuffers<W, BM, BN, BK>);
+    constexpr int dynamic_bytes = bytes > 48 * 1024 ? bytes : 0;
+    if constexpr (dynamic_bytes > 0) {
+        static thread_local int configured_device = -1;
+        int device = 0;
+        FUSIONRT_CUDA_CHECK(cudaGetDevice(&device));
+        if (configured_device != device) {
+            FUSIONRT_CUDA_CHECK(cudaFuncSetAttribute(k_mmq_q8_1<W, BM, BN, WN, BK>,
+                                                     cudaFuncAttributeMaxDynamicSharedMemorySize, dynamic_bytes));
+            configured_device = device;
+        }
+    }
+    k_mmq_q8_1<W, BM, BN, WN, BK><<<grid, threads, dynamic_bytes, stream>>>(x, w, y, M, N, K);
 }
 
 template <typename W>
@@ -2496,6 +2594,18 @@ void launch_mmq(const void* x, const void* w, float* y, int M, int N, int K, cud
     if constexpr (std::is_same_v<W, BlockQ4_A>) {
         if (M >= 64 && N >= 4096) {
             launch_mmq_tile<W, 64, 128, 2>(qx, qw, y, M, N, K, stream);
+            return;
+        }
+    }
+    if constexpr (std::is_same_v<W, BlockQ4_KA>) {
+        if (M >= 64 && (N >= 8192 || (M >= 256 && N >= 4096))) {
+            launch_mmq_tile<W, 64, 128, 2>(qx, qw, y, M, N, K, stream);
+            return;
+        }
+    }
+    if constexpr (std::is_same_v<W, BlockQ4_KA> || std::is_same_v<W, BlockQ6_A>) {
+        if (M >= 64 && N >= 1024) {
+            launch_mmq_tile<W, 64, 64, 1>(qx, qw, y, M, N, K, stream);
             return;
         }
     }
@@ -3924,6 +4034,18 @@ void gemv_q4_k_q8_1(const void* x, const void* w, float* y, int N, int K, cudaSt
     launch_gemv_q8_1<BlockQ4_K>(x, w, y, N, K, stream, geometry);
 }
 
+void gemv_q4_ka_q8_1(const void* x, const void* w, float* y, int N, int K, cudaStream_t stream,
+                     GemvGeometry geometry) {
+    launch_gemv_q8_1<BlockQ4_KA>(x, w, y, N, K, stream, geometry);
+}
+
+void gemv_q6_a_q8_1(const void* x, const void* w, float* y, int N, int K, cudaStream_t stream,
+                     GemvGeometry geometry) {
+    // An extra output row per warp costs HBM throughput on large packed Q6 matrices.
+    if ((N >= 4096 && K >= 4096) || N >= 100000) geometry.rows_per_warp = 1;
+    launch_gemv_q8_1<BlockQ6_A>(x, w, y, N, K, stream, geometry);
+}
+
 void gemv_q5_k_q8_1(const void* x, const void* w, float* y, int N, int K, cudaStream_t stream,
                     GemvGeometry geometry) {
     launch_gemv_q8_1<BlockQ5_K, 8>(x, w, y, N, K, stream, geometry);
@@ -3973,6 +4095,14 @@ void mmq_q6_k_q8_1(const void* x, const void* w, float* y, int M, int N, int K, 
 
 void mmq_q4_k_q8_1(const void* x, const void* w, float* y, int M, int N, int K, cudaStream_t stream) {
     launch_mmq<BlockQ4_K>(x, w, y, M, N, K, stream);
+}
+
+void mmq_q4_ka_q8_1(const void* x, const void* w, float* y, int M, int N, int K, cudaStream_t stream) {
+    launch_mmq<BlockQ4_KA>(x, w, y, M, N, K, stream);
+}
+
+void mmq_q6_a_q8_1(const void* x, const void* w, float* y, int M, int N, int K, cudaStream_t stream) {
+    launch_mmq<BlockQ6_A>(x, w, y, M, N, K, stream);
 }
 
 void mmq_q5_k_q8_1(const void* x, const void* w, float* y, int M, int N, int K, cudaStream_t stream) {
@@ -4352,6 +4482,34 @@ void fused_gemv_q4_0(const float* x, const void* w_q4, float* y,
     }
 }
 
+template <int WK>
+__global__ void k_repacked_k_linear(const float* x, const void* w, float* y, int N, int K) {
+    const int n = blockIdx.x * 4 + threadIdx.x / 32;
+    if (n >= N) return;
+    const int m = blockIdx.y;
+    const int lane = threadIdx.x % 32;
+    float sum = 0;
+    for (int k = lane; k < K; k += 32) {
+        sum = fmaf(x[static_cast<int64_t>(m) * K + k], dequant_weight_elem<WK>(w, n, k - lane, lane, K), sum);
+    }
+    sum = warp_reduce_sum(sum);
+    if (lane == 0) y[static_cast<int64_t>(m) * N + n] = sum;
+}
+
+void linear_repacked_k_f32(const float* x, const void* w, DType dtype, float* y,
+                           int M, int N, int K, cudaStream_t stream) {
+    auto launch = [&]<int WK>() {
+        if (M >= 16) {
+            k_gemm_wmma<WK, false><<<dim3((N + 63) / 64, (M + 31) / 32), 128, 0, stream>>>(
+                x, nullptr, w, y, M, N, K, 0);
+        } else {
+            k_repacked_k_linear<WK><<<dim3((N + 3) / 4, M), 128, 0, stream>>>(x, w, y, N, K);
+        }
+    };
+    if (dtype == DType::Q4_KA) launch.template operator()<8>();
+    else launch.template operator()<9>();
+}
+
 void fused_gemv_q4_1(const float* x, const void* w_q4_1, float* y,
                      int M, int N, int K, cudaStream_t stream) {
     if (M >= 16 && (K & 31) == 0) {
@@ -4613,6 +4771,16 @@ void embed_lookup_f32(const void* emb_table, DType table_dtype,
             static_cast<const BlockQ8_A*>(emb_table), token_ids_dev, out, hidden / 256);
         return;
     }
+    if (table_dtype == DType::Q4_KA) {
+        k_embed_lookup_repacked_f32<<<dim3(hidden / 256, M), 256, 0, stream>>>(
+            static_cast<const BlockQ4_KA*>(emb_table), token_ids_dev, out, hidden / 256);
+        return;
+    }
+    if (table_dtype == DType::Q6_A) {
+        k_embed_lookup_repacked_f32<<<dim3(hidden / 256, M), 256, 0, stream>>>(
+            static_cast<const BlockQ6_A*>(emb_table), token_ids_dev, out, hidden / 256);
+        return;
+    }
     int total = M * hidden;
     k_embed_lookup_f32<<<(total + 255) / 256, 256, 0, stream>>>(
         static_cast<const uint8_t*>(emb_table), static_cast<int>(table_dtype),
@@ -4746,6 +4914,10 @@ void dequantize_to_f16(const void* w, DType dt, uint16_t* out_f16, int N, int K,
         int total_b = N * (K >> 5);
         k_dequant_q4_1_to_f16<<<(total_b + 63) / 64, 256, 0, stream>>>(
             static_cast<const BlockQ4_1*>(w), out, total_b);
+    } else if (dt == DType::Q4_KA || dt == DType::Q6_A) {
+        const auto grid = static_cast<unsigned>((static_cast<int64_t>(N) * K + 255) / 256);
+        if (dt == DType::Q4_KA) k_dequant_generic_to_f16<8><<<grid, 256, 0, stream>>>(w, out, N, K);
+        else k_dequant_generic_to_f16<9><<<grid, 256, 0, stream>>>(w, out, N, K);
     } else if (dt == DType::Q4_K) {
         int64_t total = static_cast<int64_t>(N) * K;
         k_dequant_generic_to_f16<5><<<static_cast<int>((total + 255) / 256), 256, 0, stream>>>(w, out, N, K);

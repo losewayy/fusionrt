@@ -55,6 +55,10 @@ void gemv_q6_k_q8_1(const void* x_q8, const void* w_q6_k, float* y, int N, int K
                    GemvGeometry geometry = {});
 void gemv_q4_k_q8_1(const void* x_q8, const void* w_q4_k, float* y, int N, int K, cudaStream_t stream,
                    GemvGeometry geometry = {});
+void gemv_q4_ka_q8_1(const void* x, const void* w, float* y, int N, int K, cudaStream_t stream,
+                     GemvGeometry geometry = {});
+void gemv_q6_a_q8_1(const void* x, const void* w, float* y, int N, int K, cudaStream_t stream,
+                     GemvGeometry geometry = {});
 void gemv_q5_k_q8_1(const void* x_q8, const void* w_q5_k, float* y, int N, int K, cudaStream_t stream,
                    GemvGeometry geometry = {});
 
@@ -65,6 +69,8 @@ void mmq_q4_a_q8_1(const void* x_q8, const void* w, float* y, int M, int N, int 
 void mmq_q8_a_q8_1(const void* x_q8, const void* w, float* y, int M, int N, int K, cudaStream_t stream);
 void mmq_q6_k_q8_1(const void* x_q8, const void* w, float* y, int M, int N, int K, cudaStream_t stream);
 void mmq_q4_k_q8_1(const void* x_q8, const void* w, float* y, int M, int N, int K, cudaStream_t stream);
+void mmq_q4_ka_q8_1(const void* x, const void* w, float* y, int M, int N, int K, cudaStream_t stream);
+void mmq_q6_a_q8_1(const void* x, const void* w, float* y, int M, int N, int K, cudaStream_t stream);
 void mmq_q5_k_q8_1(const void* x_q8, const void* w, float* y, int M, int N, int K, cudaStream_t stream);
 void add_residual_f32(const float* a, const float* b, float* out, int n, cudaStream_t stream);
 void add_bias_f32(float* out, const float* bias, int rows, int cols, int stride, cudaStream_t stream);
@@ -209,6 +215,8 @@ void fused_gemv_q8_0(const float* x, const void* w_q8, float* y,
 void fused_gemv_q4_0(const float* x, const void* w_q4, float* y,
                      int M, int N, int K, cudaStream_t stream);
 
+void linear_repacked_k_f32(const float* x, const void* w, DType dtype, float* y,
+                           int M, int N, int K, cudaStream_t stream);
 void fused_gemv_q4_1(const float* x, const void* w_q4_1, float* y,
                      int M, int N, int K, cudaStream_t stream);
 

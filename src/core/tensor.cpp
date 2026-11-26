@@ -209,6 +209,78 @@ void convert_bf16_to_f32(const uint16_t* src, float* dst, int64_t n) {
     for (int64_t i = 0; i < n; ++i) dst[i] = bf16_to_fp32(src[i]);
 }
 
+void repack_q4_k_to_q4_ka(const BlockQ4_K* src, BlockQ4_KA* dst, int64_t cols) {
+    for (int64_t b = 0; b < cols / 256; ++b) {
+        const auto& in = src[b];
+        auto& out = dst[b];
+        out.d = in.d;
+        out.dmin = in.dmin;
+        for (int sub = 0; sub < 8; ++sub) {
+            const auto* s = in.scales;
+            out.scale[sub] = sub < 4 ? s[sub] & 63 : (s[sub + 4] & 15) | ((s[sub - 4] >> 6) << 4);
+            out.min[sub] = sub < 4 ? s[sub + 4] & 63 : (s[sub + 4] >> 4) | ((s[sub] >> 6) << 4);
+            const auto* q = in.qs + (sub / 2) * 32;
+            const int shift = (sub % 2) * 4;
+            for (int i = 0; i < 16; ++i) {
+                out.q[sub][i] = ((q[i] >> shift) & 15) | (((q[i + 16] >> shift) & 15) << 4);
+            }
+        }
+    }
+}
+
+void repack_q6_k_to_q6_a(const BlockQ6_K* src, BlockQ6_A* dst, int64_t cols) {
+    for (int64_t b = 0; b < cols / 256; ++b) {
+        const auto& in = src[b];
+        auto& out = dst[b];
+        out.d = in.d;
+        std::memcpy(out.scale, in.scales, sizeof(out.scale));
+        for (int sub = 0; sub < 8; ++sub) {
+            const auto* ql = in.ql + (sub / 4) * 64 + (sub % 2) * 32;
+            const int shift = ((sub % 4) / 2) * 4;
+            for (int i = 0; i < 16; ++i) {
+                out.ql[sub][i] = ((ql[i] >> shift) & 15) | (((ql[i + 16] >> shift) & 15) << 4);
+            }
+        }
+        // Each high plane serves two adjacent 32-value groups.
+        for (int pair = 0; pair < 4; ++pair) {
+            const auto* qh = in.qh + (pair / 2) * 32;
+            const int shift = (pair % 2) * 4;
+            for (int i = 0; i < 16; ++i) {
+                out.qh[pair][i] = ((qh[i] >> shift) & 3) | (((qh[i + 16] >> shift) & 3) << 2) |
+                    (((qh[i] >> (shift + 2)) & 3) << 4) | (((qh[i + 16] >> (shift + 2)) & 3) << 6);
+            }
+        }
+    }
+}
+
+void dequantize_row_q4_ka(const BlockQ4_KA* src, float* dst, int64_t cols) {
+    for (int64_t b = 0; b < cols / 256; ++b) {
+        const auto& block = src[b];
+        for (int sub = 0; sub < 8; ++sub) {
+            const float d = fp16_to_fp32(block.d) * block.scale[sub];
+            const float m = fp16_to_fp32(block.dmin) * block.min[sub];
+            for (int i = 0; i < 32; ++i) {
+                const int q = (block.q[sub][i % 16] >> ((i / 16) * 4)) & 15;
+                dst[b * 256 + sub * 32 + i] = d * q - m;
+            }
+        }
+    }
+}
+
+void dequantize_row_q6_a(const BlockQ6_A* src, float* dst, int64_t cols) {
+    for (int64_t b = 0; b < cols / 256; ++b) {
+        const auto& block = src[b];
+        for (int sub = 0; sub < 8; ++sub) {
+            for (int i = 0; i < 32; ++i) {
+                const int low = (block.ql[sub][i % 16] >> ((i / 16) * 4)) & 15;
+                const int high = (block.qh[sub / 2][i % 16] >> ((sub % 2) * 4 + (i / 16) * 2)) & 3;
+                const float d = fp16_to_fp32(block.d) * block.scale[2 * sub + i / 16];
+                dst[b * 256 + sub * 32 + i] = d * ((low | (high << 4)) - 32);
+            }
+        }
+    }
+}
+
 void repack_q4_0_to_q4_a(const BlockQ4_0* src, BlockQ4_A* dst, int64_t cols) {
     const int64_t n_super = cols / 256;
     for (int64_t s = 0; s < n_super; ++s) {

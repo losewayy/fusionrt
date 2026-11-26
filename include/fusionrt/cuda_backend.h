@@ -94,6 +94,8 @@ public:
     const CudaDeviceInfo& info() const { return info_; }
     cudaStream_t stream() const { return stream_; }
     cublasHandle_t cublas() const { return cublas_; }
+    int prefill_batch() const { return prefill_batch_; }
+    void set_prefill_batch(int rows) { prefill_batch_ = rows; }
     int mmq_crossover_m() const { return mmq_crossover_m_; }
     void set_mmq_crossover_m(int rows) { mmq_crossover_m_ = rows; }
     GemvGeometry preferred_gemv_geometry() const { return preferred_gemv_geometry_; }
@@ -126,6 +128,7 @@ private:
     void* l2_flush_buf_ = nullptr;
     size_t l2_flush_bytes_ = 0;
     int mmq_crossover_m_ = 4;
+    int prefill_batch_ = 512;
     GemvGeometry preferred_gemv_geometry_;
     uint64_t empirical_l2_bytes_ = 0;
     DType kv_dtype_ = DType::F32;

@@ -42,7 +42,7 @@ void print_usage() {
               << "  fusionrt inspect --model <path> [--max-seq 4096]\n"
               << "  fusionrt chat --model <path> [--system <text>] [--temp 0.7] [--max-tokens 512]\n"
               << "  fusionrt serve --model <path> [--host 127.0.0.1] [--port 8080] [--max-seq 4096] [--profile <json>]\n"
-              << "  fusionrt bench-model --model <path> [--pp 128] [--tg 64] [--decode-prefix 0] [--reps 5] [--graph] [--profile-ops <json>]\n"
+              << "  fusionrt bench-model --model <path> [--pp 128] [--tg 64] [--decode-prefix 0] [--ubatch 512] [--reps 5] [--graph] [--profile-ops <json>]\n"
               << "  CUDA run, chat, serve, inspect and bench-model accept --kv-type {f32|f16}.\n"
               << "  fusionrt bench [--suite all|fusions|blocks|vulkan] [--output <path>] [--vk-device 0]\n";
 }
@@ -283,7 +283,7 @@ int cmd_daily(const std::string& cmd, int argc, char** argv) {
 int cmd_bench_model(int argc, char** argv) {
 #ifdef FUSIONRT_ENABLE_CUDA
     std::string path;
-    int pp = 128, tg = 64, reps = 5, decode_prefix = 0;
+    int pp = 128, tg = 64, reps = 5, decode_prefix = 0, ubatch = 512;
     DType kv_dtype = DType::F32;
     std::optional<bool> graph_option;
     std::string profile, profile_ops;
@@ -302,6 +302,7 @@ int cmd_bench_model(int argc, char** argv) {
         else if (a == "--model" && i + 1 < argc) path = argv[++i];
         else if (a == "--pp" && i + 1 < argc) pp = parse_int(argv[++i]);
         else if (a == "--tg" && i + 1 < argc) tg = parse_int(argv[++i]);
+        else if (a == "--ubatch" && i + 1 < argc) ubatch = parse_int(argv[++i]);
         else if (a == "--decode-prefix" && i + 1 < argc) decode_prefix = parse_int(argv[++i]);
         else if (a == "--reps" && i + 1 < argc) reps = parse_int(argv[++i]);
         else throw std::invalid_argument("Unknown or incomplete bench-model option: " + a);
@@ -309,13 +310,17 @@ int cmd_bench_model(int argc, char** argv) {
     if (path.empty() || reps == 0 || (pp == 0 && tg == 0)) {
         throw std::invalid_argument("bench-model requires --model, positive --reps and at least one nonzero token count");
     }
+    if (ubatch <= 0 || ubatch > 512) throw std::invalid_argument("--ubatch must be between 1 and 512");
     if (decode_prefix > std::numeric_limits<int>::max() - tg || (decode_prefix != 0 && tg == 0)) {
         throw std::invalid_argument("--decode-prefix requires a positive generation count and a valid context length");
     }
     CudaContext ctx(0, is_gguf(path) ? 0 : estimate_arena_mb(path), 256);
     ctx.set_kv_dtype(kv_dtype);
     FusionModel model(HybridModelConfig{});
+    ctx.set_prefill_batch(ubatch);
+    const auto load_start = std::chrono::steady_clock::now();
     load_cuda_model(ctx, model, path, std::max(pp, decode_prefix + tg), profile);
+    const double load_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - load_start).count();
     const bool graph = graph_option.value_or(model.recommended_cuda_graph());
     OpTrace trace;
     auto samples = model.bench_model_cuda(ctx, pp, tg, reps, graph, profile_ops.empty() ? nullptr : &trace, decode_prefix);
@@ -331,6 +336,7 @@ int cmd_bench_model(int argc, char** argv) {
     };
     std::cout << "model=" << std::filesystem::path(path).filename().string()
               << " backend=cuda graph=" << (graph ? "true" : "false") << " reps=" << reps
+              << " ubatch=" << model.prefill_batch_limit(ctx) << " load_ms=" << load_ms
               << '\n' << std::fixed << std::setprecision(2);
     report("pp", pp, &GenerationStats::prefill_tok_per_s);
     report("tg", tg, &GenerationStats::decode_tok_per_s);
