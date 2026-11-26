@@ -192,7 +192,7 @@ void fused_qk_norm_rope_kv_append_f32(
     int num_q_heads, int num_kv_heads, int head_dim, int rot_dim,
     const int* pos_dev, int pos_host, int max_seq,
     float theta, float eps, bool neox, cudaStream_t stream, const float* rotary_factors = nullptr,
-    DType kv_dtype = DType::F32);
+    DType kv_dtype = DType::F32, CudaKvView cache = {});
 
 // Batched Q/K Norm + RoPE + KV Cache Append for M > 1 prompt prefill
 void batched_qk_norm_rope_kv_append_f32(
@@ -206,7 +206,7 @@ void batched_qk_norm_rope_kv_append_f32(
     int M, int num_q_heads, int num_kv_heads, int head_dim, int rot_dim,
     int start_pos, int max_seq, float theta, float eps, bool neox, cudaStream_t stream,
     int q_row_stride = 0, int k_row_stride = 0, int v_row_stride = 0,
-    const float* rotary_factors = nullptr, DType kv_dtype = DType::F32);
+    const float* rotary_factors = nullptr, DType kv_dtype = DType::F32, CudaKvView cache = {});
 
 // Fusion 4: Fused W4/Q8 Dequantize-GEMV/GEMM (supports arbitrary M >= 1)
 void fused_gemv_q8_0(const float* x, const void* w_q8, float* y,
@@ -241,7 +241,7 @@ void rmsnorm_or_copy_to_f16(const float* x, const float* norm_w, uint16_t* out_f
 void cublas_linear_f16_f32(cublasHandle_t handle, const uint16_t* x_f16, const uint16_t* w_f16,
                            float* y, int M, int N, int K);
 
-// GQA Flash / Split-K Decode (supports up to 64K seq_len).
+// GQA Flash / Split-K Decode.
 // A Q8_1 output uses at least two splits and a head_dim divisible by 32.
 void gqa_splitk_decode_f32(
     const float* q,
@@ -253,7 +253,7 @@ void gqa_splitk_decode_f32(
     int num_q_heads, int num_kv_heads, int head_dim,
     const int* kv_len_dev, int kv_len_host, int max_seq,
     float scale, int max_splits, cudaStream_t stream, bool fixed_splits = false,
-    DType kv_dtype = DType::F32, BlockQ8_1* q8_out = nullptr, const float* gate = nullptr);
+    DType kv_dtype = DType::F32, BlockQ8_1* q8_out = nullptr, const float* gate = nullptr, CudaKvView cache = {});
 
 // Batched Causal GQA Prefill Attention (M queries at start_pos .. start_pos + M - 1)
 void gqa_prefill_causal_f32(
@@ -263,14 +263,12 @@ void gqa_prefill_causal_f32(
     float* out,              // [M, num_q_heads, head_dim]
     int M, int num_q_heads, int num_kv_heads, int head_dim,
     int start_pos, int max_seq, float scale, cudaStream_t stream,
-    int q_row_stride = 0, DType kv_dtype = DType::F32);
+    int q_row_stride = 0, DType kv_dtype = DType::F32, CudaKvView cache = {});
 
-// Tensor Core prefill for a long FP16 KV cache. Q and the output remain FP32.
-size_t gqa_f16_prefill_workspace(int rows, int q_heads, int head_dim, int kv_len);
-void gqa_f16_prefill(cublasHandle_t handle, const float* q, int q_stride,
-                     const void* keys, const void* values, float* out, int rows,
-                     int q_heads, int kv_heads, int head_dim, int start_pos, float scale,
-                     void* workspace, cudaStream_t stream);
+// Online Tensor Core prefill with FP32 softmax and accumulation.
+void gqa_prefill_online_f32(const float* q, int q_stride, CudaKvView cache, float* out,
+                            int rows, int q_heads, int kv_heads, int head_dim,
+                            int start_pos, float scale, cudaStream_t stream);
 
 // Sparse MoE helper kernels
 void moe_topk_router_f32(const float* logits, int* topk_idx, float* topk_weight,

@@ -1021,10 +1021,6 @@ void test_cuda_wave2_prefill(CudaContext& ctx) {
                 cuda_ops::gqa_prefill_causal_f32(q.ptr<float>(), kh.ptr(), vh.ptr(), tiled.ptr<float>(),
                     M, nq, nkv, hd, start, start + M, scale, ctx.stream(), stride, DType::F16);
                 expect_close(read(tiled), {expected.begin(), expected.end()}, 4e-4, 1e-3, "GQA FP16 KV prefill");
-                void* workspace = arena.alloc(cuda_ops::gqa_f16_prefill_workspace(M, nq, hd, start + M));
-                cuda_ops::gqa_f16_prefill(ctx.cublas(), q.ptr<float>(), stride, kh.ptr(), vh.ptr(), tiled.ptr<float>(),
-                    M, nq, nkv, hd, start, scale, workspace, ctx.stream());
-                expect_close(read(tiled), {expected.begin(), expected.end()}, 5e-4, 1e-3, "GQA FP16 Tensor Core prefill");
                 constexpr int splits = 4;
                 auto partial = arena.alloc_tensor({nq, splits, hd}, DType::F32);
                 auto stats = arena.alloc_tensor({nq, splits, 2}, DType::F32);
@@ -1050,6 +1046,60 @@ void test_cuda_wave2_prefill(CudaContext& ctx) {
         }
         arena.reset(mark);
     }
+    const auto old_kv_dtype = ctx.kv_dtype();
+    for (int hd : {64, 128, 256}) {
+        const int prefix = kKvPageTokens - 3, rows = 23, total = prefix + rows;
+        const int stride = nq * hd + 64;
+        const float scale = 1.0f / std::sqrt(static_cast<float>(hd));
+        const auto q = upload_random({total, stride}, 0.5f);
+        const auto k = upload_random({total, nkv * hd}, 0.5f);
+        const auto v = upload_random({total, nkv * hd}, 0.25f);
+        const auto reference_out = arena.alloc_tensor({rows, nq * hd}, DType::F32);
+        const auto online_out = arena.alloc_tensor({rows, nq * hd}, DType::F32);
+        std::vector<double> f16;
+        for (auto dtype : {DType::F16, DType::F32, DType::Q8_0}) {
+            ctx.set_kv_dtype(dtype);
+            const auto persistent_mark = ctx.weight_arena().mark();
+            {
+                const auto cache = make_cuda_kv_view(ctx, 262144, nkv, hd);
+                CudaKvPool pool;
+                auto append = [&](int from, int count) {
+                    pool.ensure(ctx, std::span(&cache, 1), from + count);
+                    cuda_ops::batched_qk_norm_rope_kv_append_f32(
+                        q.ptr<float>() + from * stride, k.ptr<float>() + from * nkv * hd, v.ptr<float>() + from * nkv * hd,
+                        nullptr, nullptr, nullptr, nullptr, count, nq, nkv, hd, 0, from, total, 10000.0f, 1e-6f,
+                        true, ctx.stream(), stride, nkv * hd, nkv * hd, nullptr, dtype, cache);
+                };
+                append(0, prefix);
+                if (pool.pages() != 1) throw std::runtime_error("KV must allocate only the first page");
+                if (dtype == DType::F16) {
+                    cuda_ops::gqa_prefill_causal_f32(q.ptr<float>(), nullptr, nullptr, reference_out.ptr<float>(),
+                        rows, nq, nkv, hd, 0, total, scale, ctx.stream(), stride, dtype, cache);
+                    cuda_ops::gqa_prefill_online_f32(q.ptr<float>(), stride, cache, online_out.ptr<float>(), rows,
+                        nq, nkv, hd, 0, scale, ctx.stream());
+                    const auto first_page = read(reference_out);
+                    expect_close(read(online_out), {first_page.begin(), first_page.end()}, 2e-4, 1e-3,
+                                 "Online attention against the short FP16 path");
+                }
+                append(prefix, rows);
+                const auto bytes = 4 * kKvPageTokens * nkv * hd * dtype_type_size(dtype) / dtype_block_size(dtype);
+                if (pool.pages() != 2 || pool.bytes() != bytes) throw std::runtime_error("KV page payload size mismatch");
+                const float* query = q.ptr<float>() + prefix * stride;
+                cuda_ops::gqa_prefill_causal_f32(query, nullptr, nullptr, reference_out.ptr<float>(), rows,
+                    nq, nkv, hd, prefix, total, scale, ctx.stream(), stride, dtype, cache);
+                cuda_ops::gqa_prefill_online_f32(query, stride, cache, online_out.ptr<float>(), rows,
+                    nq, nkv, hd, prefix, scale, ctx.stream());
+                const auto reference = read(reference_out);
+                const auto online = read(online_out);
+                expect_close(online, {reference.begin(), reference.end()}, 2e-4, 1e-3, "Paged online attention");
+                if (dtype == DType::F16) f16.assign(reference.begin(), reference.end());
+                if (dtype == DType::Q8_0) expect_close(online, f16, 1.5e-3, 1e-2, "Q8 KV attention accuracy");
+            }
+            ctx.weight_arena().reset(persistent_mark);
+        }
+        arena.reset(mark);
+    }
+    ctx.set_kv_dtype(old_kv_dtype);
 }
 
 void test_cuda_qk_rope_and_gqa_64k(CudaContext& ctx) {
@@ -1093,6 +1143,30 @@ void test_cuda_qk_rope_and_gqa_64k(CudaContext& ctx) {
     HostTensor h16 = ctx.download(out_s16);
     std::vector<double> ref(h1.data<float>(), h1.data<float>() + nq * hd);
     expect_close(std::vector<float>(h16.data<float>(), h16.data<float>() + nq * hd), ref, 1e-5, 1e-5, "CUDA GQA 64K Split-K=16 vs Split-K=1");
+    const auto old_kv_dtype = ctx.kv_dtype();
+    const auto mark = ctx.weight_arena().mark();
+    ctx.set_kv_dtype(DType::Q8_0);
+    {
+        CudaKvPool pool;
+        const auto cache = make_cuda_kv_view(ctx, max_seq, nkv, hd);
+        pool.ensure(ctx, std::span(&cache, 1), max_seq);
+        ctx.upload_into(hq, dq);
+        ctx.upload_into(hk, dk);
+        cuda_ops::fused_qk_norm_rope_kv_append_f32(dq.ptr<float>(), dk.ptr<float>(), dv.ptr<float>(),
+            dqn.ptr<float>(), dkn.ptr<float>(), nullptr, nullptr, nq, nkv, hd, rot_dim, nullptr, pos, max_seq,
+            1000000.0f, 1e-6f, true, ctx.stream(), nullptr, DType::Q8_0, cache);
+        constexpr int splits = 128;
+        auto parts = ctx.scratch_arena().alloc_tensor({nq, splits, hd}, DType::F32);
+        auto ml = ctx.scratch_arena().alloc_tensor({nq, splits, 2}, DType::F32);
+        cuda_ops::gqa_splitk_decode_f32(dq.ptr<float>(), nullptr, nullptr, out_s16.ptr<float>(),
+            parts.ptr<float>(), ml.ptr<float>(), nq, nkv, hd, nullptr, max_seq, max_seq, scale,
+            splits, ctx.stream(), true, DType::Q8_0, nullptr, nullptr, cache);
+        const auto actual = ctx.download(out_s16);
+        expect_close({actual.data<float>(), actual.data<float>() + nq * hd}, ref,
+                     1e-7, 1e-2, "Paged Q8 attention with 128 splits at 64K");
+    }
+    ctx.set_kv_dtype(old_kv_dtype);
+    ctx.weight_arena().reset(mark);
     ctx.scratch_arena().reset();
 }
 

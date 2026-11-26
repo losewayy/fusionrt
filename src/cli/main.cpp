@@ -43,7 +43,7 @@ void print_usage() {
               << "  fusionrt chat --model <path> [--system <text>] [--temp 0.7] [--max-tokens 512]\n"
               << "  fusionrt serve --model <path> [--host 127.0.0.1] [--port 8080] [--max-seq 4096] [--profile <json>]\n"
               << "  fusionrt bench-model --model <path> [--pp 128] [--tg 64] [--decode-prefix 0] [--ubatch 512] [--reps 5] [--graph] [--profile-ops <json>]\n"
-              << "  CUDA run, chat, serve, inspect and bench-model accept --kv-type {f32|f16}.\n"
+              << "  CUDA run, chat, serve, inspect and bench-model accept --kv-type {f32|f16|q8_0}.\n"
               << "  fusionrt bench [--suite all|fusions|blocks|vulkan] [--output <path>] [--vk-device 0]\n";
 }
 
@@ -96,7 +96,8 @@ size_t estimate_arena_mb(const std::string& model_path) {
 DType parse_kv_type(const std::string& value) {
     if (value == "f16") return DType::F16;
     if (value == "f32") return DType::F32;
-    throw std::invalid_argument("Expected f32 or f16 for --kv-type");
+    if (value == "q8_0") return DType::Q8_0;
+    throw std::invalid_argument("Expected f32, f16 or q8_0 for --kv-type");
 }
 
 bool is_gguf(const std::string& path) {
@@ -266,10 +267,11 @@ int cmd_daily(const std::string& cmd, int argc, char** argv) {
         std::cout << model.fused_ir_graph().summary()
                   << "\nstatic_scratch_peak_bytes=" << mem.static_scratch_bytes
                   << " kv_cache_dtype=" << dtype_name(kv_dtype) << " kv_cache_bytes=" << mem.kv_bytes
+                  << " kv_cache_pages=" << mem.kv_pages
                   << " weight_arena_reserved_bytes=" << ctx.weight_arena().capacity()
                   << " ssm_cache_bytes=" << mem.ssm_bytes
                   << " persistent_bytes=" << mem.persistent_bytes
-                  << " total_vram_estimate_bytes=" << mem.persistent_bytes + mem.static_scratch_bytes << '\n';
+                  << " total_vram_estimate_bytes=" << mem.persistent_bytes + mem.kv_bytes + mem.static_scratch_bytes << '\n';
         return 0;
     }
     BpeTokenizer tokenizer;

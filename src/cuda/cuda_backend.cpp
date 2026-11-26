@@ -36,10 +36,67 @@ void check_cu(CUresult err, const char* expr, const char* file, int line) {
 }
 
 void CudaContext::set_kv_dtype(DType dtype) {
-    if (dtype != DType::F16 && dtype != DType::F32) {
-        throw std::invalid_argument("CUDA KV cache supports F16 and F32");
+    if (dtype != DType::F16 && dtype != DType::F32 && dtype != DType::Q8_0) {
+        throw std::invalid_argument("CUDA KV cache supports F16, F32 and Q8_0");
     }
     kv_dtype_ = dtype;
+}
+
+CudaKvView make_cuda_kv_view(CudaContext& ctx, int max_tokens, int kv_heads, int head_dim) {
+    const DType dtype = ctx.kv_dtype();
+    if (dtype == DType::Q8_0 && head_dim % 32 != 0) {
+        throw std::invalid_argument("Q8_0 KV requires a head dimension divisible by 32");
+    }
+    const int pages = 1 + (max_tokens - 1) / kKvPageTokens;
+    const int elements = kKvPageTokens * kv_heads * head_dim;
+    const size_t plane = size_t(elements) / dtype_block_size(dtype) * dtype_type_size(dtype);
+    auto* table = static_cast<uint8_t**>(ctx.weight_arena().alloc(pages * sizeof(uint8_t*)));
+    return {table, plane, elements, pages, dtype};
+}
+
+void CudaKvPool::ensure(CudaContext& ctx, std::span<const CudaKvView> layers, int tokens) {
+    if (tokens <= 0 || layers.empty()) return;
+    const int requested = 1 + (tokens - 1) / kKvPageTokens;
+    if (requested <= pages_) return;
+    const int added = requested - pages_;
+    size_t stride = 0;
+    for (const auto& layer : layers) {
+        if (requested > layer.max_pages) throw std::invalid_argument("KV position exceeds context");
+        stride += 2 * layer.plane_bytes;
+    }
+    const size_t bytes = added * stride;
+    std::vector<uint8_t*> entries(layers.size() * added);
+    if (slabs_.size() == slabs_.capacity()) {
+        slabs_.reserve(2 * slabs_.size() + 1);
+    }
+    uint8_t* data = nullptr;
+    FUSIONRT_CUDA_CHECK(cudaMalloc(&data, bytes));
+    Slab slab{{data, cudaFree}, bytes};
+    FUSIONRT_CUDA_CHECK(cudaMemsetAsync(data, 0, bytes, ctx.stream()));
+    size_t offset = 0;
+    for (size_t i = 0; i < layers.size(); ++i) {
+        auto* entry = entries.data() + i * added;
+        for (int p = 0; p < added; ++p) entry[p] = data + offset + p * stride;
+        FUSIONRT_CUDA_CHECK(cudaMemcpyAsync(layers[i].pages + pages_, entry, added * sizeof(*entry),
+                                            cudaMemcpyHostToDevice, ctx.stream()));
+        offset += 2 * layers[i].plane_bytes;
+    }
+    ctx.synchronize();
+    slabs_.push_back(std::move(slab));
+    pages_ = requested;
+    bytes_ += bytes;
+}
+
+void CudaKvPool::clear(CudaContext& ctx) {
+    for (const auto& slab : slabs_) {
+        FUSIONRT_CUDA_CHECK(cudaMemsetAsync(slab.data.get(), 0, slab.bytes, ctx.stream()));
+    }
+}
+
+void CudaKvPool::release() {
+    slabs_.clear();
+    pages_ = 0;
+    bytes_ = 0;
 }
 
 CudaArena::~CudaArena() {

@@ -113,6 +113,7 @@ struct GenerationOptions {
 struct ModelMemory {
     size_t static_scratch_bytes = 0;
     size_t kv_bytes = 0;
+    int kv_pages = 0;
     size_t ssm_bytes = 0;
     size_t persistent_bytes = 0;
     std::map<DType, size_t> weight_bytes;
@@ -158,10 +159,6 @@ struct CudaGatedDeltaNetLayer {
     Tensor gate_up_proj;    // [2*inter, hidden]
     Tensor gate_proj, up_proj;
     Tensor down_proj;       // [hidden, inter]
-};
-
-struct CudaKvState {
-    Tensor keys, values;
 };
 
 struct CudaGdnState {
@@ -297,7 +294,8 @@ private:
     Tensor lm_head_w_;
     struct CudaSession {
         Tensor hidden, logits, token_ids, position, kv_length;
-        std::vector<CudaKvState> kv;
+        std::vector<CudaKvView> kv;
+        CudaKvPool kv_pool;
         std::vector<CudaGdnState> gdn;
         std::vector<int32_t> cached_prompt_tokens;
         bool cached_fused = true;
@@ -305,6 +303,7 @@ private:
         bool graph_captured = false;
         bool graph_fused = true;
         bool graph_has_argmax = false;
+        int graph_split_bucket = 0;
     } cuda_session_;
 
     std::vector<CudaDenseGQALayer> dense_layers_;

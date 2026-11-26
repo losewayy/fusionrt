@@ -7,6 +7,7 @@
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <span>
 #include <string>
 #include <vector>
 
@@ -132,6 +133,36 @@ private:
     GemvGeometry preferred_gemv_geometry_;
     uint64_t empirical_l2_bytes_ = 0;
     DType kv_dtype_ = DType::F32;
+};
+
+inline constexpr int kKvPageTokens = 128;
+
+struct CudaKvView {
+    uint8_t** pages = nullptr;
+    size_t plane_bytes = 0;   // K or V in one page, including the Q8 scale plane.
+    int elements = 0;         // Elements in one plane before quantization.
+    int max_pages = 0;
+    DType dtype = DType::F32;
+};
+
+CudaKvView make_cuda_kv_view(CudaContext& ctx, int max_tokens, int kv_heads, int head_dim);
+
+class CudaKvPool {
+public:
+    void ensure(CudaContext& ctx, std::span<const CudaKvView> layers, int tokens);
+    void clear(CudaContext& ctx);
+    void release();
+    size_t bytes() const { return bytes_; }
+    int pages() const { return pages_; }
+
+private:
+    struct Slab {
+        std::unique_ptr<uint8_t, decltype(&cudaFree)> data{nullptr, cudaFree};
+        size_t bytes;
+    };
+    std::vector<Slab> slabs_;
+    size_t bytes_ = 0;
+    int pages_ = 0;
 };
 
 void check_cuda(cudaError_t err, const char* expr, const char* file, int line);

@@ -1076,8 +1076,40 @@ __global__ void k_gdn_decode_gated_norm(const float* __restrict__ y,
 // =============================================================================
 // Fusion 3: Fused Q/K RMSNorm + RoPE (Full/Partial) + KV Cache Append
 // =============================================================================
+template <bool Value, typename T>
+__device__ __forceinline__ T* kv_row(T* contiguous, CudaKvView cache, int token, int head, int heads, int dim) {
+    if (!cache.pages) return contiguous + (static_cast<int64_t>(token) * heads + head) * dim;
+    auto* page = cache.pages[token / kKvPageTokens];
+    return reinterpret_cast<T*>(page + (Value ? cache.plane_bytes : 0)) +
+           ((token % kKvPageTokens) * heads + head) * dim;
+}
+
+template <bool Value>
+__device__ __forceinline__ half* kv_scales(CudaKvView cache, int token, int head, int heads, int dim) {
+    auto* page = cache.pages[token / kKvPageTokens];
+    return reinterpret_cast<half*>(page + (Value ? cache.plane_bytes : 0) + cache.elements) +
+           ((token % kKvPageTokens) * heads + head) * (dim / 32);
+}
+
+template <bool Value, typename Cache>
+__device__ __forceinline__ float kv_value(const Cache* row, CudaKvView cache,
+                                         int token, int head, int heads, int dim, int d) {
+    if constexpr (std::is_same_v<Cache, int8_t>) {
+        return float(row[d]) * __half2float(kv_scales<Value>(cache, token, head, heads, dim)[d / 32]);
+    } else {
+        return static_cast<float>(row[d]);
+    }
+}
+
+__device__ __forceinline__ void kv_quantize(float value, int8_t* bytes, half* scales, int i) {
+    const float amax = __int_as_float(__reduce_max_sync(0xffffffffu, __float_as_int(fabsf(value))));
+    const float d = amax * (1.0f / 127.0f);
+    bytes[i] = static_cast<int8_t>(__float2int_rn(value * (amax > 0.0f ? __fdividef(127.0f, amax) : 0.0f)));
+    if ((i & 31) == 0) scales[i / 32] = __float2half_rn(d);
+}
+
 template <typename Cache>
-__global__ void k_fused_qk_norm_rope_kv_append(
+__global__ void k_qk_norm_rope_kv_append(
     float* __restrict__ q,
     float* __restrict__ k,
     const float* __restrict__ v,
@@ -1088,7 +1120,7 @@ __global__ void k_fused_qk_norm_rope_kv_append(
     Cache* __restrict__ v_cache,
     int num_q_heads, int num_kv_heads, int head_dim, int rot_dim,
     const int* __restrict__ pos_dev, int pos_host,
-    float theta, float eps, bool neox)
+    float theta, float eps, bool neox, int q_stride, int k_stride, int v_stride, CudaKvView cache)
 {
     extern __shared__ float smem[];
     float* red_buf = smem;      // [32]
@@ -1096,12 +1128,13 @@ __global__ void k_fused_qk_norm_rope_kv_append(
 
     int h = blockIdx.x;
     int tid = threadIdx.x;
-    int pos = pos_dev ? *pos_dev : pos_host;
+    const int m = blockIdx.y;
+    int pos = pos_dev ? *pos_dev : pos_host + m;
     bool is_q = (h < num_q_heads);
     int kh = is_q ? h : (h - num_q_heads);
     if (!is_q && kh >= num_kv_heads) return;
 
-    float* vec = is_q ? (q + h * head_dim) : (k + kh * head_dim);
+    float* vec = is_q ? (q + m * q_stride + h * head_dim) : (k + m * k_stride + kh * head_dim);
     const float* nw = is_q ? q_norm_w : k_norm_w;
 
     float sq = 0.0f;
@@ -1141,13 +1174,21 @@ __global__ void k_fused_qk_norm_rope_kv_append(
     }
     __syncthreads();
 
+    if (is_q) {
+        for (int i = tid; i < head_dim; i += blockDim.x) vec[i] = h_buf[i];
+        return;
+    }
+    auto* keys = kv_row<false>(k_cache, cache, pos, kh, num_kv_heads, head_dim);
+    auto* values = kv_row<true>(v_cache, cache, pos, kh, num_kv_heads, head_dim);
+    const auto* src_v = v + m * v_stride + kh * head_dim;
     for (int i = tid; i < head_dim; i += blockDim.x) {
-        float val = h_buf[i];
-        vec[i] = val;
-        if (!is_q) {
-            int64_t kv_off = (static_cast<int64_t>(pos) * num_kv_heads + kh) * head_dim + i;
-            k_cache[kv_off] = val;
-            v_cache[kv_off] = v[kh * head_dim + i];
+        vec[i] = h_buf[i];
+        if constexpr (std::is_same_v<Cache, int8_t>) {
+            kv_quantize(h_buf[i], keys, kv_scales<false>(cache, pos, kh, num_kv_heads, head_dim), i);
+            kv_quantize(src_v[i], values, kv_scales<true>(cache, pos, kh, num_kv_heads, head_dim), i);
+        } else {
+            keys[i] = h_buf[i];
+            values[i] = src_v[i];
         }
     }
 }
@@ -1352,7 +1393,7 @@ __global__ void k_gqa_splitk_part1(
     float* __restrict__ partial_ml,
     int num_q_heads, int num_kv_heads, int head_dim,
     const int* __restrict__ kv_len_dev, int kv_len_host,
-    float scale, int num_splits)
+    float scale, int num_splits, CudaKvView cache)
 {
     extern __shared__ float smem[];
     float* red_buf = smem;       // [32]
@@ -1380,8 +1421,10 @@ __global__ void k_gqa_splitk_part1(
     float o_j = 0.0f;
 
     for (int t = t_start; t < t_end; ++t) {
-        int64_t kv_base = (static_cast<int64_t>(t) * num_kv_heads + kvh) * head_dim;
-        float qk_part = (tid < head_dim) ? (q_sh[tid] * static_cast<float>(k_cache[kv_base + tid])) : 0.0f;
+        const auto* keys = kv_row<false>(k_cache, cache, t, kvh, num_kv_heads, head_dim);
+        const auto* values = kv_row<true>(v_cache, cache, t, kvh, num_kv_heads, head_dim);
+        const float qk_part = tid < head_dim
+            ? q_sh[tid] * kv_value<false>(keys, cache, t, kvh, num_kv_heads, head_dim, tid) : 0.0f;
         float score = block_reduce_sum(qk_part, red_buf);
 
         float m_new = fmaxf(m_i, score);
@@ -1389,7 +1432,7 @@ __global__ void k_gqa_splitk_part1(
         float p = expf(score - m_new);
         l_i = l_i * alpha + p;
         if (tid < head_dim) {
-            o_j = o_j * alpha + p * static_cast<float>(v_cache[kv_base + tid]);
+            o_j = o_j * alpha + p * kv_value<true>(values, cache, t, kvh, num_kv_heads, head_dim, tid);
         }
         m_i = m_new;
     }
@@ -1741,90 +1784,13 @@ __global__ void k_embed_lookup_repacked_f32(const Block* __restrict__ table,
 }
 
 template <typename Cache>
-__global__ void k_batched_qk_norm_rope_kv_append(
-    float* __restrict__ q,
-    float* __restrict__ k,
-    const float* __restrict__ v,
-    const float* __restrict__ q_norm_w,
-    const float* __restrict__ k_norm_w,
-    const float* __restrict__ rotary_factors,
-    Cache* __restrict__ k_cache,
-    Cache* __restrict__ v_cache,
-    int M, int num_q_heads, int num_kv_heads, int head_dim, int rot_dim,
-    int start_pos, float theta, float eps, bool neox, int q_stride, int k_stride, int v_stride)
-{
-    extern __shared__ float smem[];
-    float* red_buf = smem;
-    float* h_buf = smem + 32;
-
-    int h = blockIdx.x;
-    int m = blockIdx.y;
-    int tid = threadIdx.x;
-    if (m >= M) return;
-    int pos = start_pos + m;
-    bool is_q = (h < num_q_heads);
-    int kh = is_q ? h : (h - num_q_heads);
-    if (!is_q && kh >= num_kv_heads) return;
-
-    float* vec = is_q ? (q + m * q_stride + h * head_dim) : (k + m * k_stride + kh * head_dim);
-    const float* nw = is_q ? q_norm_w : k_norm_w;
-
-    float sq = 0.0f;
-    for (int i = tid; i < head_dim; i += blockDim.x) {
-        float val = vec[i];
-        h_buf[i] = val;
-        sq += val * val;
-    }
-    __syncthreads();
-
-    if (nw != nullptr) {
-        float inv = rsqrtf(block_reduce_sum(sq, red_buf) / static_cast<float>(head_dim) + eps);
-        for (int i = tid; i < head_dim; i += blockDim.x) {
-            h_buf[i] = h_buf[i] * inv * nw[i];
-        }
-        __syncthreads();
-    }
-
-    int half_rot = rot_dim >> 1;
-    for (int i = tid; i < half_rot; i += blockDim.x) {
-        float freq = powf(theta, -static_cast<float>(2 * i) / static_cast<float>(rot_dim));
-        float angle = static_cast<float>(pos) * freq;
-        if (rotary_factors) angle /= rotary_factors[i];
-        float cs = cosf(angle);
-        float sn = sinf(angle);
-        if (neox) {
-            float x0 = h_buf[i];
-            float x1 = h_buf[i + half_rot];
-            h_buf[i] = x0 * cs - x1 * sn;
-            h_buf[i + half_rot] = x0 * sn + x1 * cs;
-        } else {
-            float x0 = h_buf[2 * i];
-            float x1 = h_buf[2 * i + 1];
-            h_buf[2 * i] = x0 * cs - x1 * sn;
-            h_buf[2 * i + 1] = x0 * sn + x1 * cs;
-        }
-    }
-    __syncthreads();
-
-    for (int i = tid; i < head_dim; i += blockDim.x) {
-        float val = h_buf[i];
-        vec[i] = val;
-        if (!is_q) {
-            int64_t kv_off = (static_cast<int64_t>(pos) * num_kv_heads + kh) * head_dim + i;
-            k_cache[kv_off] = val;
-            v_cache[kv_off] = v[m * v_stride + kh * head_dim + i];
-        }
-    }
-}
-
-template <typename Cache>
 __global__ void k_gqa_prefill_causal(
     const float* __restrict__ q, int q_stride,
     const Cache* __restrict__ k_cache,
     const Cache* __restrict__ v_cache,
     float* __restrict__ out,
     int M, int num_q_heads, int num_kv_heads, int head_dim,
-    int start_pos, float scale)
+    int start_pos, float scale, CudaKvView cache)
 {
     extern __shared__ float smem[];
     float* red_buf = smem;
@@ -1851,8 +1817,10 @@ __global__ void k_gqa_prefill_causal(
     float o_j = 0.0f;
 
     for (int t = 0; t < kv_end; ++t) {
-        int64_t kv_base = (static_cast<int64_t>(t) * num_kv_heads + kvh) * head_dim;
-        float qk_part = (tid < head_dim) ? (q_sh[tid] * static_cast<float>(k_cache[kv_base + tid])) : 0.0f;
+        const auto* keys = kv_row<false>(k_cache, cache, t, kvh, num_kv_heads, head_dim);
+        const auto* values = kv_row<true>(v_cache, cache, t, kvh, num_kv_heads, head_dim);
+        const float qk_part = tid < head_dim
+            ? q_sh[tid] * kv_value<false>(keys, cache, t, kvh, num_kv_heads, head_dim, tid) : 0.0f;
         float score = block_reduce_sum(qk_part, red_buf);
 
         float m_new = fmaxf(m_i, score);
@@ -1860,7 +1828,7 @@ __global__ void k_gqa_prefill_causal(
         float p = expf(score - m_new);
         l_i = l_i * alpha + p;
         if (tid < head_dim) {
-            o_j = o_j * alpha + p * static_cast<float>(v_cache[kv_base + tid]);
+            o_j = o_j * alpha + p * kv_value<true>(values, cache, t, kvh, num_kv_heads, head_dim, tid);
         }
         m_i = m_new;
     }
@@ -1870,15 +1838,15 @@ __global__ void k_gqa_prefill_causal(
     }
 }
 
-template <int HD, typename Cache, bool Decode = false, int Warps = 8>
+template <int HD, typename Cache, bool Decode = false, int Warps = 8, bool FirstPage = false>
 __global__ void k_gqa_prefill_tiled(
     const float* __restrict__ q, int q_stride,
     const Cache* __restrict__ k_cache, const Cache* __restrict__ v_cache,
     float* __restrict__ out, int M, int num_q_heads, int num_kv_heads,
     int start_pos, float scale, const int* kv_len_dev = nullptr, int splits = 1,
-    float* partial_ml = nullptr)
+    float* partial_ml = nullptr, CudaKvView cache = {})
 {
-    constexpr int BKV = std::is_same_v<Cache, half> ? 16 : 8, DP = HD / 32;
+    constexpr int BKV = std::is_same_v<Cache, float> ? 8 : 16, DP = HD / 32;
     constexpr int TokensPerWarp = Decode ? 4 : 1;
     constexpr int ScoreLanes = 32 / TokensPerWarp;
     // Separate the four token rows' shared-memory banks.
@@ -1893,6 +1861,14 @@ __global__ void k_gqa_prefill_tiled(
     int qh = kvh * group + query % group;
     int lane = threadIdx.x & 31;
     const int kv_len = Decode ? (kv_len_dev ? *kv_len_dev : start_pos) : 0;
+    if constexpr (FirstPage || (Decode && !std::is_same_v<Cache, int8_t>)) {
+        if (FirstPage || (cache.pages && kv_len <= kKvPageTokens)) {
+            const auto* page = cache.pages[0];
+            k_cache = reinterpret_cast<const Cache*>(page);
+            v_cache = reinterpret_cast<const Cache*>(page + cache.plane_bytes);
+            cache.pages = nullptr;
+        }
+    }
     const int tile_start = Decode ? (kv_len * blockIdx.y) / splits : 0;
     const int kv_end = Decode ? (kv_len * (blockIdx.y + 1)) / splits : start_pos + m + 1;
     const int tile_end = Decode ? kv_end : start_pos + min(M, (first + Warps - 1) / group + 1);
@@ -1910,27 +1886,36 @@ __global__ void k_gqa_prefill_tiled(
 
     float max_score = -INFINITY, sum = 0.0f;
     for (int base = tile_start; base < tile_end; base += BKV) {
-        if constexpr (Decode) {
-            constexpr int V = 8;
-            for (int i = threadIdx.x; i < BKV * HD / V; i += Warps * 32) {
-                const int t = (V * i) / HD, d = (V * i) % HD;
-                const int64_t src = (static_cast<int64_t>(min(base + t, tile_end - 1)) * num_kv_heads + kvh) * HD + d;
-                const uint4 k = *reinterpret_cast<const uint4*>(k_cache + src);
-                const uint4 v = *reinterpret_cast<const uint4*>(v_cache + src);
-                const auto* k2 = reinterpret_cast<const half2*>(&k);
-                const auto* v2 = reinterpret_cast<const half2*>(&v);
+        constexpr int V = (Decode || FirstPage || std::is_same_v<Cache, int8_t>) ? 16 / sizeof(Cache) : 1;
+        for (int i = threadIdx.x; i < BKV * HD / V; i += Warps * 32) {
+            const int t = (V * i) / HD, d = (V * i) % HD;
+            const int pos = min(base + t, tile_end - 1);
+            const auto* kr = kv_row<false>(k_cache, cache, pos, kvh, num_kv_heads, HD);
+            const auto* vr = kv_row<true>(v_cache, cache, pos, kvh, num_kv_heads, HD);
+            if constexpr (std::is_same_v<Cache, int8_t>) {
+                const uint4 k = *reinterpret_cast<const uint4*>(kr + d);
+                const uint4 v = *reinterpret_cast<const uint4*>(vr + d);
+                const float dk = __half2float(kv_scales<false>(cache, pos, kvh, num_kv_heads, HD)[d / 32]);
+                const float dv = __half2float(kv_scales<true>(cache, pos, kvh, num_kv_heads, HD)[d / 32]);
+                #pragma unroll
+                for (int j = 0; j < V; ++j) {
+                    keys[t][d+j] = float(reinterpret_cast<const int8_t*>(&k)[j]) * dk;
+                    values[t][d+j] = float(reinterpret_cast<const int8_t*>(&v)[j]) * dv;
+                }
+            } else if constexpr ((Decode || FirstPage) && std::is_same_v<Cache, half>) {
+                const uint4 k = *reinterpret_cast<const uint4*>(kr + d);
+                const uint4 v = *reinterpret_cast<const uint4*>(vr + d);
                 #pragma unroll
                 for (int j = 0; j < V / 2; ++j) {
-                    reinterpret_cast<float2*>(keys[t] + d)[j] = __half22float2(k2[j]);
-                    reinterpret_cast<float2*>(values[t] + d)[j] = __half22float2(v2[j]);
+                    reinterpret_cast<float2*>(keys[t] + d)[j] = __half22float2(reinterpret_cast<const half2*>(&k)[j]);
+                    reinterpret_cast<float2*>(values[t] + d)[j] = __half22float2(reinterpret_cast<const half2*>(&v)[j]);
                 }
-            }
-        } else {
-            for (int i = threadIdx.x; i < BKV * HD; i += Warps * 32) {
-                const int t = base + i / HD;
-                const int64_t src = (static_cast<int64_t>(min(t, tile_end - 1)) * num_kv_heads + kvh) * HD + i % HD;
-                keys[i / HD][i % HD] = static_cast<float>(k_cache[src]);
-                values[i / HD][i % HD] = static_cast<float>(v_cache[src]);
+            } else if constexpr (FirstPage && std::is_same_v<Cache, float>) {
+                *reinterpret_cast<float4*>(keys[t] + d) = *reinterpret_cast<const float4*>(kr + d);
+                *reinterpret_cast<float4*>(values[t] + d) = *reinterpret_cast<const float4*>(vr + d);
+            } else {
+                keys[t][d] = static_cast<float>(kr[d]);
+                values[t][d] = static_cast<float>(vr[d]);
             }
         }
         __syncthreads();
@@ -1992,66 +1977,212 @@ __global__ void k_gqa_prefill_tiled(
     }
 }
 
-__global__ void k_gqa_pack_queries(const float* q, half* packed, int cols, int stride, int count) {
-    const int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < count) packed[i] = __float2half_rn(q[(i / cols) * stride + i % cols]);
-}
-
-__global__ void k_gqa_batch_pointers(const half* q, const half* keys, const half* values,
-                                     float* scores, half* prob, float* out, void** table,
-                                     int first_head, int group_size,
-                                     int head_dim, int elements_per_head, int batch) {
-    const int i = threadIdx.x;
-    if (i >= batch) return;
-    const int head = first_head + i;
-    const int q_col = head * head_dim, kv_col = (head / group_size) * head_dim;
-    const size_t offset = static_cast<size_t>(i) * elements_per_head;
-    table[i] = const_cast<half*>(keys + kv_col);
-    table[batch + i] = const_cast<half*>(q + q_col);
-    table[2 * batch + i] = scores + offset;
-    table[3 * batch + i] = const_cast<half*>(values + kv_col);
-    table[4 * batch + i] = prob + offset;
-    table[5 * batch + i] = out + q_col;
-}
-
-__global__ void k_gqa_causal_softmax(const float* scores, half* prob, int rows, int start_pos, int kv_len) {
-    __shared__ float warp_max[8], warp_sum[8];
-    const int tid = threadIdx.x, lane = tid % 32;
-    const int valid = start_pos + blockIdx.x % rows + 1;
-    const size_t row = static_cast<size_t>(blockIdx.x) * kv_len;
-    scores += row;
-    prob += row;
-    float maximum = -INFINITY;
-    for (int i = tid; i < valid; i += blockDim.x) maximum = fmaxf(maximum, scores[i]);
-    for (int offset = 16; offset > 0; offset >>= 1) {
-        maximum = fmaxf(maximum, __shfl_xor_sync(0xffffffffu, maximum, offset));
+template <bool Transpose>
+__device__ __forceinline__ uint2 attention_load_b(const half* ptr) {
+    uint2 b;
+    const unsigned addr = static_cast<unsigned>(__cvta_generic_to_shared(ptr));
+    if constexpr (Transpose) {
+        asm("ldmatrix.sync.aligned.m8n8.x2.trans.shared.b16 {%0,%1}, [%2];"
+            : "=r"(b.x), "=r"(b.y) : "r"(addr));
+    } else {
+        asm("ldmatrix.sync.aligned.m8n8.x2.shared.b16 {%0,%1}, [%2];"
+            : "=r"(b.x), "=r"(b.y) : "r"(addr));
     }
-    if (lane == 0) warp_max[tid / 32] = maximum;
+    return b;
+}
+
+__device__ __forceinline__ void attention_mma(float4& c, uint4 a, uint2 b) {
+    asm("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 "
+        "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
+        : "+f"(c.x), "+f"(c.y), "+f"(c.z), "+f"(c.w)
+        : "r"(a.x), "r"(a.y), "r"(a.z), "r"(a.w), "r"(b.x), "r"(b.y));
+}
+
+template <int HD>
+__device__ __forceinline__ int attention_offset(int row, int col) {
+    return row * HD + (col ^ ((row & 7) * 8));
+}
+
+template <bool Value, typename Cache, int HD>
+__device__ __forceinline__ void attention_stage_kv(half* tile, int r, CudaKvView cache, int token,
+                                                    int head, int heads, int d) {
+    half* dst = tile + attention_offset<HD>(r, d);
+    const auto* row = kv_row<Value>(static_cast<const Cache*>(nullptr), cache, token, head, heads, HD);
+    if constexpr (std::is_same_v<Cache, half>) {
+        const auto shared = static_cast<unsigned>(__cvta_generic_to_shared(dst));
+        asm volatile("cp.async.ca.shared.global [%0], [%1], 16;"
+            :: "r"(shared), "l"(row + d) : "memory");
+    } else if constexpr (std::is_same_v<Cache, int8_t>) {
+        const auto packed = *reinterpret_cast<const uint4*>(row + d);
+        const auto scale = kv_scales<Value>(cache, token, head, heads, HD)[d / 32];
+        const auto scale2 = __halves2half2(scale, scale);
+        const auto bias = __float2half2_rn(1152.0f);
+        #pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            const unsigned bytes = reinterpret_cast<const unsigned*>(&packed)[i] ^ 0x80808080u;
+            // 0x6400 is 1024 with unit spacing. Subtracting 1024 + 128 restores the signed byte.
+            const unsigned lo = __byte_perm(bytes, 0x64646464u, 0x5150);
+            const unsigned hi = __byte_perm(bytes, 0x64646464u, 0x5352);
+            auto* pair = reinterpret_cast<half2*>(tile + attention_offset<HD>(r, d + (i / 2) * 8)) + (i % 2) * 2;
+            pair[0] = __hmul2(__hsub2(reinterpret_cast<const half2&>(lo), bias), scale2);
+            pair[1] = __hmul2(__hsub2(reinterpret_cast<const half2&>(hi), bias), scale2);
+        }
+    } else {
+        #pragma unroll
+        for (int i = 0; i < 8; i += 2) {
+            reinterpret_cast<half2*>(dst)[i / 2] = __floats2half2_rn(row[d + i], row[d + i + 1]);
+        }
+    }
+}
+
+__device__ __forceinline__ uint4 attention_load_q(const half* ptr) {
+    uint4 a;
+    const unsigned addr = static_cast<unsigned>(__cvta_generic_to_shared(ptr));
+    asm("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];"
+        : "=r"(a.x), "=r"(a.y), "=r"(a.z), "=r"(a.w) : "r"(addr));
+    return a;
+}
+
+__device__ __forceinline__ float attention_exp2(float x) {
+    float value;
+    asm("ex2.approx.ftz.f32 %0, %1;" : "=f"(value) : "f"(x));
+    return value;
+}
+
+__device__ __forceinline__ unsigned attention_prob(float a, float b) {
+    const auto value = __floats2half2_rn(a, b);
+    return reinterpret_cast<const unsigned&>(value);
+}
+
+// Keep scores, softmax state and output fragments on chip; K and V are shared
+// by all query rows and heads in this KV group.
+template <int HD, int Warps, typename Cache>
+__global__ void k_gqa_prefill_online(const float* q, int q_stride, CudaKvView cache, float* out,
+                                     int rows, int nq, int nkv, int start, float scale) {
+    constexpr int Q = 16 * Warps, K = HD == 256 ? 32 : 64;
+    constexpr bool KeepQ = HD <= 128;
+    constexpr unsigned mask = 0xffffffffu;
+    extern __shared__ __align__(16) half sh[];
+    auto* sq = sh;
+    auto* sk = sq + (KeepQ ? 0 : Q * HD);
+    auto* sv = sk + K * HD;
+    const int tid = threadIdx.x, lane = tid % 32, warp = tid / 32;
+    const int quad = lane / 4, col = 2 * (lane % 4);
+    const int group = nq / nkv, head = blockIdx.x, qr = blockIdx.y * Q;
+    const int end = rows * group;
+    for (int i = tid; i < Q * HD / 8; i += blockDim.x) {
+        const int r = i / (HD / 8), d = (i % (HD / 8)) * 8;
+        const int j = min(qr + r, end - 1);
+        const float* src = q + (j / group) * q_stride + (head * group + j % group) * HD + d;
+        #pragma unroll
+        for (int e = 0; e < 8; e += 2) {
+            reinterpret_cast<half2*>(sq + attention_offset<HD>(r, d))[e / 2] = __floats2half2_rn(src[e], src[e + 1]);
+        }
+    }
     __syncthreads();
-    maximum = lane < 8 ? warp_max[lane] : -INFINITY;
-    for (int offset = 4; offset > 0; offset >>= 1) {
-        maximum = fmaxf(maximum, __shfl_xor_sync(0xffffffffu, maximum, offset));
+    const int j0 = qr + warp * 16 + quad, j1 = j0 + 8;
+    const int last0 = start + min(j0, end - 1) / group, last1 = start + min(j1, end - 1) / group;
+    const int last = start + min(qr + Q - 1, end - 1) / group;
+    const int arow = warp * 16 + lane % 16, acol = 8 * (lane / 16);
+    uint4 query[KeepQ ? HD / 16 : 1];
+    if constexpr (KeepQ) {
+        #pragma unroll
+        for (int d = 0; d < HD / 16; ++d) {
+            query[d] = attention_load_q(sq + attention_offset<HD>(arow, 16 * d + acol));
+        }
+        __syncthreads();
     }
-    maximum = __shfl_sync(0xffffffffu, maximum, 0);
-    float sum = 0.0f;
-    for (int i = tid; i < valid; i += blockDim.x) sum += __expf(scores[i] - maximum);
-    const float inv = 1.0f / block_reduce_sum(sum, warp_sum);
-    for (int i = tid; i < kv_len; i += blockDim.x) {
-        prob[i] = __float2half_rn(i < valid ? __expf(scores[i] - maximum) * inv : 0.0f);
+    float max0 = -INFINITY, max1 = -INFINITY, sum0 = 0.0f, sum1 = 0.0f;
+    float4 acc[HD / 8]{};
+    for (int base = 0; base <= last; base += K) {
+        constexpr int V = std::is_same_v<Cache, int8_t> ? 16 : 8;
+        for (int i = tid; i < K * HD / V; i += blockDim.x) {
+            const int r = i / (HD / V), d = (i % (HD / V)) * V;
+            const int t = min(base + r, last);
+            attention_stage_kv<false, Cache, HD>(sk, r, cache, t, head, nkv, d);
+            attention_stage_kv<true, Cache, HD>(sv, r, cache, t, head, nkv, d);
+        }
+        if constexpr (std::is_same_v<Cache, half>) {
+            asm volatile("cp.async.commit_group;\n\tcp.async.wait_group 0;" ::: "memory");
+        }
+        __syncthreads();
+        float4 scores[K / 8]{};
+        #pragma unroll (HD == 256 ? 1 : HD / 16)
+        for (int d = 0; d < HD / 16; ++d) {
+            const auto a = KeepQ ? query[d] : attention_load_q(sq + attention_offset<HD>(arow, 16 * d + acol));
+            #pragma unroll
+            for (int t = 0; t < K / 8; ++t) {
+                auto b = attention_load_b<false>(sk + attention_offset<HD>(t * 8 + lane % 8,
+                                                                           16 * d + 8 * ((lane / 8) % 2)));
+                attention_mma(scores[t], a, b);
+            }
+        }
+        float next0 = max0, next1 = max1;
+        #pragma unroll
+        for (int i = 0; i < K / 8; ++i) {
+            const int t = base + 8 * i + col;
+            auto& s = scores[i];
+            s = {t <= last0 ? s.x * scale : -INFINITY, t + 1 <= last0 ? s.y * scale : -INFINITY,
+                 t <= last1 ? s.z * scale : -INFINITY, t + 1 <= last1 ? s.w * scale : -INFINITY};
+            next0 = fmaxf(next0, fmaxf(s.x, s.y));
+            next1 = fmaxf(next1, fmaxf(s.z, s.w));
+        }
+        #pragma unroll
+        for (int x = 1; x <= 2; x *= 2) {
+            next0 = fmaxf(next0, __shfl_xor_sync(mask, next0, x));
+            next1 = fmaxf(next1, __shfl_xor_sync(mask, next1, x));
+        }
+        const float alpha0 = attention_exp2(max0 - next0), alpha1 = attention_exp2(max1 - next1);
+        max0 = next0;
+        max1 = next1;
+        float tile0 = 0.0f, tile1 = 0.0f;
+        uint4 p[K / 16];
+        #pragma unroll
+        for (int i = 0; i < K / 16; ++i) {
+            const auto a = scores[2 * i], b = scores[2 * i + 1];
+            const float ax = attention_exp2(a.x - max0), ay = attention_exp2(a.y - max0);
+            const float az = attention_exp2(a.z - max1), aw = attention_exp2(a.w - max1);
+            const float bx = attention_exp2(b.x - max0), by = attention_exp2(b.y - max0);
+            const float bz = attention_exp2(b.z - max1), bw = attention_exp2(b.w - max1);
+            tile0 += ax + ay + bx + by;
+            tile1 += az + aw + bz + bw;
+            p[i] = {attention_prob(ax, ay), attention_prob(az, aw),
+                    attention_prob(bx, by), attention_prob(bz, bw)};
+        }
+        #pragma unroll
+        for (int x = 1; x <= 2; x *= 2) {
+            tile0 += __shfl_xor_sync(mask, tile0, x);
+            tile1 += __shfl_xor_sync(mask, tile1, x);
+        }
+        sum0 = fmaf(sum0, alpha0, tile0);
+        sum1 = fmaf(sum1, alpha1, tile1);
+        if (__any_sync(mask, alpha0 != 1.0f || alpha1 != 1.0f)) {
+            #pragma unroll
+            for (auto& a : acc) a = {a.x * alpha0, a.y * alpha0, a.z * alpha1, a.w * alpha1};
+        }
+        #pragma unroll
+        for (int d = 0; d < HD / 8; ++d) {
+            auto& a = acc[d];
+            #pragma unroll
+            for (int i = 0; i < K / 16; ++i) {
+                const auto b = attention_load_b<true>(sv + attention_offset<HD>(16 * i + lane % 16, 8 * d));
+                attention_mma(a, p[i], b);
+            }
+        }
+        __syncthreads();
     }
-}
-
-struct GqaF16Workspace {
-    int batch;
-    size_t score_count, query_count;
-};
-
-GqaF16Workspace gqa_f16_workspace(int rows, int q_heads, int head_dim, int kv_len) {
-    constexpr size_t kAttentionScratchTarget = 72 * 1024 * 1024;
-    const size_t per_head = static_cast<size_t>(rows) * kv_len;
-    const size_t per_head_bytes = per_head * (sizeof(float) + sizeof(half));
-    const int batch = static_cast<int>(std::clamp<size_t>(kAttentionScratchTarget / per_head_bytes, 1, q_heads));
-    return {batch, per_head * batch, static_cast<size_t>(rows) * q_heads * head_dim};
+    const float inv0 = 1.0f / sum0, inv1 = 1.0f / sum1;
+    #pragma unroll
+    for (int d = 0; d < HD / 8; ++d) {
+        if (j0 < end) {
+            auto* dst = out + ((j0 / group) * nq + head * group + j0 % group) * HD + d * 8 + col;
+            *reinterpret_cast<float2*>(dst) = {acc[d].x * inv0, acc[d].y * inv0};
+        }
+        if (j1 < end) {
+            auto* dst = out + ((j1 / group) * nq + head * group + j1 % group) * HD + d * 8 + col;
+            *reinterpret_cast<float2*>(dst) = {acc[d].z * inv1, acc[d].w * inv1};
+        }
+    }
 }
 
 // =============================================================================
@@ -4614,17 +4745,19 @@ void fused_qk_norm_rope_kv_append_f32(
     void* k_cache, void* v_cache,
     int num_q_heads, int num_kv_heads, int head_dim, int rot_dim,
     const int* pos_dev, int pos_host, int /*max_seq*/,
-    float theta, float eps, bool neox, cudaStream_t stream, const float* rotary_factors, DType kv_dtype)
+    float theta, float eps, bool neox, cudaStream_t stream, const float* rotary_factors, DType kv_dtype, CudaKvView cache)
 {
     int total_heads = num_q_heads + num_kv_heads;
     int threads = std::min(256, std::max(32, ((head_dim + 31) / 32) * 32));
     size_t smem_bytes = (32 + static_cast<size_t>(head_dim)) * sizeof(float);
     auto launch = [&]<typename Cache>() {
-        k_fused_qk_norm_rope_kv_append<<<total_heads, threads, smem_bytes, stream>>>(
+        k_qk_norm_rope_kv_append<<<total_heads, threads, smem_bytes, stream>>>(
             q, k, v, q_norm_w, k_norm_w, rotary_factors, static_cast<Cache*>(k_cache), static_cast<Cache*>(v_cache),
-            num_q_heads, num_kv_heads, head_dim, rot_dim, pos_dev, pos_host, theta, eps, neox);
+            num_q_heads, num_kv_heads, head_dim, rot_dim, pos_dev, pos_host, theta, eps, neox,
+            num_q_heads * head_dim, num_kv_heads * head_dim, num_kv_heads * head_dim, cache);
     };
-    if (kv_dtype == DType::F16) launch.template operator()<half>();
+    if (kv_dtype == DType::Q8_0) launch.template operator()<int8_t>();
+    else if (kv_dtype == DType::F16) launch.template operator()<half>();
     else launch.template operator()<float>();
 }
 
@@ -4803,7 +4936,7 @@ void gqa_splitk_decode_f32(
     int num_q_heads, int num_kv_heads, int head_dim,
     const int* kv_len_dev, int kv_len_host, int /*max_seq*/,
     float scale, int max_splits, cudaStream_t stream, bool fixed_splits, DType kv_dtype,
-    BlockQ8_1* q8_out, const float* gate)
+    BlockQ8_1* q8_out, const float* gate, CudaKvView cache)
 {
     int num_splits = max_splits;
     if (!kv_len_dev && !fixed_splits && !q8_out) {
@@ -4816,7 +4949,7 @@ void gqa_splitk_decode_f32(
     auto launch = [&]<typename Cache>() {
         const auto* keys = static_cast<const Cache*>(k_cache);
         const auto* values = static_cast<const Cache*>(v_cache);
-        if constexpr (std::is_same_v<Cache, half>) {
+        if constexpr (!std::is_same_v<Cache, float>) {
             if (num_splits > 1 && num_q_heads / num_kv_heads <= 8 &&
                 (head_dim == 64 || head_dim == 128 || head_dim == 256)) {
                 const dim3 grid(num_kv_heads, num_splits);
@@ -4824,7 +4957,7 @@ void gqa_splitk_decode_f32(
                     auto run = [&]<int Warps>() {
                         k_gqa_prefill_tiled<HD, Cache, true, Warps><<<grid, Warps * 32, 0, stream>>>(
                             q, 0, keys, values, partial_out, 1, num_q_heads, num_kv_heads,
-                            kv_len_host, scale, kv_len_dev, num_splits, partial_ml);
+                            kv_len_host, scale, kv_len_dev, num_splits, partial_ml, cache);
                     };
                     if (num_q_heads / num_kv_heads <= 4) run.template operator()<4>();
                     else run.template operator()<8>();
@@ -4838,9 +4971,10 @@ void gqa_splitk_decode_f32(
         const dim3 grid(num_q_heads, num_splits);
         k_gqa_splitk_part1<<<grid, threads, smem_bytes, stream>>>(
             q, keys, values, num_splits == 1 ? out : partial_out, partial_ml,
-            num_q_heads, num_kv_heads, head_dim, kv_len_dev, kv_len_host, scale, num_splits);
+            num_q_heads, num_kv_heads, head_dim, kv_len_dev, kv_len_host, scale, num_splits, cache);
     };
-    if (kv_dtype == DType::F16) launch.template operator()<half>();
+    if (kv_dtype == DType::Q8_0) launch.template operator()<int8_t>();
+    else if (kv_dtype == DType::F16) launch.template operator()<half>();
     else launch.template operator()<float>();
     if (q8_out) {
         k_gqa_splitk_reduce<true><<<num_q_heads, threads, 0, stream>>>(
@@ -4983,7 +5117,7 @@ void batched_qk_norm_rope_kv_append_f32(
     void* k_cache, void* v_cache,
     int M, int num_q_heads, int num_kv_heads, int head_dim, int rot_dim,
     int start_pos, int /*max_seq*/, float theta, float eps, bool neox, cudaStream_t stream,
-    int q_row_stride, int k_row_stride, int v_row_stride, const float* rotary_factors, DType kv_dtype)
+    int q_row_stride, int k_row_stride, int v_row_stride, const float* rotary_factors, DType kv_dtype, CudaKvView cache)
 {
     int total_heads = num_q_heads + num_kv_heads;
     int threads = std::min(256, std::max(32, ((head_dim + 31) / 32) * 32));
@@ -4993,11 +5127,12 @@ void batched_qk_norm_rope_kv_append_f32(
     int ks = k_row_stride > 0 ? k_row_stride : num_kv_heads * head_dim;
     int vs = v_row_stride > 0 ? v_row_stride : ks;
     auto launch = [&]<typename Cache>() {
-        k_batched_qk_norm_rope_kv_append<<<grid, threads, smem_bytes, stream>>>(
+        k_qk_norm_rope_kv_append<<<grid, threads, smem_bytes, stream>>>(
             q, k, v, q_norm_w, k_norm_w, rotary_factors, static_cast<Cache*>(k_cache), static_cast<Cache*>(v_cache),
-            M, num_q_heads, num_kv_heads, head_dim, rot_dim, start_pos, theta, eps, neox, qs, ks, vs);
+            num_q_heads, num_kv_heads, head_dim, rot_dim, nullptr, start_pos, theta, eps, neox, qs, ks, vs, cache);
     };
-    if (kv_dtype == DType::F16) launch.template operator()<half>();
+    if (kv_dtype == DType::Q8_0) launch.template operator()<int8_t>();
+    else if (kv_dtype == DType::F16) launch.template operator()<half>();
     else launch.template operator()<float>();
 }
 
@@ -5005,7 +5140,7 @@ void gqa_prefill_causal_f32(
     const float* q, const void* k_cache, const void* v_cache, float* out,
     int M, int num_q_heads, int num_kv_heads, int head_dim,
     int start_pos, int /*max_seq*/, float scale, cudaStream_t stream,
-    int q_row_stride, DType kv_dtype)
+    int q_row_stride, DType kv_dtype, CudaKvView cache)
 {
     int qs = (q_row_stride > 0) ? q_row_stride : (num_q_heads * head_dim);
     auto launch = [&]<typename Cache>() {
@@ -5015,8 +5150,16 @@ void gqa_prefill_causal_f32(
             const int group = num_q_heads / num_kv_heads;
             const dim3 grid(num_kv_heads, (M * group + 7) / 8);
             auto tiled = [&]<int HD>() {
+                if constexpr (!std::is_same_v<Cache, int8_t>) {
+                    if (cache.pages && start_pos + M <= kKvPageTokens) {
+                        k_gqa_prefill_tiled<HD, Cache, false, 8, true><<<grid, 256, 0, stream>>>(
+                            q, qs, keys, values, out, M, num_q_heads, num_kv_heads, start_pos, scale,
+                            nullptr, 1, nullptr, cache);
+                        return;
+                    }
+                }
                 k_gqa_prefill_tiled<HD><<<grid, 256, 0, stream>>>(
-                    q, qs, keys, values, out, M, num_q_heads, num_kv_heads, start_pos, scale);
+                    q, qs, keys, values, out, M, num_q_heads, num_kv_heads, start_pos, scale, nullptr, 1, nullptr, cache);
             };
             if (head_dim == 64) tiled.template operator()<64>();
             else if (head_dim == 128) tiled.template operator()<128>();
@@ -5027,47 +5170,41 @@ void gqa_prefill_causal_f32(
         const size_t smem_bytes = (32 + static_cast<size_t>(head_dim)) * sizeof(float);
         const dim3 grid(num_q_heads, M);
         k_gqa_prefill_causal<<<grid, threads, smem_bytes, stream>>>(
-            q, qs, keys, values, out, M, num_q_heads, num_kv_heads, head_dim, start_pos, scale);
+            q, qs, keys, values, out, M, num_q_heads, num_kv_heads, head_dim, start_pos, scale, cache);
     };
-    if (kv_dtype == DType::F16) launch.template operator()<half>();
+    if (kv_dtype == DType::Q8_0) launch.template operator()<int8_t>();
+    else if (kv_dtype == DType::F16) launch.template operator()<half>();
     else launch.template operator()<float>();
 }
 
-size_t gqa_f16_prefill_workspace(int rows, int q_heads, int head_dim, int kv_len) {
-    const auto ws = gqa_f16_workspace(rows, q_heads, head_dim, kv_len);
-    return ws.score_count * (sizeof(float) + sizeof(half)) + ws.query_count * sizeof(half)
-           + 6 * ws.batch * sizeof(void*);
-}
-
-void gqa_f16_prefill(cublasHandle_t handle, const float* q, int q_stride,
-                     const void* keys, const void* values, float* out, int rows,
-                     int q_heads, int kv_heads, int head_dim, int start_pos, float scale,
-                     void* workspace, cudaStream_t stream) {
-    const int kv_len = start_pos + rows;
-    const int q_cols = q_heads * head_dim, kv_cols = kv_heads * head_dim;
-    const auto ws = gqa_f16_workspace(rows, q_heads, head_dim, kv_len);
-    auto* packed_q = static_cast<half*>(workspace);
-    auto** table = reinterpret_cast<void**>(packed_q + ws.query_count);
-    auto* scores = reinterpret_cast<float*>(table + 6 * ws.batch);
-    auto* probs = reinterpret_cast<half*>(scores + ws.score_count);
-    const int count = rows * q_cols;
-    k_gqa_pack_queries<<<(count + 255) / 256, 256, 0, stream>>>(q, packed_q, q_cols, q_stride, count);
-    const float zero = 0.0f, one = 1.0f;
-    for (int first = 0; first < q_heads; first += ws.batch) {
-        const int batch = std::min(ws.batch, q_heads - first);
-        k_gqa_batch_pointers<<<1, (batch + 31) / 32 * 32, 0, stream>>>(
-            packed_q, static_cast<const half*>(keys), static_cast<const half*>(values), scores, probs, out,
-            table, first, q_heads / kv_heads, head_dim, rows * kv_len, batch);
-        auto input = [&](int i) { return reinterpret_cast<const void* const*>(table + i * batch); };
-        auto status = cublasGemmBatchedEx(handle, CUBLAS_OP_T, CUBLAS_OP_N, kv_len, rows, head_dim,
-            &scale, input(0), CUDA_R_16F, kv_cols, input(1), CUDA_R_16F, q_cols,
-            &zero, table + 2 * batch, CUDA_R_32F, kv_len, batch, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT);
-        if (status != CUBLAS_STATUS_SUCCESS) throw std::runtime_error("CUDA GQA query/key batched GEMM failed");
-        k_gqa_causal_softmax<<<batch * rows, 256, 0, stream>>>(scores, probs, rows, start_pos, kv_len);
-        status = cublasGemmBatchedEx(handle, CUBLAS_OP_N, CUBLAS_OP_N, head_dim, rows, kv_len,
-            &one, input(3), CUDA_R_16F, kv_cols, input(4), CUDA_R_16F, kv_len,
-            &zero, table + 5 * batch, CUDA_R_32F, q_cols, batch, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT);
-        if (status != CUBLAS_STATUS_SUCCESS) throw std::runtime_error("CUDA GQA probability/value batched GEMM failed");
+void gqa_prefill_online_f32(const float* q, int q_stride, CudaKvView cache, float* out,
+                            int rows, int q_heads, int kv_heads, int head_dim, int start_pos,
+                            float scale, cudaStream_t stream) {
+    auto launch = [&]<int HD, int Warps, typename Cache>() {
+        constexpr int Q = 16 * Warps, K = HD == 256 ? 32 : 64;
+        constexpr size_t bytes = ((HD <= 128 ? 0 : Q) + 2 * K) * HD * sizeof(half);
+        if constexpr (bytes > 48 * 1024) {
+            FUSIONRT_CUDA_CHECK(cudaFuncSetAttribute(k_gqa_prefill_online<HD, Warps, Cache>,
+                                                     cudaFuncAttributeMaxDynamicSharedMemorySize, bytes));
+        }
+        const int queries = rows * (q_heads / kv_heads);
+        const dim3 grid(kv_heads, (queries + Q - 1) / Q);
+        k_gqa_prefill_online<HD, Warps, Cache><<<grid, 32 * Warps, bytes, stream>>>(
+            q, q_stride, cache, out, rows, q_heads, kv_heads, start_pos, scale * 1.4426950408889634f);
+    };
+    auto dispatch = [&]<int HD, int Warps>() {
+        if (cache.dtype == DType::Q8_0) launch.template operator()<HD, Warps, int8_t>();
+        else if (cache.dtype == DType::F16) launch.template operator()<HD, Warps, half>();
+        else launch.template operator()<HD, Warps, float>();
+    };
+    if (head_dim == 64) dispatch.template operator()<64, 4>();
+    else if (head_dim == 128) dispatch.template operator()<128, 4>();
+    else if (head_dim == 256) {
+        int device, shared_limit;
+        FUSIONRT_CUDA_CHECK(cudaGetDevice(&device));
+        FUSIONRT_CUDA_CHECK(cudaDeviceGetAttribute(&shared_limit, cudaDevAttrMaxSharedMemoryPerBlockOptin, device));
+        if (shared_limit >= 64 * 1024) dispatch.template operator()<256, 4>();
+        else dispatch.template operator()<256, 2>();
     }
 }
 

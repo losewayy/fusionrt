@@ -4,6 +4,7 @@
 #include "fusionrt/cuda_kernels.h"
 
 #include <algorithm>
+#include <bit>
 #include <chrono>
 #include <cmath>
 #include <cstdlib>
@@ -19,7 +20,16 @@ using namespace model_io;
 namespace {
 
 constexpr int kPrefillCarrySlots = 8;
-constexpr int kPrefillAttentionRows = 128;
+int decode_split_bucket(int kv_len) {
+    return static_cast<int>(std::bit_ceil(static_cast<unsigned>(1 + (kv_len - 1) / 4096)));
+}
+
+int decode_splits(const CudaContext& ctx, int kv_heads, int kv_len) {
+    const int bucket = decode_split_bucket(kv_len);
+    if (bucket == 1) return 16;
+    const int waves = (4 * ctx.info().multi_processor_count + kv_heads - 1) / kv_heads;
+    return std::min(128, std::max(8 * bucket, waves));
+}
 
 float silu_host(float x) { return x / (1.0f + std::exp(-x)); }
 
@@ -449,6 +459,8 @@ void FusionModel::init_synthetic(CudaContext& ctx, uint64_t seed) {
     layer_indices_.clear();
     dense_layers_.clear();
     gdn_layers_.clear();
+    cuda_session_.decode_graph.reset();
+    cuda_session_.kv_pool.release();
     cuda_session_.kv.clear();
     cuda_session_.gdn.clear();
     moe_layers_.clear();
@@ -485,9 +497,7 @@ void FusionModel::init_synthetic(CudaContext& ctx, uint64_t seed) {
             L.mlp_norm_w = ctx.upload(make_ones_f32({H}), true);
             L.gate_up_proj = ctx.upload(quantize_host_matrix(make_rand_f32({2 * I, H}, rng, 0.04f), wdt), true);
             L.down_proj = ctx.upload(quantize_host_matrix(make_rand_f32({H, I}, rng, 0.04f), wdt), true);
-            cuda_session_.kv.push_back(CudaKvState{
-                ctx.weight_arena().alloc_tensor({L.cfg.max_seq_len, L.cfg.num_key_value_heads, L.cfg.head_dim}, ctx.kv_dtype(), "k_cache"),
-                ctx.weight_arena().alloc_tensor({L.cfg.max_seq_len, L.cfg.num_key_value_heads, L.cfg.head_dim}, ctx.kv_dtype(), "v_cache")});
+            cuda_session_.kv.push_back(make_cuda_kv_view(ctx, L.cfg.max_seq_len, L.cfg.num_key_value_heads, L.cfg.head_dim));
 
             layer_indices_.push_back(dense_layers_.size());
             dense_layers_.push_back(std::move(L));
@@ -570,7 +580,7 @@ static bool upload_raw_model_to_cuda(CudaContext& ctx, const LoadedModelRaw& raw
                                      std::vector<int>& layer_kinds, std::vector<size_t>& layer_indices,
                                      std::vector<CudaDenseGQALayer>& dense_layers,
                                      std::vector<CudaGatedDeltaNetLayer>& gdn_layers,
-                                     std::vector<CudaKvState>& kv_states, std::vector<CudaGdnState>& gdn_states,
+                                     std::vector<CudaKvView>& kv_states, std::vector<CudaGdnState>& gdn_states,
                                      std::vector<CudaSparseMoELayer>& moe_layers) {
     cfg_out = raw.cfg;
     const Tensor rope_factors = raw.rope_factors.storage.empty() ? Tensor{} : ctx.upload(raw.rope_factors, true);
@@ -644,9 +654,7 @@ static bool upload_raw_model_to_cuda(CudaContext& ctx, const LoadedModelRaw& raw
                 }
                 L.down_proj = upload_cuda_matrix(ctx, lr.down);
             }
-            kv_states.push_back(CudaKvState{
-                ctx.weight_arena().alloc_tensor({L.cfg.max_seq_len, L.cfg.num_key_value_heads, L.cfg.head_dim}, ctx.kv_dtype(), "k_cache"),
-                ctx.weight_arena().alloc_tensor({L.cfg.max_seq_len, L.cfg.num_key_value_heads, L.cfg.head_dim}, ctx.kv_dtype(), "v_cache")});
+            kv_states.push_back(make_cuda_kv_view(ctx, L.cfg.max_seq_len, L.cfg.num_key_value_heads, L.cfg.head_dim));
             layer_indices.push_back(dense_layers.size());
             dense_layers.push_back(std::move(L));
         } else if (lr.kind == 1) {
@@ -683,7 +691,7 @@ static bool upload_raw_model_to_cuda(CudaContext& ctx, const LoadedModelRaw& raw
     return true;
 }
 
-static size_t gguf_cuda_arena_bytes(const LoadedModelRaw& raw, DType kv_dtype) {
+static size_t gguf_cuda_arena_bytes(const LoadedModelRaw& raw) {
     size_t bytes = 0;
     auto reserve = [&](size_t n) { bytes += (n + 255) & ~size_t{255}; };
     auto weight = [&](const HostTensor& t) {
@@ -710,9 +718,7 @@ static size_t gguf_cuda_arena_bytes(const LoadedModelRaw& raw, DType kv_dtype) {
             weight(*t);
         }
         if (l.kind == 0) {
-            const size_t kv = dtype_type_size(kv_dtype) * static_cast<size_t>(d.max_seq_len) * d.num_key_value_heads * d.head_dim;
-            reserve(kv);
-            reserve(kv);
+            reserve((1 + (d.max_seq_len - 1) / kKvPageTokens) * sizeof(void*));
         } else if (l.kind == 1) {
             weight(l.qkv_proj);
             reserve(sizeof(float) * static_cast<size_t>(l.conv_w.desc.shape[0]) * 3);
@@ -726,8 +732,10 @@ bool FusionModel::load_gguf(CudaContext& ctx, const std::string& path, std::stri
     LoadedModelRaw raw;
     if (!parse_gguf_model_raw(path, max_seq_override, raw, err)) return false;
     if (ctx.weight_arena().capacity() == 0) {
-        ctx.weight_arena().init(gguf_cuda_arena_bytes(raw, ctx.kv_dtype()));
+        ctx.weight_arena().init(gguf_cuda_arena_bytes(raw));
     }
+    cuda_session_.decode_graph.reset();
+    cuda_session_.kv_pool.release();
     cuda_session_.graph_captured = false;
     cuda_session_.cached_prompt_tokens.clear();
     if (!upload_raw_model_to_cuda(ctx, raw, cfg_, tok_embeddings_, final_norm_w_, lm_head_w_,
@@ -743,6 +751,8 @@ bool FusionModel::load_gguf(CudaContext& ctx, const std::string& path, std::stri
 bool FusionModel::load_safetensors(CudaContext& ctx, const std::string& path, std::string* err, int max_seq_override) {
     LoadedModelRaw raw;
     if (!parse_safetensors_model_raw(path, max_seq_override, raw, err)) return false;
+    cuda_session_.decode_graph.reset();
+    cuda_session_.kv_pool.release();
     cuda_session_.graph_captured = false;
     cuda_session_.cached_prompt_tokens.clear();
     if (!upload_raw_model_to_cuda(ctx, raw, cfg_, tok_embeddings_, final_norm_w_, lm_head_w_,
@@ -757,10 +767,7 @@ bool FusionModel::load_safetensors(CudaContext& ctx, const std::string& path, st
 
 void FusionModel::reset_kv_and_state(CudaContext& ctx) {
     cuda_session_.cached_prompt_tokens.clear();
-    for (auto& state : cuda_session_.kv) {
-        FUSIONRT_CUDA_CHECK(cudaMemsetAsync(state.keys.ptr(), 0, state.keys.nbytes(), ctx.stream()));
-        FUSIONRT_CUDA_CHECK(cudaMemsetAsync(state.values.ptr(), 0, state.values.nbytes(), ctx.stream()));
-    }
+    cuda_session_.kv_pool.clear(ctx);
     for (auto& state : cuda_session_.gdn) {
         FUSIONRT_CUDA_CHECK(cudaMemsetAsync(state.convolution.ptr(), 0, state.convolution.nbytes(), ctx.stream()));
         FUSIONRT_CUDA_CHECK(cudaMemsetAsync(state.recurrence.ptr(), 0, state.recurrence.nbytes(), ctx.stream()));
@@ -812,7 +819,7 @@ private:
 static OpTiming operator_work(const IRNode& node, int rows, int pos, const CudaContext& ctx,
                                bool use_fused, bool packed_input, bool packed_output,
                                const CudaDenseGQALayer* dense, const CudaSparseMoELayer* moe,
-                               size_t kv_element_bytes) {
+                               DType kv_dtype) {
     const int64_t m = rows, f32 = sizeof(float);
     const int64_t n = node.op == OpKind::GQA_ATTN_BLOCK ? node.attention.query_heads :
                       node.op == OpKind::GDN_RECURRENT_BLOCK ? node.recurrent.key_heads : node.output_cols;
@@ -889,7 +896,7 @@ static OpTiming operator_work(const IRNode& node, int rows, int pos, const CudaC
             const int64_t hd = node.attention.head_dim;
             const int64_t pairs = m * pos + m * (m + 1) / 2;
             work.flops = n * pairs * (4 * hd + 4) + 3 * m * (n + k) * node.attention.rotary_dims;
-            work.bytes = f32 * hd * 2 * m * (n + k) + kv_element_bytes * hd * 2 * (m + pairs) * k;
+            work.bytes = f32 * hd * 2 * m * (n + k) + row_nbytes(kv_dtype, hd) * 2 * (m + pairs) * k;
             if (node.attention.query_norm) norm(hd, m * n, false);
             if (node.attention.key_norm) norm(hd, m * k, false);
             if (node.attention.gated) {
@@ -949,7 +956,7 @@ static void execute_ir_graph_cuda(
     const int* pos_dev, const int* kv_len_dev,
     const std::vector<CudaDenseGQALayer>& dense_layers,
     const std::vector<CudaGatedDeltaNetLayer>& gdn_layers,
-    const std::vector<CudaKvState>& kv_states, const std::vector<CudaGdnState>& gdn_states,
+    const std::vector<CudaKvView>& kv_states, const std::vector<CudaGdnState>& gdn_states,
     const std::vector<CudaSparseMoELayer>& moe_layers,
     bool use_fused, OpTrace* op_trace = nullptr, CudaOpTimer* timer = nullptr,
     LayerTrace* layer_trace = nullptr, bool compute_logits = true) {
@@ -1148,48 +1155,33 @@ static void execute_ir_graph_cuda(
                     if (rows == 1) {
                         cuda_ops::fused_qk_norm_rope_kv_append_f32(
                             q_p, k_p, v_p, qnw, knw,
-                            state.keys.ptr(), state.values.ptr(),
+                            nullptr, nullptr,
                             nq, nkv, hd, cfg.rotary_dims, pos_dev, pos_host, cfg.max_context,
-                            cfg.rope_theta, node.norm_eps, cfg.rope_neox, ctx.stream(), rotary, state.keys.dtype);
-                        constexpr int kMaxSplits = 16;
-                        Tensor part_out = cuda_scratch(ctx, {nq, kMaxSplits, hd});
-                        Tensor part_ml = cuda_scratch(ctx, {nq, kMaxSplits, 2});
+                            cfg.rope_theta, node.norm_eps, cfg.rope_neox, ctx.stream(), rotary, state.dtype, state);
+                        const int splits = decode_splits(ctx, nkv, pos_host + 1);
+                        Tensor part_out = cuda_scratch(ctx, {nq, splits, hd});
+                        Tensor part_ml = cuda_scratch(ctx, {nq, splits, 2});
                         // Use the same reduction order for eager and captured decode.
                         cuda_ops::gqa_splitk_decode_f32(
-                            q_p, state.keys.ptr(), state.values.ptr(),
+                            q_p, nullptr, nullptr,
                             attn_out.ptr<float>(), part_out.ptr<float>(), part_ml.ptr<float>(),
                             nq, nkv, hd, kv_len_dev, pos_host + 1, cfg.max_context,
-                            scale, kMaxSplits, ctx.stream(), true, state.keys.dtype,
-                            quantize_output ? attn_out.ptr<BlockQ8_1>() : nullptr, gate_p);
+                            scale, splits, ctx.stream(), true, state.dtype,
+                            quantize_output ? attn_out.ptr<BlockQ8_1>() : nullptr, gate_p, state);
                     } else {
                         cuda_ops::batched_qk_norm_rope_kv_append_f32(
                             q_p, k_p, v_p, qnw, knw,
-                            state.keys.ptr(), state.values.ptr(),
+                            nullptr, nullptr,
                             rows, nq, nkv, hd, cfg.rotary_dims, start_pos, cfg.max_context,
                             cfg.rope_theta, node.norm_eps, cfg.rope_neox, ctx.stream(), q_stride, k_stride, v_stride,
-                            rotary, state.keys.dtype);
-                        auto& arena = ctx.scratch_arena();
-                        // Bound the score matrix and retain the same attention reductions as smaller projection batches.
-                        for (int base = 0; base < rows; base += kPrefillAttentionRows) {
-                            const int m = std::min(rows - base, kPrefillAttentionRows);
-                            const int pos = start_pos + base;
-                            const auto* query = q_p + static_cast<int64_t>(base) * q_stride;
-                            auto* result = attn_out.ptr<float>() + static_cast<int64_t>(base) * q_dim;
-                            const size_t workspace = state.keys.dtype == DType::F16 && ctx.cublas() &&
-                                                     m >= 64 && pos >= 512 && hd % 32 == 0
-                                ? cuda_ops::gqa_f16_prefill_workspace(m, nq, hd, pos + m) : 0;
-                            const size_t aligned = (arena.used() + 255) & ~size_t{255};
-                            if (workspace && aligned <= arena.capacity() && workspace <= arena.capacity() - aligned) {
-                                const size_t mark = arena.mark();
-                                cuda_ops::gqa_f16_prefill(
-                                    ctx.cublas(), query, q_stride, state.keys.ptr(), state.values.ptr(), result,
-                                    m, nq, nkv, hd, pos, scale, arena.alloc(workspace), ctx.stream());
-                                arena.reset(mark);
-                            } else {
-                                cuda_ops::gqa_prefill_causal_f32(
-                                    query, state.keys.ptr(), state.values.ptr(), result, m, nq, nkv, hd, pos,
-                                    cfg.max_context, scale, ctx.stream(), q_stride, state.keys.dtype);
-                            }
+                            rotary, state.dtype, state);
+                        if ((hd == 64 || hd == 128 || hd == 256) && start_pos + rows >= 512) {
+                            cuda_ops::gqa_prefill_online_f32(q_p, q_stride, state, attn_out.ptr<float>(),
+                                rows, nq, nkv, hd, start_pos, scale, ctx.stream());
+                        } else {
+                            cuda_ops::gqa_prefill_causal_f32(q_p, nullptr, nullptr, attn_out.ptr<float>(),
+                                rows, nq, nkv, hd, start_pos, cfg.max_context, scale, ctx.stream(),
+                                q_stride, state.dtype, state);
                         }
                     }
                     if (node.attention.gated && !quantize_output) {
@@ -1353,7 +1345,7 @@ static void execute_ir_graph_cuda(
                         node.out >= 0 && bufs[node.out].dtype == DType::Q8_1,
                         node.op == OpKind::GQA_ATTN_BLOCK ? &dense_layers[node.layer_index] : nullptr,
                         node.op == OpKind::MOE_FFN_BLOCK ? &moe_layers[node.layer_index] : nullptr,
-                        node.op == OpKind::GQA_ATTN_BLOCK ? dtype_type_size(kv_states[node.layer_index].keys.dtype) : 0);
+                        node.op == OpKind::GQA_ATTN_BLOCK ? kv_states[node.layer_index].dtype : DType::F32);
                 }
                 work.total_ms = ms;
                 auto op = std::find_if(op_trace->ops.begin(), op_trace->ops.end(), [&](const OpTiming& entry) {
@@ -1393,9 +1385,10 @@ static void run_forward_token_step_cuda(
     Tensor& hidden_buf, Tensor& logits_buf, Tensor& tok_id_dev, Tensor& pos_dev, Tensor& kv_len_dev,
     const std::vector<CudaDenseGQALayer>& dense_layers,
     const std::vector<CudaGatedDeltaNetLayer>& gdn_layers,
-    const std::vector<CudaKvState>& kv_states, const std::vector<CudaGdnState>& gdn_states,
+    const std::vector<CudaKvView>& kv_states, const std::vector<CudaGdnState>& gdn_states,
     const std::vector<CudaSparseMoELayer>& moe_layers,
     CudaGraphExec& decode_graph, bool& graph_captured, bool& graph_fused_flag, bool& graph_has_argmax,
+    int& graph_split_bucket,
     int pos, bool use_fused, bool use_graph, bool with_argmax, bool first_step = true,
     OpTrace* trace = nullptr, CudaOpTimer* timer = nullptr) {
     int H = static_cast<int>(hidden_buf.shape[0]);
@@ -1419,16 +1412,19 @@ static void run_forward_token_step_cuda(
 
     if (use_graph && can_use_cuda_graph(cfg)) {
         // The generation graph advances both counters after it writes the next token.
-        if (first_step) {
+        if (first_step || !with_argmax) {
             int kv_len = pos + 1;
             FUSIONRT_CUDA_CHECK(cudaMemcpyAsync(pos_dev.ptr(), &pos, sizeof(int), cudaMemcpyHostToDevice, ctx.stream()));
             FUSIONRT_CUDA_CHECK(cudaMemcpyAsync(kv_len_dev.ptr(), &kv_len, sizeof(int), cudaMemcpyHostToDevice, ctx.stream()));
         }
-        if (!graph_captured || graph_fused_flag != use_fused || graph_has_argmax != with_argmax) {
+        const int bucket = decode_split_bucket(pos + 1);
+        if (!graph_captured || graph_fused_flag != use_fused || graph_has_argmax != with_argmax ||
+            graph_split_bucket != bucket) {
             decode_graph.capture(ctx.stream(), [&]() { run_body(true); });
             graph_captured = true;
             graph_fused_flag = use_fused;
             graph_has_argmax = with_argmax;
+            graph_split_bucket = bucket;
         }
         decode_graph.launch(ctx.stream());
     } else {
@@ -1440,6 +1436,7 @@ std::vector<float> FusionModel::forward_token_cuda(CudaContext& ctx, int32_t tok
                                                    bool use_fused, bool use_graph) {
     cuda_session_.cached_prompt_tokens.clear();
     if (pos < 0 || pos >= cfg_.dense.max_seq_len) throw std::invalid_argument("Token position exceeds context");
+    cuda_session_.kv_pool.ensure(ctx, cuda_session_.kv, pos + 1);
     const MiniGraph& ir = use_fused ? fused_ir_graph_ : raw_ir_graph_;
     CudaIRWorkspace ws(ir);
     int32_t tid = std::clamp(token_id, int32_t{0}, cfg_.vocab_size - 1);
@@ -1448,6 +1445,7 @@ std::vector<float> FusionModel::forward_token_cuda(CudaContext& ctx, int32_t tok
                                 cuda_session_.hidden, cuda_session_.logits, cuda_session_.token_ids, cuda_session_.position, cuda_session_.kv_length,
                                 dense_layers_, gdn_layers_, cuda_session_.kv, cuda_session_.gdn, moe_layers_,
                                 cuda_session_.decode_graph, cuda_session_.graph_captured, cuda_session_.graph_fused, cuda_session_.graph_has_argmax,
+                                cuda_session_.graph_split_bucket,
                                 pos, use_fused, use_graph, false);
     HostTensor h_logits = ctx.download(cuda_session_.logits);
     return std::vector<float>(h_logits.data<float>(), h_logits.data<float>() + cfg_.vocab_size);
@@ -1461,15 +1459,10 @@ int FusionModel::prefill_batch_limit(CudaContext& ctx) const {
     const int64_t dense_extra = std::max<int64_t>(3LL * d.intermediate_size, 4LL * q + 2LL * kv);
     const auto& arena = ctx.scratch_arena();
     const size_t available = arena.capacity() - arena.used();
-    const bool tensor_core_attn = ctx.kv_dtype() == DType::F16 && ctx.cublas() &&
-                                  d.max_seq_len >= 512 && d.head_dim % 32 == 0 && !dense_layers_.empty();
     int rows = std::min(ctx.prefill_batch(), d.max_seq_len);
     for (; rows > 1; rows /= 2) {
         const size_t layer_rows = static_cast<size_t>(rows);
-        const size_t dense = dense_extra * layer_rows + (tensor_core_attn && rows > kPrefillAttentionRows
-            ? cuda_ops::gqa_f16_prefill_workspace(kPrefillAttentionRows, d.num_attention_heads,
-                                                  d.head_dim, d.max_seq_len) / sizeof(float)
-            : 0);
+        const size_t dense = dense_extra * layer_rows;
         size_t recurrent = 0;
         if (!gdn_layers_.empty()) {
             const int recurrent_cols = 2 * g.num_k_heads * g.head_k_dim + 3 * g.num_v_heads * g.head_v_dim +
@@ -1496,7 +1489,6 @@ void FusionModel::set_device_profile(CudaContext& ctx, const DeviceProfile& prof
 
 ModelMemory FusionModel::inspect_cuda(CudaContext& ctx) {
     ModelMemory result;
-    for (const auto& state : cuda_session_.kv) result.kv_bytes += state.keys.nbytes() + state.values.nbytes();
     for (const auto& state : cuda_session_.gdn) result.ssm_bytes += state.recurrence.nbytes() + state.convolution.nbytes();
     result.persistent_bytes = ctx.weight_arena().used();
     std::unordered_set<const void*> counted;
@@ -1539,6 +1531,8 @@ ModelMemory FusionModel::inspect_cuda(CudaContext& ctx) {
         throw;
     }
     arena.track_peak(false);
+    result.kv_bytes = cuda_session_.kv_pool.bytes();
+    result.kv_pages = cuda_session_.kv_pool.pages();
     reset_kv_and_state(ctx);
     return result;
 }
@@ -1591,6 +1585,7 @@ void FusionModel::execute_prefill_chunks(CudaContext& ctx, const int32_t* token_
         ~RestoreArena() { arena.reset(mark); }
     } restore{arena, arena.mark()};
 
+    cuda_session_.kv_pool.ensure(ctx, cuda_session_.kv, start_pos + count);
     const int capacity = std::min(count, prefill_batch_limit(ctx));
     Tensor ids = cuda_scratch(ctx, {capacity}, DType::I32);
     Tensor hidden = cuda_scratch(ctx, {capacity, H});
@@ -1701,14 +1696,16 @@ std::vector<int32_t> FusionModel::generate_cuda(CudaContext& ctx, const std::vec
         options.op_trace->mode = "decode";
     }
     auto decode = [&](bool first_step) {
+        cuda_session_.kv_pool.ensure(ctx, cuda_session_.kv, pos + 1);
         run_forward_token_step_cuda(ctx, cfg_, tok_embeddings_, ir, ws,
                                     cuda_session_.hidden, cuda_session_.logits, cuda_session_.token_ids, cuda_session_.position, cuda_session_.kv_length,
                                     dense_layers_, gdn_layers_, cuda_session_.kv, cuda_session_.gdn, moe_layers_,
                                     cuda_session_.decode_graph, cuda_session_.graph_captured, cuda_session_.graph_fused, cuda_session_.graph_has_argmax,
+                                    cuda_session_.graph_split_bucket,
                                     pos++, use_fused, use_graph, greedy, first_step, options.op_trace, timer.get());
     };
     auto td0 = std::chrono::high_resolution_clock::now();
-    if (use_graph && can_use_cuda_graph(cfg_) && !options.on_token && stop_eos_id < 0 && max_new_tokens > 1 &&
+    if (greedy && use_graph && can_use_cuda_graph(cfg_) && !options.on_token && stop_eos_id < 0 && max_new_tokens > 1 &&
         static_cast<int64_t>(pos) + max_new_tokens <= cuda_session_.token_ids.shape[0]) {
         // Graph replay feeds the next greedy step and records IDs on the device.
         int first_pos = pos;
@@ -1792,6 +1789,7 @@ std::vector<GenerationStats> FusionModel::bench_model_cuda(CudaContext& ctx, int
     use_graph = use_graph && can_use_cuda_graph(cfg_);
 
     if (pp > 0) {
+        cuda_session_.kv_pool.ensure(ctx, cuda_session_.kv, pp);
         std::copy(prompt.begin(), prompt.end(), host_args);
         auto prefill = [&] {
             execute_prefill_chunks(ctx, host_args, pp, 0, true, nullptr, nullptr);
@@ -1816,6 +1814,7 @@ std::vector<GenerationStats> FusionModel::bench_model_cuda(CudaContext& ctx, int
     }
 
     if (tg > 0) {
+        cuda_session_.kv_pool.ensure(ctx, cuda_session_.kv, decode_prefix + tg);
         Tensor args = cuda_scratch(ctx, {3}, DType::I32);
         auto decode = [&](int pos) {
             FUSIONRT_CUDA_CHECK(cudaMemcpyAsync(args.ptr(), host_args, args.nbytes(), cudaMemcpyHostToDevice, ctx.stream()));
@@ -1875,6 +1874,7 @@ std::vector<GenerationStats> FusionModel::bench_model_cuda(CudaContext& ctx, int
                 run_forward_token_step_cuda(ctx, cfg_, tok_embeddings_, ir, ws, cuda_session_.hidden, cuda_session_.logits,
                                             cuda_session_.token_ids, cuda_session_.position, cuda_session_.kv_length, dense_layers_, gdn_layers_, cuda_session_.kv, cuda_session_.gdn, moe_layers_,
                                             cuda_session_.decode_graph, cuda_session_.graph_captured, cuda_session_.graph_fused, cuda_session_.graph_has_argmax,
+                                cuda_session_.graph_split_bucket,
                                             decode_prefix + pos, true, false, false, true, trace, &timer);
             }
         } else {
