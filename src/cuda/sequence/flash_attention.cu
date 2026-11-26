@@ -341,40 +341,100 @@ __device__ __forceinline__ void attention_mma(float4& c, uint4 a, uint2 b) {
         : "r"(a.x), "r"(a.y), "r"(a.z), "r"(a.w), "r"(b.x), "r"(b.y));
 }
 
+__device__ __forceinline__ void attention_mma_f16(uint2& c, uint4 a, uint2 b) {
+    asm("mma.sync.aligned.m16n8k16.row.col.f16.f16.f16.f16 "
+        "{%0,%1}, {%2,%3,%4,%5}, {%6,%7}, {%0,%1};"
+        : "+r"(c.x), "+r"(c.y)
+        : "r"(a.x), "r"(a.y), "r"(a.z), "r"(a.w), "r"(b.x), "r"(b.y));
+}
+
 template <int HD>
 __device__ __forceinline__ int attention_offset(int row, int col) {
     return row * HD + (col ^ ((row & 7) * 8));
 }
 
-template <bool Value, typename Cache, int HD>
-__device__ __forceinline__ void attention_stage_kv(half* tile, int r, CudaKvView cache, int token,
-                                                    int head, int heads, int d) {
+struct AttentionQ8Pairs {
+    half2 lo, hi;
+};
+
+__device__ __forceinline__ AttentionQ8Pairs attention_dequantize_q8(unsigned bytes, half2 scale) {
+    bytes ^= 0x80808080u;
+    // 0x6400 is 1024 with unit spacing. Subtracting 1024 + 128 restores the signed byte.
+    const unsigned lo = __byte_perm(bytes, 0x64646464u, 0x5150);
+    const unsigned hi = __byte_perm(bytes, 0x64646464u, 0x5352);
+    const auto bias = __float2half2_rn(1152.0f);
+    return {__hmul2(__hsub2(reinterpret_cast<const half2&>(lo), bias), scale),
+            __hmul2(__hsub2(reinterpret_cast<const half2&>(hi), bias), scale)};
+}
+
+template <typename Cache, int HD>
+__device__ __forceinline__ void attention_stage_kv_row(half* tile, int r, const Cache* row, int d, half scale) {
     half* dst = tile + attention_offset<HD>(r, d);
-    const auto* row = kv_row<Value>(static_cast<const Cache*>(nullptr), cache, token, head, heads, HD);
     if constexpr (std::is_same_v<Cache, half>) {
         const auto shared = static_cast<unsigned>(__cvta_generic_to_shared(dst));
         asm volatile("cp.async.ca.shared.global [%0], [%1], 16;"
             :: "r"(shared), "l"(row + d) : "memory");
     } else if constexpr (std::is_same_v<Cache, int8_t>) {
-        const auto packed = *reinterpret_cast<const uint4*>(row + d);
-        const auto scale = kv_scales<Value>(cache, token, head, heads, HD)[d / 32];
         const auto scale2 = __halves2half2(scale, scale);
-        const auto bias = __float2half2_rn(1152.0f);
-        #pragma unroll
-        for (int i = 0; i < 4; ++i) {
-            const unsigned bytes = reinterpret_cast<const unsigned*>(&packed)[i] ^ 0x80808080u;
-            // 0x6400 is 1024 with unit spacing. Subtracting 1024 + 128 restores the signed byte.
-            const unsigned lo = __byte_perm(bytes, 0x64646464u, 0x5150);
-            const unsigned hi = __byte_perm(bytes, 0x64646464u, 0x5352);
-            auto* pair = reinterpret_cast<half2*>(tile + attention_offset<HD>(r, d + (i / 2) * 8)) + (i % 2) * 2;
-            pair[0] = __hmul2(__hsub2(reinterpret_cast<const half2&>(lo), bias), scale2);
-            pair[1] = __hmul2(__hsub2(reinterpret_cast<const half2&>(hi), bias), scale2);
+        if constexpr (HD == 256) {
+            // One lane per eight columns keeps each shared-memory store contiguous after swizzling.
+            const auto packed = *reinterpret_cast<const uint2*>(row + d);
+            const auto lo = attention_dequantize_q8(packed.x, scale2);
+            const auto hi = attention_dequantize_q8(packed.y, scale2);
+            *reinterpret_cast<uint4*>(dst) = {
+                reinterpret_cast<const unsigned&>(lo.lo), reinterpret_cast<const unsigned&>(lo.hi),
+                reinterpret_cast<const unsigned&>(hi.lo), reinterpret_cast<const unsigned&>(hi.hi)};
+        } else {
+            const auto packed = *reinterpret_cast<const uint4*>(row + d);
+            #pragma unroll
+            for (int i = 0; i < 4; ++i) {
+                const auto value = attention_dequantize_q8(reinterpret_cast<const unsigned*>(&packed)[i], scale2);
+                auto* pair = reinterpret_cast<half2*>(tile + attention_offset<HD>(r, d + (i / 2) * 8)) + (i % 2) * 2;
+                pair[0] = value.lo;
+                pair[1] = value.hi;
+            }
         }
     } else {
         #pragma unroll
         for (int i = 0; i < 8; i += 2) {
             reinterpret_cast<half2*>(dst)[i / 2] = __floats2half2_rn(row[d + i], row[d + i + 1]);
         }
+    }
+}
+
+template <bool Value, typename Cache, int HD>
+__device__ __forceinline__ void attention_stage_kv(half* tile, int r, CudaKvView cache, int token,
+                                                    int head, int heads, int d) {
+    const auto* row = kv_row<Value>(static_cast<const Cache*>(nullptr), cache, token, head, heads, HD);
+    half scale{};
+    if constexpr (std::is_same_v<Cache, int8_t>) {
+        scale = kv_scales<Value>(cache, token, head, heads, HD)[d / 32];
+    }
+    attention_stage_kv_row<Cache, HD>(tile, r, row, d, scale);
+}
+
+template <typename Cache, int HD, int K, int Warps>
+__device__ __forceinline__ void attention_stage_kv_tile(half* sk, half* sv, CudaKvView cache, int base, int last,
+                                                        int head, int heads) {
+    static_assert(kKvPageTokens % K == 0);
+    constexpr int Columns = HD / 8;
+    constexpr int RowsPerStep = 32 * Warps / Columns;
+    // A tile stays within one page, so both Q8 data and scales use the same page pointer.
+    const auto* keys = cache.pages[base / kKvPageTokens];
+    const auto* values = keys + cache.plane_bytes;
+    const int first = base % kKvPageTokens;
+    const int d = (threadIdx.x % Columns) * 8;
+    #pragma unroll 1
+    for (int r = threadIdx.x / Columns; r < K; r += RowsPerStep) {
+        const int row = ((first + min(r, last - base)) * heads + head) * HD;
+        half k_scale{}, v_scale{};
+        if constexpr (std::is_same_v<Cache, int8_t>) {
+            const int i = (row + d) / 32;
+            k_scale = reinterpret_cast<const half*>(keys + cache.elements)[i];
+            v_scale = reinterpret_cast<const half*>(values + cache.elements)[i];
+        }
+        attention_stage_kv_row<Cache, HD>(sk, r, reinterpret_cast<const Cache*>(keys) + row, d, k_scale);
+        attention_stage_kv_row<Cache, HD>(sv, r, reinterpret_cast<const Cache*>(values) + row, d, v_scale);
     }
 }
 
@@ -397,17 +457,40 @@ __device__ __forceinline__ unsigned attention_prob(float a, float b) {
     return reinterpret_cast<const unsigned&>(value);
 }
 
+__device__ __forceinline__ float4 attention_unpack(uint2 x) {
+    const auto lo = __half22float2(reinterpret_cast<const half2&>(x.x));
+    const auto hi = __half22float2(reinterpret_cast<const half2&>(x.y));
+    return {lo.x, lo.y, hi.x, hi.y};
+}
+
+__device__ __forceinline__ unsigned attention_rescale(unsigned x, half2 alpha) {
+    const auto y = __hmul2(reinterpret_cast<const half2&>(x), alpha);
+    return reinterpret_cast<const unsigned&>(y);
+}
+
+__device__ __forceinline__ unsigned attention_mask_pair(unsigned x, int col, int last) {
+    constexpr unsigned neg_inf = 0xfc00u;
+    if (col > last) return neg_inf | (neg_inf << 16);
+    if (col == last) return (x & 0xffffu) | (neg_inf << 16);
+    return x;
+}
+
+template <int HD, int Warps>
+struct OnlineAttentionTile {
+    static constexpr int Q = 16 * Warps, K = HD == 256 ? 32 : 64;
+    static constexpr size_t Bytes = 2 * K * HD * sizeof(half);
+};
+
 // Keep scores, softmax state and output fragments on chip; K and V are shared
 // by all query rows and heads in this KV group.
 template <int HD, int Warps, typename Cache>
-__global__ void k_gqa_prefill_online(const float* q, int q_stride, CudaKvView cache, float* out,
-                                     int rows, int nq, int nkv, int start, float scale) {
-    constexpr int Q = 16 * Warps, K = HD == 256 ? 32 : 64;
-    constexpr bool KeepQ = HD <= 128;
+__device__ __forceinline__ void gqa_prefill_online(const float* q, int q_stride, CudaKvView cache, float* out,
+                                                  int rows, int nq, int nkv, int start, float scale, half* sh) {
+    using Tile = OnlineAttentionTile<HD, Warps>;
+    constexpr int Q = Tile::Q, K = Tile::K;
+    constexpr bool HalfPV = HD == 256, HalfQK = HD == 256;
     constexpr unsigned mask = 0xffffffffu;
-    extern __shared__ __align__(16) half sh[];
-    auto* sq = sh;
-    auto* sk = sq + (KeepQ ? 0 : Q * HD);
+    auto* sk = sh;
     auto* sv = sk + K * HD;
     const int tid = threadIdx.x, lane = tid % 32, warp = tid / 32;
     const int quad = lane / 4, col = 2 * (lane % 4);
@@ -417,56 +500,79 @@ __global__ void k_gqa_prefill_online(const float* q, int q_stride, CudaKvView ca
         const int r = i / (HD / 8), d = (i % (HD / 8)) * 8;
         const int j = min(qr + r, end - 1);
         const float* src = q + (j / group) * q_stride + (head * group + j % group) * HD + d;
+        auto* dst = reinterpret_cast<half2*>(sh + attention_offset<HD>(r, d));
         #pragma unroll
         for (int e = 0; e < 8; e += 2) {
-            reinterpret_cast<half2*>(sq + attention_offset<HD>(r, d))[e / 2] = __floats2half2_rn(src[e], src[e + 1]);
+            if constexpr (HalfQK) dst[e / 2] = __floats2half2_rn(src[e] * scale, src[e + 1] * scale);
+            else dst[e / 2] = __floats2half2_rn(src[e], src[e + 1]);
         }
     }
     __syncthreads();
     const int j0 = qr + warp * 16 + quad, j1 = j0 + 8;
     const int last0 = start + min(j0, end - 1) / group, last1 = start + min(j1, end - 1) / group;
-    const int last = start + min(qr + Q - 1, end - 1) / group;
+    const int first = start + qr / group, last = start + min(qr + Q - 1, end - 1) / group;
     const int arow = warp * 16 + lane % 16, acol = 8 * (lane / 16);
-    uint4 query[KeepQ ? HD / 16 : 1];
-    if constexpr (KeepQ) {
-        #pragma unroll
-        for (int d = 0; d < HD / 16; ++d) {
-            query[d] = attention_load_q(sq + attention_offset<HD>(arow, 16 * d + acol));
-        }
-        __syncthreads();
+    uint4 query[HD / 16];
+    #pragma unroll
+    for (int d = 0; d < HD / 16; ++d) {
+        query[d] = attention_load_q(sh + attention_offset<HD>(arow, 16 * d + acol));
     }
+    __syncthreads();
     float max0 = -INFINITY, max1 = -INFINITY, sum0 = 0.0f, sum1 = 0.0f;
-    float4 acc[HD / 8]{};
+    std::conditional_t<HalfPV, uint2, float4> acc[HD / 8]{};
     for (int base = 0; base <= last; base += K) {
-        constexpr int V = std::is_same_v<Cache, int8_t> ? 16 : 8;
-        for (int i = tid; i < K * HD / V; i += blockDim.x) {
-            const int r = i / (HD / V), d = (i % (HD / V)) * V;
-            const int t = min(base + r, last);
-            attention_stage_kv<false, Cache, HD>(sk, r, cache, t, head, nkv, d);
-            attention_stage_kv<true, Cache, HD>(sv, r, cache, t, head, nkv, d);
+        if constexpr (HD == 256) {
+            attention_stage_kv_tile<Cache, HD, K, Warps>(sk, sv, cache, base, last, head, nkv);
+        } else {
+            constexpr int V = std::is_same_v<Cache, int8_t> ? 16 : 8;
+            for (int i = tid; i < K * HD / V; i += blockDim.x) {
+                const int r = i / (HD / V), d = (i % (HD / V)) * V;
+                const int t = min(base + r, last);
+                attention_stage_kv<false, Cache, HD>(sk, r, cache, t, head, nkv, d);
+                attention_stage_kv<true, Cache, HD>(sv, r, cache, t, head, nkv, d);
+            }
         }
         if constexpr (std::is_same_v<Cache, half>) {
             asm volatile("cp.async.commit_group;\n\tcp.async.wait_group 0;" ::: "memory");
         }
         __syncthreads();
-        float4 scores[K / 8]{};
-        #pragma unroll (HD == 256 ? 1 : HD / 16)
+        std::conditional_t<HalfQK, uint2, float4> scores[K / 8]{};
+        #pragma unroll
         for (int d = 0; d < HD / 16; ++d) {
-            const auto a = KeepQ ? query[d] : attention_load_q(sq + attention_offset<HD>(arow, 16 * d + acol));
+            const auto a = query[d];
             #pragma unroll
             for (int t = 0; t < K / 8; ++t) {
                 auto b = attention_load_b<false>(sk + attention_offset<HD>(t * 8 + lane % 8,
                                                                            16 * d + 8 * ((lane / 8) % 2)));
-                attention_mma(scores[t], a, b);
+                if constexpr (HalfQK) attention_mma_f16(scores[t], a, b);
+                else attention_mma(scores[t], a, b);
+            }
+        }
+        auto score = [](auto s) {
+            if constexpr (HalfQK) return attention_unpack(s);
+            else return s;
+        };
+        if constexpr (HalfQK) {
+            // Only the tiles intersecting the causal boundary need per-query masks.
+            if (base + K - 1 > first) {
+                #pragma unroll
+                for (int i = 0; i < K / 8; ++i) {
+                    const int t = base + 8 * i + col;
+                    auto& s = scores[i];
+                    s = {attention_mask_pair(s.x, t, last0), attention_mask_pair(s.y, t, last1)};
+                }
             }
         }
         float next0 = max0, next1 = max1;
         #pragma unroll
         for (int i = 0; i < K / 8; ++i) {
-            const int t = base + 8 * i + col;
-            auto& s = scores[i];
-            s = {t <= last0 ? s.x * scale : -INFINITY, t + 1 <= last0 ? s.y * scale : -INFINITY,
-                 t <= last1 ? s.z * scale : -INFINITY, t + 1 <= last1 ? s.w * scale : -INFINITY};
+            if constexpr (!HalfQK) {
+                const int t = base + 8 * i + col;
+                auto& s = scores[i];
+                s = {t <= last0 ? s.x * scale : -INFINITY, t + 1 <= last0 ? s.y * scale : -INFINITY,
+                     t <= last1 ? s.z * scale : -INFINITY, t + 1 <= last1 ? s.w * scale : -INFINITY};
+            }
+            const auto s = score(scores[i]);
             next0 = fmaxf(next0, fmaxf(s.x, s.y));
             next1 = fmaxf(next1, fmaxf(s.z, s.w));
         }
@@ -482,7 +588,7 @@ __global__ void k_gqa_prefill_online(const float* q, int q_stride, CudaKvView ca
         uint4 p[K / 16];
         #pragma unroll
         for (int i = 0; i < K / 16; ++i) {
-            const auto a = scores[2 * i], b = scores[2 * i + 1];
+            const auto a = score(scores[2 * i]), b = score(scores[2 * i + 1]);
             const float ax = attention_exp2(a.x - max0), ay = attention_exp2(a.y - max0);
             const float az = attention_exp2(a.z - max1), aw = attention_exp2(a.w - max1);
             const float bx = attention_exp2(b.x - max0), by = attention_exp2(b.y - max0);
@@ -500,8 +606,16 @@ __global__ void k_gqa_prefill_online(const float* q, int q_stride, CudaKvView ca
         sum0 = fmaf(sum0, alpha0, tile0);
         sum1 = fmaf(sum1, alpha1, tile1);
         if (__any_sync(mask, alpha0 != 1.0f || alpha1 != 1.0f)) {
-            #pragma unroll
-            for (auto& a : acc) a = {a.x * alpha0, a.y * alpha0, a.z * alpha1, a.w * alpha1};
+            if constexpr (HalfPV) {
+                const auto alpha_lo = __float2half2_rn(alpha0), alpha_hi = __float2half2_rn(alpha1);
+                #pragma unroll
+                for (auto& a : acc) {
+                    a = {attention_rescale(a.x, alpha_lo), attention_rescale(a.y, alpha_hi)};
+                }
+            } else {
+                #pragma unroll
+                for (auto& a : acc) a = {a.x * alpha0, a.y * alpha0, a.z * alpha1, a.w * alpha1};
+            }
         }
         #pragma unroll
         for (int d = 0; d < HD / 8; ++d) {
@@ -509,7 +623,8 @@ __global__ void k_gqa_prefill_online(const float* q, int q_stride, CudaKvView ca
             #pragma unroll
             for (int i = 0; i < K / 16; ++i) {
                 const auto b = attention_load_b<true>(sv + attention_offset<HD>(16 * i + lane % 16, 8 * d));
-                attention_mma(a, p[i], b);
+                if constexpr (HalfPV) attention_mma_f16(a, p[i], b);
+                else attention_mma(a, p[i], b);
             }
         }
         __syncthreads();
@@ -517,15 +632,35 @@ __global__ void k_gqa_prefill_online(const float* q, int q_stride, CudaKvView ca
     const float inv0 = 1.0f / sum0, inv1 = 1.0f / sum1;
     #pragma unroll
     for (int d = 0; d < HD / 8; ++d) {
+        float4 a;
+        if constexpr (HalfPV) a = attention_unpack(acc[d]);
+        else a = acc[d];
         if (j0 < end) {
             auto* dst = out + ((j0 / group) * nq + head * group + j0 % group) * HD + d * 8 + col;
-            *reinterpret_cast<float2*>(dst) = {acc[d].x * inv0, acc[d].y * inv0};
+            *reinterpret_cast<float2*>(dst) = {a.x * inv0, a.y * inv0};
         }
         if (j1 < end) {
             auto* dst = out + ((j1 / group) * nq + head * group + j1 % group) * HD + d * 8 + col;
-            *reinterpret_cast<float2*>(dst) = {acc[d].z * inv1, acc[d].w * inv1};
+            *reinterpret_cast<float2*>(dst) = {a.z * inv1, a.w * inv1};
         }
     }
+}
+
+template <int HD, int Warps, typename Cache>
+    requires (HD != 256)
+__global__ void k_gqa_prefill_online(const float* q, int q_stride, CudaKvView cache, float* out,
+                                     int rows, int nq, int nkv, int start, float scale) {
+    extern __shared__ __align__(16) half sh[];
+    gqa_prefill_online<HD, Warps, Cache>(q, q_stride, cache, out, rows, nq, nkv, start, scale, sh);
+}
+
+template <int HD, int Warps, typename Cache>
+    requires (HD == 256)
+__global__ __launch_bounds__(32 * Warps, 3)
+void k_gqa_prefill_online(const float* q, int q_stride, CudaKvView cache, float* out,
+                          int rows, int nq, int nkv, int start, float scale) {
+    extern __shared__ __align__(16) half sh[];
+    gqa_prefill_online<HD, Warps, Cache>(q, q_stride, cache, out, rows, nq, nkv, start, scale, sh);
 }
 
 }  // namespace
@@ -630,12 +765,8 @@ void gqa_prefill_online_f32(const float* q, int q_stride, CudaKvView cache, floa
                             int rows, int q_heads, int kv_heads, int head_dim, int start_pos,
                             float scale, cudaStream_t stream) {
     auto launch = [&]<int HD, int Warps, typename Cache>() {
-        constexpr int Q = 16 * Warps, K = HD == 256 ? 32 : 64;
-        constexpr size_t bytes = ((HD <= 128 ? 0 : Q) + 2 * K) * HD * sizeof(half);
-        if constexpr (bytes > 48 * 1024) {
-            FUSIONRT_CUDA_CHECK(cudaFuncSetAttribute(k_gqa_prefill_online<HD, Warps, Cache>,
-                                                     cudaFuncAttributeMaxDynamicSharedMemorySize, bytes));
-        }
+        constexpr int Q = OnlineAttentionTile<HD, Warps>::Q;
+        constexpr size_t bytes = OnlineAttentionTile<HD, Warps>::Bytes;
         const int queries = rows * (q_heads / kv_heads);
         const dim3 grid(kv_heads, (queries + Q - 1) / Q);
         k_gqa_prefill_online<HD, Warps, Cache><<<grid, 32 * Warps, bytes, stream>>>(
@@ -648,13 +779,7 @@ void gqa_prefill_online_f32(const float* q, int q_stride, CudaKvView cache, floa
     };
     if (head_dim == 64) dispatch.template operator()<64, 4>();
     else if (head_dim == 128) dispatch.template operator()<128, 4>();
-    else if (head_dim == 256) {
-        int device, shared_limit;
-        FUSIONRT_CUDA_CHECK(cudaGetDevice(&device));
-        FUSIONRT_CUDA_CHECK(cudaDeviceGetAttribute(&shared_limit, cudaDevAttrMaxSharedMemoryPerBlockOptin, device));
-        if (shared_limit >= 64 * 1024) dispatch.template operator()<256, 4>();
-        else dispatch.template operator()<256, 2>();
-    }
+    else if (head_dim == 256) dispatch.template operator()<256, 4>();
 }
 
 }  // namespace fusionrt::cuda_ops
