@@ -20,6 +20,18 @@
 
 namespace fusionrt {
 
+struct MlaConfig {
+    int query_rank = 0;
+    int latent_rank = 0;
+    int rope_dims = 0;
+    int value_dim = 0;
+    int leading_dense_layers = 0;
+    float attention_scale = 0.0f;
+    float rope_amplitude = 1.0f;
+
+    int latent_width() const { return latent_rank + rope_dims; }
+};
+
 struct DenseGQAConfig {
     int hidden_size = 512;
     int num_attention_heads = 8;
@@ -33,6 +45,7 @@ struct DenseGQAConfig {
     bool qk_norm = true;                 // Qwen3/Gemma3 style Q/K RMSNorm before RoPE
     bool rope_neox = true;               // NeoX split-half RoPE vs interleaved
     bool gated_q_attn = false;           // Qwen3.5 full-attn joint [Q, gate] projection
+    MlaConfig mla;
     DType weight_dtype = DType::F32;     // F32, F16, BF16, Q8_0, or Q4_0
 };
 
@@ -55,6 +68,10 @@ struct MoEConfig {
     int num_experts = 8;
     int top_k = 2;
     bool norm_topk_prob = true;
+    bool sigmoid_router = false;
+    float expert_weights_scale = 1.0f;
+    int expert_groups = 1;
+    int expert_groups_used = 1;
     int gpu_resident_experts = 8;
     float rms_norm_eps = 1e-6f;
     bool has_shared_expert = true;
@@ -155,6 +172,7 @@ struct CudaDenseGQALayer {
     Tensor v_proj;          // [kv_dim, hidden]
     std::array<Tensor, 3> projection_packs;
     Tensor q_bias, k_bias, v_bias;
+    Tensor mla_q_a, mla_q_a_norm, mla_kv_a, mla_kv_a_norm, mla_k_b, mla_v_b;
     Tensor q_norm_w;        // [head_dim] (optional)
     Tensor k_norm_w;        // [head_dim] (optional)
     Tensor rope_factors;    // [rotary_dims / 2] (optional)
@@ -196,6 +214,7 @@ struct CudaSparseMoELayer {
     MoEConfig cfg;
     Tensor norm_w;                // [hidden]
     Tensor router_w;              // [num_experts, hidden]
+    Tensor router_bias;           // Optional correction for expert selection.
     Tensor gpu_gate_up_w;         // [gpu_resident_experts, (2*)inter, hidden]
     Tensor gpu_up_w;              // Separate up projection for unpacked gate/up weights.
     Tensor gpu_down_w;            // [gpu_resident_experts, hidden, inter]

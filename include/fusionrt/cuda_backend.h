@@ -162,9 +162,13 @@ struct CudaKvView {
     int elements = 0;         // Elements in one plane before quantization.
     int max_pages = 0;
     DType dtype = DType::F32;
+    bool latent = false;
+
+    size_t page_bytes() const { return (latent ? 1 : 2) * plane_bytes; }
 };
 
-CudaKvView make_cuda_kv_view(CudaArena& arena, DType dtype, int max_tokens, int kv_heads, int head_dim);
+CudaKvView make_cuda_kv_view(CudaArena& arena, DType dtype, int max_tokens, int kv_heads, int head_dim,
+                             bool latent = false);
 
 class CudaKvPool {
 public:

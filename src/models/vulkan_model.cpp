@@ -238,6 +238,10 @@ bool FusionModel::load_gguf_vulkan(VkContext& ctx, const std::string& path, std:
         if (err) *err = "Gemma 4 GGUF requires the CUDA backend";
         return false;
     }
+    if (raw.cfg.dense.mla.latent_rank > 0) {
+        if (err) *err = "DeepSeek MLA requires the CUDA backend";
+        return false;
+    }
     if (!raw.rope_factors.bytes().empty()) {
         if (err) *err = "Vulkan does not support GGUF RoPE frequency factors";
         return false;

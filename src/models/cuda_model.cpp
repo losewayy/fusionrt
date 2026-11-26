@@ -283,7 +283,8 @@ void CudaSparseMoELayer::forward_cuda(CudaContext& ctx, Tensor& x_in_out, bool u
     Tensor topk_idx = cuda_scratch(ctx, {K}, DType::I32);
     Tensor topk_w = cuda_scratch(ctx, {K});
     cuda_ops::moe_topk_router_f32(logits.ptr<float>(), topk_idx.ptr<int>(), topk_w.ptr<float>(),
-                                  E, K, cfg.norm_topk_prob, ctx.stream());
+                                  E, K, cfg.norm_topk_prob, ctx.stream(), router_bias.ptr<float>(),
+                                  cfg.sigmoid_router, cfg.expert_weights_scale, cfg.expert_groups, cfg.expert_groups_used);
 
     float* host_x = nullptr;
     float* host_out = nullptr;
@@ -406,6 +407,39 @@ Tensor upload_cuda_matrix(CudaContext& ctx, CudaArena& arena, const HostTensor& 
     const auto dtype = cuda_matrix_dtype(ctx.cost_hardware(), src, is_vocab_head);
     return dtype == src.desc.dtype ? upload_cuda_weight(ctx, arena, src) :
                                      upload_cuda_weight(ctx, arena, repack_matrix_for_cuda(src, dtype));
+}
+
+DType mla_weight_dtype(DType source) {
+    return source == DType::F32 ? DType::F32 : DType::F16;
+}
+
+void upload_mla_weights(CudaContext& ctx, CudaArena& arena, const LoadedLayerRaw& raw, CudaDenseGQALayer& layer) {
+    auto upload_b = [&](const HostTensor& source, DType dtype) {
+        if (source.desc.dtype == dtype) return upload_cuda_weight(ctx, arena, source);
+        return upload_cuda_weight(ctx, arena, quantize_host_matrix(to_f32_host(source), dtype));
+    };
+    if (!raw.mla_kv_b.bytes().empty()) {
+        const auto& d = layer.cfg;
+        const int heads = d.num_attention_heads, rank = d.mla.latent_rank, dv = d.mla.value_dim;
+        const int nope = d.head_dim - d.mla.rope_dims;
+        const auto combined = to_f32_host(raw.mla_kv_b);
+        auto k = HostTensor::create({heads, rank, nope}, DType::F32);
+        auto v = HostTensor::create({heads, dv, rank}, DType::F32);
+        for (int h = 0; h < heads; ++h) {
+            const float* src = combined.data<float>() + static_cast<size_t>(h) * (nope + dv) * rank;
+            float* dst = k.data<float>() + static_cast<size_t>(h) * rank * nope;
+            for (int r = 0; r < rank; ++r)
+                for (int i = 0; i < nope; ++i) dst[r * nope + i] = src[i * rank + r];
+            std::copy_n(src + static_cast<size_t>(nope) * rank, static_cast<size_t>(dv) * rank,
+                        v.data<float>() + static_cast<size_t>(h) * dv * rank);
+        }
+        const auto dtype = mla_weight_dtype(raw.mla_kv_b.desc.dtype);
+        layer.mla_k_b = upload_b(k, dtype);
+        layer.mla_v_b = upload_b(v, dtype);
+    } else {
+        layer.mla_k_b = upload_b(raw.mla_k_b, mla_weight_dtype(raw.mla_k_b.desc.dtype));
+        layer.mla_v_b = upload_b(raw.mla_v_b, mla_weight_dtype(raw.mla_v_b.desc.dtype));
+    }
 }
 
 template <size_t Count>
@@ -608,6 +642,7 @@ static bool upload_raw_model_to_cuda(CudaContext& ctx, CudaArena& arena, LoadedM
         L.cfg.intermediate_size = static_cast<int>(lr.experts_down.desc.shape[2]);
         L.norm_w = upload_cuda_weight(ctx, arena, lr.mlp_norm.bytes().empty() ? lr.attn_norm : lr.mlp_norm);
         L.router_w = upload_cuda_weight(ctx, arena, lr.router_w);
+        if (!lr.router_bias.bytes().empty()) L.router_bias = upload_cuda_weight(ctx, arena, lr.router_bias);
         auto split = [&](HostTensor& weights, Tensor& gpu, HostTensor& cpu) {
             if (weights.bytes().empty()) return;
             const auto& shape = weights.desc.shape;
@@ -665,7 +700,16 @@ static bool upload_raw_model_to_cuda(CudaContext& ctx, CudaArena& arena, LoadedM
                 L.ple_projection = upload_cuda_matrix(ctx, arena, lr.ple_projection);
                 L.ple_post_norm = upload_cuda_weight(ctx, arena, lr.ple_post_norm);
             }
-            if (L.kv_source_layer >= 0) {
+            if (L.cfg.mla.latent_rank > 0) {
+                L.q_proj = upload_cuda_matrix(ctx, arena, lr.q_proj);
+                if (L.cfg.mla.query_rank > 0) {
+                    L.mla_q_a = upload_cuda_matrix(ctx, arena, lr.mla_q_a);
+                    L.mla_q_a_norm = upload_cuda_weight(ctx, arena, lr.mla_q_a_norm);
+                }
+                L.mla_kv_a = upload_cuda_matrix(ctx, arena, lr.mla_kv_a);
+                L.mla_kv_a_norm = upload_cuda_weight(ctx, arena, lr.mla_kv_a_norm);
+                upload_mla_weights(ctx, arena, lr, L);
+            } else if (L.kv_source_layer >= 0) {
                 L.q_proj = upload_cuda_matrix(ctx, arena, lr.q_proj);
             } else if (lr.v_proj.bytes().empty()) {
                 std::array<Tensor, 2> packs;
@@ -751,10 +795,25 @@ static size_t cuda_model_arena_bytes(const LoadedModelRaw& raw, const CostHardwa
                              &l.q_bias, &l.k_bias, &l.v_bias, &l.o_proj, &l.mlp_norm, &l.gate_up,
                              &l.attn_post_norm, &l.ffn_post_norm,
                              &l.ple_gate, &l.ple_projection, &l.ple_post_norm,
+                             &l.mla_q_a, &l.mla_q_a_norm, &l.mla_kv_a, &l.mla_kv_a_norm,
                              &l.gate, &l.up, &l.down, &l.z_proj, &l.a_proj, &l.b_proj,
                              &l.conv_w, &l.conv_bias, &l.A_log, &l.dt_bias, &l.gdn_norm_w,
-                             &l.router_w, &l.shared_gate_up, &l.shared_down}) {
+                             &l.router_w, &l.router_bias, &l.shared_gate_up, &l.shared_down}) {
             weight(*t);
+        }
+        if (d.mla.latent_rank > 0) {
+            const auto split_bytes = [](const HostTensor& t) {
+                return t.desc.numel() * dtype_type_size(mla_weight_dtype(t.desc.dtype));
+            };
+            if (l.mla_kv_b.bytes().empty()) {
+                reserve(split_bytes(l.mla_k_b));
+                reserve(split_bytes(l.mla_v_b));
+            } else {
+                const size_t unit = static_cast<size_t>(d.num_attention_heads) * d.mla.latent_rank *
+                    dtype_type_size(mla_weight_dtype(l.mla_kv_b.desc.dtype));
+                reserve(unit * (d.head_dim - d.mla.rope_dims));
+                reserve(unit * d.mla.value_dim);
+            }
         }
         for (const auto* t : {&l.experts_gate_up, &l.experts_up, &l.experts_down}) {
             if (t->bytes().empty()) continue;
@@ -822,7 +881,9 @@ static int place_cuda_experts(CudaContext& ctx, LoadedModelRaw& raw, int overrid
             if (layer.kind != 0 || layer.kv_source_layer >= 0) continue;
             const int heads = layer.kv_heads > 0 ? layer.kv_heads : cfg.num_key_value_heads;
             const int dim = layer.head_dim > 0 ? layer.head_dim : cfg.head_dim;
-            kv += pages * 2 * row_nbytes(ctx.kv_dtype(), kKvPageTokens * heads * dim);
+            kv += pages * (cfg.mla.latent_rank > 0
+                ? kKvPageTokens * static_cast<size_t>(cfg.mla.latent_width()) * sizeof(float)
+                : 2 * row_nbytes(ctx.kv_dtype(), kKvPageTokens * heads * dim));
             page_table_bytes += (pages * sizeof(uint8_t*) + 255) & ~size_t{255};
         }
         kv *= static_cast<size_t>(slots);
@@ -885,7 +946,7 @@ bool FusionModel::load_gguf(CudaContext& ctx, const std::string& path, std::stri
                                     layer_kinds_, layer_indices_, dense_layers_, gdn_layers_, moe_layers_)) {
         return false;
     }
-    cuda_kv_dtype_ = ctx.kv_dtype();
+    cuda_kv_dtype_ = cfg_.dense.mla.latent_rank > 0 ? DType::F32 : ctx.kv_dtype();
     cuda_slots_[0] = make_cuda_session();
     rebuild_cuda_ir();
     return true;
@@ -941,8 +1002,10 @@ std::unique_ptr<FusionModel::CudaSession> FusionModel::make_cuda_session() const
     slot->storage.init(table_bytes + state_bytes);
     for (const auto& layer : dense_layers_) {
         const auto& d = layer.cfg;
+        const bool mla = d.mla.latent_rank > 0;
         slot->kv.push_back(layer.kv_source_layer >= 0 ? CudaKvView{} :
-            make_cuda_kv_view(slot->storage, cuda_kv_dtype_, d.max_seq_len, d.num_key_value_heads, d.head_dim));
+            make_cuda_kv_view(slot->storage, cuda_kv_dtype_, d.max_seq_len, d.num_key_value_heads,
+                              mla ? d.mla.latent_width() : d.head_dim, mla));
     }
     if (state_bytes != 0) {
         slot->gdn_data = slot->storage.alloc(state_bytes);
@@ -1147,6 +1210,16 @@ static OpTiming operator_work(const IRNode& node, int rows, int pos, const CudaC
             work.flops = 5 * m * k;
             linear(*node.weight, false);
             break;
+        case OpKind::MLA_ATTN_BLOCK: {
+            const auto& d = dense->cfg;
+            const int64_t heads = d.num_attention_heads, rank = d.mla.latent_rank, width = d.mla.latent_width();
+            const int64_t visible = std::max<int64_t>(1, pos + 1);
+            const int64_t projections = rank * (d.head_dim - d.mla.rope_dims + d.mla.value_dim);
+            work.flops += 2 * m * heads * (projections + visible * (width + rank));
+            work.bytes += m * (dense->mla_k_b.nbytes() + dense->mla_v_b.nbytes() +
+                              f32 * heads * visible * width);
+            break;
+        }
         case OpKind::GQA_ATTN_BLOCK: {
             const int64_t hd = node.attention.head_dim;
             const int64_t pairs = m * pos + m * (m + 1) / 2;
@@ -1388,6 +1461,21 @@ static void execute_ir_graph_cuda(
                 };
                 if (pa.enabled && is_lm_head && M > 1) pa.lm_ms += time_cuda_fn(ctx.stream(), fn);
                 else fn();
+                break;
+            }
+            case OpKind::MLA_ATTN_BLOCK: {
+                const auto& layer = dense_layers[node.layer_index];
+                const auto& d = layer.cfg;
+                const int heads = d.num_attention_heads;
+                const auto& mla = d.mla;
+                auto& output = get_out_buf(node.out, node.output_cols, rows);
+                auto query = cuda_scratch(ctx, {rows, heads, mla.latent_width()});
+                auto latent = cuda_scratch(ctx, {rows, heads, mla.latent_rank});
+                cuda_ops::mla_attention_f32(bufs[node.inputs[0]].ptr<float>(), bufs[node.inputs[1]].ptr<float>(),
+                    layer.mla_kv_a_norm.ptr<float>(), layer.mla_k_b, layer.mla_v_b, layer.rope_factors.ptr<float>(),
+                    query.ptr<float>(), latent.ptr<float>(), output.ptr<float>(), kv_states[node.layer_index],
+                    rows, heads, d.head_dim, start_pos, pos_dev, d.rms_norm_eps, mla.attention_scale,
+                    mla.rope_amplitude, ctx.stream());
                 break;
             }
             case OpKind::GQA_ATTN_BLOCK: {
@@ -1643,7 +1731,8 @@ static void execute_ir_graph_cuda(
                     work = operator_work(node, node.output_logits ? 1 : M, pos_host, ctx, use_fused,
                         !node.inputs.empty() && bufs[node.inputs[0]].dtype == DType::Q8_1,
                         node.out >= 0 && bufs[node.out].dtype == DType::Q8_1,
-                        node.op == OpKind::GQA_ATTN_BLOCK ? &dense_layers[node.layer_index] : nullptr,
+                        node.op == OpKind::GQA_ATTN_BLOCK || node.op == OpKind::MLA_ATTN_BLOCK
+                            ? &dense_layers[node.layer_index] : nullptr,
                         node.op == OpKind::MOE_FFN_BLOCK ? &moe_layers[node.layer_index] : nullptr,
                         node.op == OpKind::GQA_ATTN_BLOCK ? kv_states[dense_layers[node.layer_index].kv_source_layer >= 0
                             ? dense_layers[node.layer_index].kv_source_layer : node.layer_index].dtype : DType::F32);
@@ -1767,6 +1856,11 @@ int FusionModel::prefill_batch_limit(CudaContext& ctx) const {
     const int q = d.num_attention_heads * d.head_dim;
     const int kv = d.num_key_value_heads * d.head_dim;
     int64_t dense_extra = std::max<int64_t>(3LL * d.intermediate_size, 4LL * q + 2LL * kv);
+    if (d.mla.latent_rank > 0) {
+        const int64_t heads = d.num_attention_heads;
+        dense_extra = std::max<int64_t>(dense_extra, q + d.mla.latent_width() + 2LL * d.mla.query_rank +
+            heads * (d.mla.latent_width() + d.mla.latent_rank + d.mla.value_dim));
+    }
     if (cfg_.model_architecture == "gemma4") {
         for (const auto& layer : dense_layers_) {
             const auto& a = layer.cfg;
@@ -1846,7 +1940,8 @@ ModelMemory FusionModel::inspect_cuda(CudaContext& ctx) {
         count({&l.attn_norm_w, &l.q_proj, &l.k_proj, &l.v_proj, &l.q_bias, &l.k_bias, &l.v_bias,
                &l.q_norm_w, &l.k_norm_w, &l.rope_factors, &l.o_proj, &l.mlp_norm_w,
                &l.gate_up_proj, &l.gate_proj, &l.up_proj, &l.down_proj, &l.attn_post_norm_w, &l.ffn_post_norm_w,
-               &l.ple_gate, &l.ple_projection, &l.ple_post_norm});
+               &l.ple_gate, &l.ple_projection, &l.ple_post_norm,
+               &l.mla_q_a, &l.mla_q_a_norm, &l.mla_kv_a, &l.mla_kv_a_norm, &l.mla_k_b, &l.mla_v_b});
     }
     for (const auto& l : gdn_layers_) {
         count({&l.attn_norm_w, &l.qkv_proj, &l.z_proj, &l.a_proj, &l.b_proj, &l.conv_w, &l.conv_bias,
@@ -1854,7 +1949,7 @@ ModelMemory FusionModel::inspect_cuda(CudaContext& ctx) {
                &l.gate_proj, &l.up_proj, &l.down_proj});
     }
     for (const auto& l : moe_layers_) {
-        count({&l.norm_w, &l.router_w, &l.gpu_gate_up_w, &l.gpu_up_w, &l.gpu_down_w,
+        count({&l.norm_w, &l.router_w, &l.router_bias, &l.gpu_gate_up_w, &l.gpu_up_w, &l.gpu_down_w,
                &l.shared_gate_up_w, &l.shared_down_w});
     }
 

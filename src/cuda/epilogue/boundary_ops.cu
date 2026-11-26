@@ -354,40 +354,73 @@ __global__ void k_qk_norm_rope_kv_append(
 __global__ void k_moe_topk_router(const float* __restrict__ logits,
                                   int* __restrict__ topk_idx,
                                   float* __restrict__ topk_weight,
-                                  int num_experts, int top_k, bool norm_topk) {
+                                  int num_experts, int top_k, bool norm_topk,
+                                  const float* selection_bias, bool sigmoid, float scale,
+                                  int groups, int groups_used) {
     if (threadIdx.x != 0 || blockIdx.x != 0) return;
-    // Softmax over experts
-    float max_l = -1e30f;
-    for (int e = 0; e < num_experts; ++e) max_l = fmaxf(max_l, logits[e]);
-    float sum_e = 0.0f;
     float probs[256];
-    int ne = (num_experts < 256) ? num_experts : 256;
-    for (int e = 0; e < ne; ++e) {
-        probs[e] = expf(logits[e] - max_l);
-        sum_e += probs[e];
+    const int ne = min(num_experts, 256);
+    if (sigmoid) {
+        for (int e = 0; e < ne; ++e) probs[e] = 1.0f / (1.0f + expf(-logits[e]));
+    } else {
+        float max_l = -INFINITY;
+        for (int e = 0; e < ne; ++e) max_l = fmaxf(max_l, logits[e]);
+        float sum_e = 0.0f;
+        for (int e = 0; e < ne; ++e) {
+            probs[e] = expf(logits[e] - max_l);
+            sum_e += probs[e];
+        }
+        for (int e = 0; e < ne; ++e) probs[e] /= sum_e;
     }
-    for (int e = 0; e < ne; ++e) probs[e] /= sum_e;
+
+    const int group_width = ne / groups;
+    bool selected_groups[128]{};
+    if (groups_used < groups) {
+        float group_scores[128];
+        for (int g = 0; g < groups; ++g) {
+            float first = -INFINITY, second = -INFINITY;
+            for (int e = g * group_width; e < (g + 1) * group_width; ++e) {
+                const float score = selection_bias ? probs[e] + selection_bias[e] : probs[e];
+                second = fmaxf(second, fminf(first, score));
+                first = fmaxf(first, score);
+            }
+            group_scores[g] = first + second;
+        }
+        for (int i = 0; i < groups_used; ++i) {
+            int best = -1;
+            for (int g = 0; g < groups; ++g) {
+                if (!selected_groups[g] && (best < 0 || group_scores[g] > group_scores[best])) best = g;
+            }
+            selected_groups[best] = true;
+        }
+    }
 
     float weight_sum = 0.0f;
     for (int k = 0; k < top_k; ++k) {
         int best_e = -1;
-        float best_p = -1.0f;
+        float best_score = -INFINITY;
         for (int e = 0; e < ne; ++e) {
+            if (groups_used < groups && !selected_groups[e / group_width]) continue;
             bool used = false;
             for (int prev = 0; prev < k; ++prev) {
                 if (topk_idx[prev] == e) used = true;
             }
-            if (!used && probs[e] > best_p) {
-                best_p = probs[e];
+            const float score = selection_bias ? probs[e] + selection_bias[e] : probs[e];
+            if (!used && (best_e < 0 || score > best_score)) {
+                best_score = score;
                 best_e = e;
             }
         }
         topk_idx[k] = best_e;
-        topk_weight[k] = best_p;
-        weight_sum += best_p;
+        topk_weight[k] = probs[best_e];
+        weight_sum += topk_weight[k];
     }
-    if (norm_topk && weight_sum > 0.0f) {
+    if (norm_topk) {
+        weight_sum = fmaxf(weight_sum, 0x1p-14f);
         for (int k = 0; k < top_k; ++k) topk_weight[k] /= weight_sum;
+    }
+    if (scale != 1.0f) {
+        for (int k = 0; k < top_k; ++k) topk_weight[k] *= scale;
     }
 }
 
@@ -906,8 +939,10 @@ void fused_qk_norm_rope_kv_append_f32(
 }
 
 void moe_topk_router_f32(const float* logits, int* topk_idx, float* topk_weight,
-                         int num_experts, int top_k, bool norm_topk, cudaStream_t stream) {
-    k_moe_topk_router<<<1, 1, 0, stream>>>(logits, topk_idx, topk_weight, num_experts, top_k, norm_topk);
+                         int num_experts, int top_k, bool norm_topk, cudaStream_t stream,
+                         const float* selection_bias, bool sigmoid, float scale, int groups, int groups_used) {
+    k_moe_topk_router<<<1, 1, 0, stream>>>(logits, topk_idx, topk_weight, num_experts, top_k, norm_topk,
+                                          selection_bias, sigmoid, scale, groups, groups_used);
 }
 
 void moe_indexed_swiglu_gemv(

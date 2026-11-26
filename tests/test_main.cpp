@@ -6,6 +6,7 @@
 #include "fusionrt/tokenizer.h"
 #include "fusionrt/vision.h"
 #include "agent.h"
+#include "../src/models/model_loader.h"
 #ifdef FUSIONRT_ENABLE_CUDA
 #include "../src/core/cpu_moe.h"
 #include "fusionrt/cuda_backend.h"
@@ -23,6 +24,7 @@
 #include <fstream>
 #include <iostream>
 #include <limits>
+#include <numeric>
 #include <random>
 #include <stdexcept>
 #include <thread>
@@ -2939,6 +2941,290 @@ void test_chunked_prefill_and_k_quant_gdn() {
 }
 #endif
 
+void test_stage7c_mla() {
+    constexpr int hidden = 32, vocab = 48, layers = 2, heads = 8;
+    constexpr int rank = 160, rope = 8, nope = 24, key = nope + rope, value = 24;
+    constexpr int experts = 4, top_k = 2, expert_width = 16, shared = 2;
+    constexpr int query_rank = 24;
+    constexpr float eps = 1e-6f, router_scale = 1.35f, yarn_log_mul = 0.07f;
+    struct Fixture {
+        std::filesystem::path path = "test-stage7c-mla.gguf";
+        ~Fixture() { std::error_code ec; std::filesystem::remove(path, ec); }
+    } fixture;
+#ifdef FUSIONRT_ENABLE_CUDA
+    CudaContext ctx(0, 0, 32);
+#endif
+    for (const bool lora : {false, true}) {
+        std::map<std::string, GgufMetaValue> meta{
+            {"general.architecture", std::string("deepseek2")}, {"deepseek2.block_count", uint32_t{layers}},
+            {"deepseek2.embedding_length", uint32_t{hidden}}, {"deepseek2.attention.head_count", uint32_t{heads}},
+            {"deepseek2.attention.head_count_kv", uint32_t{1}}, {"deepseek2.context_length", uint32_t{256}},
+            {"deepseek2.attention.key_length", static_cast<uint32_t>(lora ? rank + rope : key)},
+            {"deepseek2.attention.value_length", static_cast<uint32_t>(lora ? rank : value)},
+            {"deepseek2.attention.kv_lora_rank", uint32_t{rank}}, {"deepseek2.rope.dimension_count", uint32_t{rope}},
+            {"deepseek2.rope.freq_base", 100.0f}, {"deepseek2.attention.layer_norm_rms_epsilon", eps},
+            {"deepseek2.feed_forward_length", uint32_t{hidden}}, {"deepseek2.leading_dense_block_count", uint32_t{1}},
+            {"deepseek2.expert_count", uint32_t{experts}}, {"deepseek2.expert_used_count", uint32_t{top_k}},
+            {"deepseek2.expert_shared_count", uint32_t{shared}}, {"deepseek2.expert_feed_forward_length", uint32_t{expert_width}},
+            {"deepseek2.expert_gating_func", uint32_t{2}}, {"deepseek2.expert_weights_norm", true},
+            {"deepseek2.expert_weights_scale", router_scale}
+        };
+        if (lora) {
+            meta["deepseek2.attention.q_lora_rank"] = uint32_t{query_rank};
+            meta["deepseek2.attention.key_length_mla"] = uint32_t{key};
+            meta["deepseek2.attention.value_length_mla"] = uint32_t{value};
+            meta["deepseek2.rope.scaling.type"] = std::string("yarn");
+            meta["deepseek2.rope.scaling.factor"] = 4.0f;
+            meta["deepseek2.rope.scaling.original_context_length"] = uint32_t{256};
+            meta["deepseek2.rope.scaling.yarn_log_multiplier"] = yarn_log_mul;
+            meta["deepseek2.expert_group_count"] = uint32_t{2};
+            meta["deepseek2.expert_group_used_count"] = uint32_t{1};
+        }
+        std::mt19937_64 rng(7003);
+        std::vector<std::pair<std::string, HostTensor>> tensors;
+        auto add = [&](const std::string& name, std::vector<int64_t> shape, float scale = 0.09f) {
+            tensors.emplace_back(name, model_io::make_rand_f32(shape, rng, scale));
+        };
+        auto norm_weight = [&](const std::string& name, int width) {
+            add(name, {width}, 0.04f);
+            float* w = tensors.back().second.data<float>();
+            for (int i = 0; i < width; ++i) w[i] += 1.0f;
+        };
+        add("token_embd.weight", {vocab, hidden});
+        add("output.weight", {vocab, hidden});
+        norm_weight("output_norm.weight", hidden);
+        std::array<HostTensor, layers> combined;
+        for (int i = 0; i < layers; ++i) {
+            const std::string p = "blk." + std::to_string(i) + ".";
+            norm_weight(p + "attn_norm.weight", hidden);
+            norm_weight(p + "ffn_norm.weight", hidden);
+            norm_weight(p + "attn_kv_a_norm.weight", rank);
+            add(p + "attn_kv_a_mqa.weight", {rank + rope, hidden});
+            if (lora) {
+                add(p + "attn_q_a.weight", {query_rank, hidden});
+                norm_weight(p + "attn_q_a_norm.weight", query_rank);
+                add(p + "attn_q_b.weight", {heads * key, query_rank});
+            } else {
+                add(p + "attn_q.weight", {heads * key, hidden});
+            }
+            add(p + "attn_output.weight", {hidden, heads * value}, 0.04f);
+            combined[i] = model_io::make_rand_f32({heads, nope + value, rank}, rng, 0.04f);
+            if (lora) {
+                // Store split KV-B in FP16 and use the same rounded weights in the expanded reference.
+                combined[i] = model_io::to_f32_host(model_io::quantize_host_matrix(combined[i], DType::F16));
+                HostTensor k({heads, rank, nope}, DType::F32), v({heads, value, rank}, DType::F32);
+                for (int h = 0; h < heads; ++h) {
+                    const float* src = combined[i].data<float>() + h * (nope + value) * rank;
+                    for (int d = 0; d < nope; ++d)
+                        for (int c = 0; c < rank; ++c) k.data<float>()[(h * rank + c) * nope + d] = src[d * rank + c];
+                    std::copy_n(src + nope * rank, value * rank, v.data<float>() + h * value * rank);
+                }
+                tensors.emplace_back(p + "attn_k_b.weight", model_io::quantize_host_matrix(k, DType::F16));
+                tensors.emplace_back(p + "attn_v_b.weight", model_io::quantize_host_matrix(v, DType::F16));
+            } else {
+                auto packed = combined[i];
+                packed.desc = Tensor::from_shape({heads * (nope + value), rank}, DType::F32, Backend::CPU);
+                tensors.emplace_back(p + "attn_kv_b.weight", std::move(packed));
+            }
+            if (i == 0) {
+                add(p + "ffn_gate.weight", {hidden, hidden});
+                add(p + "ffn_up.weight", {hidden, hidden});
+                add(p + "ffn_down.weight", {hidden, hidden});
+            } else {
+                add(p + "ffn_gate_inp.weight", {experts, hidden});
+                add(p + "exp_probs_b.bias", {experts});
+                auto* bias = tensors.back().second.data<float>();
+                bias[0] = 3.6f;
+                bias[1] = -3.0f;
+                bias[2] = 1.8f;
+                bias[3] = 0.7f;
+                add(p + "ffn_gate_exps.weight", {experts, expert_width, hidden});
+                add(p + "ffn_up_exps.weight", {experts, expert_width, hidden});
+                add(p + "ffn_down_exps.weight", {experts, hidden, expert_width});
+                add(p + "ffn_gate_shexp.weight", {shared * expert_width, hidden});
+                add(p + "ffn_up_shexp.weight", {shared * expert_width, hidden});
+                add(p + "ffn_down_shexp.weight", {hidden, shared * expert_width});
+            }
+        }
+        std::string error;
+        const auto path = fixture.path.string();
+        model_io::LoadedModelRaw raw;
+        if (!GgufFile::write_v3(path, meta, tensors, &error) ||
+            !model_io::parse_gguf_model_raw(path, 0, raw, &error)) {
+            throw std::runtime_error("DeepSeek MLA GGUF roundtrip: " + error);
+        }
+        const auto& mla = raw.cfg.dense.mla;
+        if (mla.query_rank != (lora ? query_rank : 0) || mla.latent_width() != rank + rope ||
+            mla.value_dim != value || mla.leading_dense_layers != 1 || raw.cfg.dense.head_dim != key ||
+            raw.cfg.dense.num_key_value_heads != 1 || raw.cfg.moe.num_experts != experts ||
+            !raw.cfg.moe.sigmoid_router || raw.cfg.moe.top_k != top_k || raw.cfg.moe.expert_weights_scale != router_scale ||
+            raw.cfg.moe.expert_groups != (lora ? 2 : 1) || raw.cfg.moe.expert_groups_used != 1 ||
+            !raw.layers.at(0).router_w.bytes().empty() || raw.layers.at(1).router_bias.bytes().empty() ||
+            !raw.layers.at(1).has_shared || raw.cfg.moe.shared_intermediate_size != shared * expert_width) {
+            throw std::runtime_error("DeepSeek MLA roundtrip metadata and tensors");
+        }
+        std::cout << "  [PASS] DeepSeek MLA GGUF " << (lora ? "Q-LoRA/split KV-B/YaRN" : "direct Q/combined KV-B")
+                  << ", dense + MoE, shared and sigmoid+bias routing\n";
+#ifdef FUSIONRT_ENABLE_CUDA
+        FusionModel model(HybridModelConfig{});
+        model.set_moe_gpu_experts(experts);
+        if (!model.load_gguf(ctx, path, &error, 0, true)) throw std::runtime_error(error);
+        const std::vector<int32_t> prompt{2, 9, 11, 3, 5, 24, 7, 8, 16};
+        using Row = std::vector<double>;
+        auto weight = [&](const std::string& name) -> const HostTensor& {
+            return std::find_if(tensors.begin(), tensors.end(), [&](const auto& entry) { return entry.first == name; })->second;
+        };
+        auto linear = [](const HostTensor& w, const Row& input, int group = 0) {
+            const int64_t n = w.desc.shape[w.desc.ndim - 2], k = w.desc.shape[w.desc.ndim - 1];
+            const float* p = w.data<float>() + group * n * k;
+            Row out(n);
+            for (int64_t i = 0; i < n; ++i)
+                out[i] = std::inner_product(input.begin(), input.end(), p + i * k, 0.0);
+            return out;
+        };
+        auto norm = [&](const std::string& name, Row input) {
+            const double rms = std::sqrt(std::inner_product(input.begin(), input.end(), input.begin(), 0.0) / input.size() + eps);
+            const float* w = weight(name).data<float>();
+            for (size_t i = 0; i < input.size(); ++i) input[i] *= w[i] / rms;
+            return input;
+        };
+        auto rotate = [&](double* x, size_t t) {
+            for (int j = 0; j < rope / 2; ++j) {
+                // For this YaRN fixture the correction interval is [0, 4].
+                const double rate = lora ? (1 - 0.75 * j / 4) : 1;
+                const double a = t * std::pow(100.0, -2.0 * j / rope) * rate;
+                const double c = std::cos(a), s = std::sin(a), re = x[2 * j], im = x[2 * j + 1];
+                x[2 * j] = c * re - s * im;
+                x[2 * j + 1] = s * re + c * im;
+            }
+        };
+        auto ffn = [&](const std::string& p, const std::string& suffix, const Row& input, int group = 0) {
+            auto gate = linear(weight(p + "ffn_gate" + suffix + ".weight"), input, group);
+            auto up = linear(weight(p + "ffn_up" + suffix + ".weight"), input, group);
+            for (size_t j = 0; j < gate.size(); ++j) gate[j] *= up[j] / (1.0 + std::exp(-gate[j]));
+            return linear(weight(p + "ffn_down" + suffix + ".weight"), gate, group);
+        };
+        std::vector<Row> h;
+        for (const int token : prompt) {
+            const auto* emb = weight("token_embd.weight").data<float>() + token * hidden;
+            h.emplace_back(emb, emb + hidden);
+        }
+        const double mscale = lora ? 1 + yarn_log_mul * std::log(4.0) : 1;
+        const double attention_scale = mscale * mscale / std::sqrt(key);
+        for (int l = 0; l < layers; ++l) {
+            const std::string p = "blk." + std::to_string(l) + ".";
+            std::vector<Row> queries, keys, expanded_kv;
+            for (size_t t = 0; t < h.size(); ++t) {
+                auto input = norm(p + "attn_norm.weight", h[t]);
+                auto q = lora ? linear(weight(p + "attn_q_b.weight"),
+                                       norm(p + "attn_q_a_norm.weight", linear(weight(p + "attn_q_a.weight"), input)))
+                              : linear(weight(p + "attn_q.weight"), input);
+                for (int a = 0; a < heads; ++a) rotate(q.data() + a * key + nope, t);
+                queries.push_back(std::move(q));
+                auto latent = linear(weight(p + "attn_kv_a_mqa.weight"), input);
+                keys.emplace_back(latent.begin() + rank, latent.end());
+                rotate(keys.back().data(), t);
+                latent.resize(rank);
+                latent = norm(p + "attn_kv_a_norm.weight", std::move(latent));
+                expanded_kv.emplace_back();
+                for (int a = 0; a < heads; ++a) {
+                    const auto full = linear(combined[l], latent, a);
+                    expanded_kv.back().insert(expanded_kv.back().end(), full.begin(), full.end());
+                }
+            }
+            for (size_t t = 0; t < h.size(); ++t) {
+                Row attended(heads * value, 0.0);
+                for (int a = 0; a < heads; ++a) {
+                    const double* q = queries[t].data() + a * key;
+                    Row scores(t + 1);
+                    for (size_t j = 0; j <= t; ++j) {
+                        const double* k = expanded_kv[j].data() + a * (nope + value);
+                        scores[j] = attention_scale * (std::inner_product(q, q + nope, k, 0.0) +
+                            std::inner_product(q + nope, q + key, keys[j].begin(), 0.0));
+                    }
+                    const double peak = *std::max_element(scores.begin(), scores.end());
+                    double mass = 0;
+                    for (size_t j = 0; j <= t; ++j) {
+                        const double probability = std::exp(scores[j] - peak);
+                        mass += probability;
+                        const double* v = expanded_kv[j].data() + a * (nope + value) + nope;
+                        for (int d = 0; d < value; ++d) attended[a * value + d] += probability * v[d];
+                    }
+                    for (int d = 0; d < value; ++d) attended[a * value + d] /= mass;
+                }
+                auto projected = linear(weight(p + "attn_output.weight"), attended);
+                for (int d = 0; d < hidden; ++d) h[t][d] += projected[d];
+                const auto input = norm(p + "ffn_norm.weight", h[t]);
+                auto ff = ffn(p, l == 0 ? "" : "_shexp", input);
+                if (l != 0) {
+                    auto gates = linear(weight(p + "ffn_gate_inp.weight"), input);
+                    for (double& g : gates) g = 1.0 / (1.0 + std::exp(-g));
+                    // Group routing selects group 1 even though expert 0 has the highest individual score.
+                    const int other = lora ? 3 : 0;
+                    const double sum = gates[other] + gates[2];
+                    for (const int e : {other, 2}) {
+                        const auto update = ffn(p, "_exps", input, e);
+                        for (int d = 0; d < hidden; ++d) ff[d] += router_scale * gates[e] / sum * update[d];
+                    }
+                }
+                for (int d = 0; d < hidden; ++d) h[t][d] += ff[d];
+            }
+        }
+        auto rel_l2 = [](const auto& actual, const auto& reference) {
+            double diff = 0, magnitude = 0;
+            for (size_t i = 0; i < reference.size(); ++i) {
+                const double err = double(actual[i]) - reference[i];
+                diff += err * err;
+                magnitude += double(reference[i]) * reference[i];
+            }
+            const double result = std::sqrt(diff / magnitude);
+            if (!(result < 1e-5)) throw std::runtime_error("DeepSeek MLA rel_l2=" + std::to_string(result));
+            return result;
+        };
+        const auto reference = [&](size_t t) { return linear(weight("output.weight"), norm("output_norm.weight", h[t])); };
+        const auto batch = model.forward_prefill_cuda(ctx, prompt, 0);
+        constexpr size_t latent_bytes = layers * kKvPageTokens * (rank + rope) * sizeof(float);
+        constexpr size_t expanded_bytes = layers * kKvPageTokens * heads * (key + value) * sizeof(float);
+        static_assert(latent_bytes < expanded_bytes);
+        if (model.cuda_cache_memory().kv_bytes != latent_bytes) throw std::runtime_error("DeepSeek MLA latent KV bytes");
+        model.reset_kv_and_state(ctx);
+        std::vector<float> step;
+        double step_error = 0;
+        for (size_t t = 0; t < prompt.size(); ++t) {
+            step = model.forward_token_cuda(ctx, prompt[t], static_cast<int>(t));
+            step_error = std::max(step_error, rel_l2(step, reference(t)));
+        }
+        const auto eager = model.generate_cuda(ctx, prompt, 16, true, false);
+        const auto graph = model.generate_cuda(ctx, prompt, 16, true, true);
+        if (eager != graph || graph.size() != prompt.size() + 16) throw std::runtime_error("DeepSeek MLA graph tokens");
+
+        std::vector<int32_t> prefix(kKvPageTokens + 9);
+        for (auto& token : prefix) token = static_cast<int32_t>(rng() % vocab);
+        auto branch = prefix;
+        std::fill(branch.begin() + kKvPageTokens + 4, branch.end(), 21);
+        prefix.push_back(31);
+        model.reset_kv_and_state(ctx);
+        const auto fresh_a = model.forward_prefill_cuda(ctx, prefix, 0);
+        model.reset_kv_and_state(ctx);
+        const auto fresh_b = model.forward_prefill_cuda(ctx, branch, 0);
+        model.reset_kv_and_state(ctx);
+        model.set_num_slots(2);
+        model.prefill_cached_cuda(ctx, {prefix.begin(), prefix.end() - 1});
+        int prefilled = 0;
+        const auto reuse_b = model.prefill_cached_cuda(ctx, branch, true, &prefilled);
+        if (prefilled != 5 || model.cuda_cache_memory().kv_bytes != 3 * latent_bytes)
+            throw std::runtime_error("DeepSeek MLA slots must share the complete page and fork the partial page");
+        const auto reuse_a = model.prefill_cached_cuda(ctx, prefix, true, &prefilled);
+        if (prefilled != 1) throw std::runtime_error("DeepSeek MLA slot resume did not reuse the prefix");
+        std::cout << "  [PASS] DeepSeek MLA batch/FP64=" << rel_l2(batch, reference(h.size() - 1))
+                  << " step/FP64(max)=" << step_error << " batch/step=" << rel_l2(batch, step)
+                  << " latent_bytes=" << latent_bytes << " expanded_bytes=" << expanded_bytes
+                  << " Graph/eager=16/16 slot_fork=" << rel_l2(reuse_b, fresh_b)
+                  << " slot_resume=" << rel_l2(reuse_a, fresh_a) << "\n";
+#endif
+    }
+}
+
 }  // namespace
 
 int main() {
@@ -2977,6 +3263,7 @@ int main() {
         test_wave3();
         test_stage7a_json();
         test_stage7b_images_and_protocols();
+        test_stage7c_mla();
 #ifdef FUSIONRT_ENABLE_CUDA
         test_stage7a_speculative();
         test_stage7b_cuda_vision();

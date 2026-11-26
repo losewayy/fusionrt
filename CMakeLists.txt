@@ -88,6 +88,7 @@ if(FUSIONRT_ENABLE_CUDA)
         src/cuda/matmul/gemv_decode.cu
         src/cuda/matmul/mmq_prefill.cu
         src/cuda/sequence/flash_attention.cu
+        src/cuda/sequence/mla.cu
         src/cuda/sequence/linear_recurrence.cu
         src/cuda/epilogue/boundary_ops.cu
         src/server/http_server.cpp

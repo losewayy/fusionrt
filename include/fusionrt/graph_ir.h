@@ -24,6 +24,7 @@ enum class OpKind : uint8_t {
     GEGLU_INTERLEAVED = 12,
     GEGLU_Q8_LINEAR = 13,
     GEMMA_PLE_GATE = 14,
+    MLA_ATTN_BLOCK = 15,
 };
 
 inline const char* op_kind_name(OpKind op) {
@@ -33,6 +34,7 @@ inline const char* op_kind_name(OpKind op) {
         case OpKind::FUSED_RMSNORM_LINEAR:     return "FUSED_RMSNORM_LINEAR";
         case OpKind::ADD_RESIDUAL:             return "ADD_RESIDUAL";
         case OpKind::FUSED_ADD_RMSNORM_LINEAR: return "FUSED_ADD_RMSNORM_LINEAR";
+        case OpKind::MLA_ATTN_BLOCK:           return "MLA_ATTN_BLOCK";
         case OpKind::GQA_ATTN_BLOCK:           return "GQA_ATTN_BLOCK";
         case OpKind::GDN_RECURRENT_BLOCK:      return "GDN_RECURRENT_BLOCK";
         case OpKind::SWIGLU_INTERLEAVED:       return "SWIGLU_INTERLEAVED";

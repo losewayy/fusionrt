@@ -319,22 +319,44 @@ int cmd_daily(const std::string& cmd, int argc, char** argv) {
         const auto hidden = header.get_int(prefix + "embedding_length");
         const auto heads = header.get_int(prefix + "attention.head_count");
         const auto experts = header.get_int(prefix + "expert_count");
+        const bool mla = arch == "deepseek2";
+        auto head_dim = header.get_int(prefix + "attention.key_length", hidden / std::max<int64_t>(1, heads));
+        if (mla) head_dim = header.get_int(prefix + "attention.key_length_mla", head_dim);
         const auto qk_norm = header.find_tensor("blk.0.attn_q_norm.weight") && header.find_tensor("blk.0.attn_k_norm.weight");
         std::cout << "model=" << model_filename(path) << " architecture=" << arch
-                  << " layout=" << (experts ? "moe" : header.find_tensor("blk.0.ssm_conv1d.weight") ? "hybrid" : "dense")
+                  << " layout=" << (mla ? "mla" : experts ? "moe" : header.find_tensor("blk.0.ssm_conv1d.weight") ? "hybrid" : "dense")
                   << " layers=" << header.get_int(prefix + "block_count") << " max_seq=" << max_seq
                   << " trained_context=" << header.get_int(prefix + "context_length") << '\n'
                   << "gguf_version=" << header.version() << " file_bytes=" << header.file_bytes()
                   << " tensors=" << header.tensors().size() << " hidden_size=" << hidden
-                  << " attention_heads=" << heads << " kv_heads=" << header.get_int(prefix + "attention.head_count_kv", heads)
-                  << " head_dim=" << header.get_int(prefix + "attention.key_length", hidden / std::max<int64_t>(1, heads))
+                  << " attention_heads=" << heads << " kv_heads=" << (mla ? 1 : header.get_int(prefix + "attention.head_count_kv", heads))
+                  << " head_dim=" << head_dim
                   << " qk_norm=" << (qk_norm ? "true" : "false")
                   << " rope_theta=" << header.get_float(prefix + "rope.freq_base", 10000.0) << '\n';
         if (experts) {
             std::cout << "experts=" << experts << " top_k=" << header.get_int(prefix + "expert_used_count")
                       << " expert_width=" << header.get_int(prefix + "expert_feed_forward_length")
                       << " norm_topk_prob=" << (header.get_bool(prefix + "expert_weights_norm",
-                             header.get_bool(prefix + "norm_topk_prob", true)) ? "true" : "false") << '\n';
+                             header.get_bool(prefix + "norm_topk_prob", !mla)) ? "true" : "false") << '\n';
+        }
+        if (mla) {
+            const auto rank = header.get_int(prefix + "attention.kv_lora_rank");
+            const auto rope = header.get_int(prefix + "rope.dimension_count");
+            const auto gate = header.get_int(prefix + "expert_gating_func", 1);
+            std::cout << "q_lora_rank=" << header.get_int(prefix + "attention.q_lora_rank", 0)
+                      << " kv_lora_rank=" << rank << " d_rope=" << rope << " d_nope=" << head_dim - rope
+                      << " d_v=" << header.get_int(prefix + "attention.value_length_mla",
+                                                   header.get_int(prefix + "attention.value_length"))
+                      << " latent_width=" << rank + rope
+                      << " leading_dense=" << header.get_int(prefix + "leading_dense_block_count",
+                          experts ? 0 : header.get_int(prefix + "block_count"))
+                      << " shared_experts=" << header.get_int(prefix + "expert_shared_count")
+                      << " expert_gating=" << (gate == 2 ? "sigmoid" : "softmax")
+                      << " expert_groups=" << header.get_int(prefix + "expert_group_count", 1)
+                      << " expert_groups_used=" << header.get_int(prefix + "expert_group_used_count",
+                          header.get_int(prefix + "expert_group_count", 1))
+                      << " expert_weights_scale=" << header.get_float(prefix + "expert_weights_scale", 1.0)
+                      << " rope_scaling=" << header.get_string(prefix + "rope.scaling.type", "none") << '\n';
         }
         if (arch == "gemma4") {
             const auto pattern = header.metadata().find(prefix + "attention.sliding_window_pattern");

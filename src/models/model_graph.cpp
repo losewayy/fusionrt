@@ -116,10 +116,22 @@ int append_dense(MiniGraph& graph, int input, int index, const CudaDenseGQALayer
     const auto& cfg = layer.cfg;
     const int normalized = norm(graph, input, layer.attn_norm_w, graph.hidden_size, cfg.rms_norm_eps,
                                 prefix + "n1", prefix + "anorm");
-    const int output = graph.new_value(cfg.num_attention_heads * cfg.head_dim, prefix + "attn");
+    const bool mla = cfg.mla.latent_rank > 0;
+    const int output_cols = cfg.num_attention_heads * (mla ? cfg.mla.value_dim : cfg.head_dim);
+    const int output = graph.new_value(output_cols, prefix + "attn");
     IRNode node;
-    node.op = OpKind::GQA_ATTN_BLOCK;
-    if (layer.kv_source_layer >= 0) {
+    node.op = mla ? OpKind::MLA_ATTN_BLOCK : OpKind::GQA_ATTN_BLOCK;
+    if (mla) {
+        int query_input = normalized;
+        if (layer.mla_q_a.data) {
+            const int low_rank = linear(graph, normalized, layer.mla_q_a, prefix + "q_a");
+            query_input = norm(graph, low_rank, layer.mla_q_a_norm, cfg.mla.query_rank,
+                               cfg.rms_norm_eps, prefix + "q_a_norm", prefix + "q_a_norm");
+        }
+        node.inputs = {linear(graph, query_input, layer.q_proj, prefix + "q"),
+                       linear(graph, normalized, layer.mla_kv_a, prefix + "kv_a")};
+        node.output_cols = output_cols;
+    } else if (layer.kv_source_layer >= 0) {
         node.inputs = {linear(graph, normalized, layer.q_proj, prefix + "q")};
     } else if (!layer.v_proj.data) {
         node.inputs = projections<2>(graph, normalized, {&layer.q_proj, &layer.k_proj}, layer.projection_packs,
@@ -137,7 +149,7 @@ int append_dense(MiniGraph& graph, int input, int index, const CudaDenseGQALayer
                       layer.k_norm_w.data ? &layer.k_norm_w : nullptr,
                       layer.rope_factors.data ? &layer.rope_factors : nullptr};
     node.norm_eps = cfg.rms_norm_eps;
-    node.tag = prefix + "gqa";
+    node.tag = prefix + (mla ? "mla" : "gqa");
     graph.add_node(std::move(node));
     int projected = linear(graph, output, layer.o_proj, prefix + "o");
     if (layer.attn_post_norm_w.data) {

@@ -18,10 +18,12 @@ struct LoadedLayerRaw {
     // Dense
     HostTensor attn_norm, q_proj, k_proj, v_proj, qkv_proj, q_norm, k_norm, o_proj, mlp_norm, gate_up, gate, up, down;
     HostTensor q_bias, k_bias, v_bias;
+    HostTensor mla_q_a, mla_q_a_norm, mla_kv_a, mla_kv_a_norm, mla_kv_b, mla_k_b, mla_v_b;
     // GDN extras
     HostTensor z_proj, a_proj, b_proj, conv_w, conv_bias, A_log, dt_bias, gdn_norm_w;
     // MoE extras
     HostTensor router_w, experts_gate_up, experts_up, experts_down, shared_gate_up, shared_down;
+    HostTensor router_bias;
     bool has_shared = false;
 };
 

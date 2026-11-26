@@ -42,7 +42,8 @@ void CudaContext::set_kv_dtype(DType dtype) {
     kv_dtype_ = dtype;
 }
 
-CudaKvView make_cuda_kv_view(CudaArena& arena, DType dtype, int max_tokens, int kv_heads, int head_dim) {
+CudaKvView make_cuda_kv_view(CudaArena& arena, DType dtype, int max_tokens, int kv_heads, int head_dim,
+                             bool latent) {
     if (dtype == DType::Q8_0 && head_dim % 32 != 0) {
         throw std::invalid_argument("Q8_0 KV requires a head dimension divisible by 32");
     }
@@ -50,7 +51,7 @@ CudaKvView make_cuda_kv_view(CudaArena& arena, DType dtype, int max_tokens, int 
     const int elements = kKvPageTokens * kv_heads * head_dim;
     const size_t plane = size_t(elements) / dtype_block_size(dtype) * dtype_type_size(dtype);
     auto* table = static_cast<uint8_t**>(arena.alloc(pages * sizeof(uint8_t*)));
-    return {table, plane, elements, pages, dtype};
+    return {table, plane, elements, pages, dtype, latent};
 }
 
 static int kv_pages_for(int tokens) { return tokens > 0 ? 1 + (tokens - 1) / kKvPageTokens : 0; }
@@ -260,7 +261,7 @@ void CudaKvPool::ensure(CudaContext& ctx, std::span<const CudaKvView> layers, Ta
     }
     if (requested > layers.front().max_pages) throw std::invalid_argument("KV position exceeds context");
     if (page_bytes_ == 0) {
-        for (const auto& layer : layers) page_bytes_ += 2 * layer.plane_bytes;
+        for (const auto& layer : layers) page_bytes_ += layer.page_bytes();
     }
     const int missing = needed - (static_cast<int>(physical_.size()) - pages_);
     if (missing > 0) {
@@ -314,7 +315,7 @@ void CudaKvPool::ensure(CudaContext& ctx, std::span<const CudaKvView> layers, Ta
         for (int p = 0; p < added; ++p) entry[p] = physical_[table.pages_[table.published_ + p]].data + offset;
         FUSIONRT_CUDA_CHECK(cudaMemcpyAsync(layers[i].pages + table.published_, entry, added * sizeof(*entry),
                                             cudaMemcpyHostToDevice, ctx.stream()));
-        offset += 2 * layers[i].plane_bytes;
+        offset += layers[i].page_bytes();
     }
     ctx.synchronize();
     table.published_ = requested;

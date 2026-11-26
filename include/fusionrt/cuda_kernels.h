@@ -288,8 +288,17 @@ void gqa_prefill_online_f32(const float* q, int q_stride, CudaKvView cache, floa
                             int start_pos, float scale, cudaStream_t stream, int sliding_window = 0);
 
 // Sparse MoE helper kernels
+// The cache has one FP32 plane with rows [normalized latent, rotary key].
+void mla_attention_f32(const float* q, const float* kv, const float* kv_norm,
+                       const Tensor& k_b, const Tensor& v_b, const float* frequencies,
+                       float* q_absorbed, float* latent_out, float* out, CudaKvView cache,
+                       int rows, int heads, int head_dim, int start_pos, const int* pos_dev,
+                       float eps, float scale, float rotary_amplitude, cudaStream_t stream);
+
 void moe_topk_router_f32(const float* logits, int* topk_idx, float* topk_weight,
-                         int num_experts, int top_k, bool norm_topk, cudaStream_t stream);
+                        int num_experts, int top_k, bool norm_topk, cudaStream_t stream,
+                        const float* selection_bias = nullptr, bool sigmoid = false, float scale = 1.0f,
+                        int groups = 1, int groups_used = 1);
 
 void moe_indexed_swiglu_gemv(
     const float* x, const int* topk_idx, const void* gate_w, DType gate_type,
