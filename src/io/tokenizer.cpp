@@ -138,9 +138,12 @@ std::vector<std::string> pretokenize_gpt2(const std::string& text) {
     return chunks;
 }
 
-// Qwen and Llama use the same pre-tokenization rules with different digit group widths.
-std::vector<std::string> pretokenize_modern_bpe(const std::string& text, int digit_width, bool combine_marks) {
+enum class BpePattern { qwen, qwen_with_marks, llama, smollm };
+
+std::vector<std::string> pretokenize_bpe(const std::string& text, BpePattern pattern) {
     enum class Kind { letter, digit, space, newline, symbol };
+    const bool smollm = pattern == BpePattern::smollm;
+    const int digit_width = pattern == BpePattern::llama ? 3 : 1;
     const auto chars = split_utf8_chars(text);
     static const std::locale locale("");
     const auto& unicode = std::use_facet<std::ctype<wchar_t>>(locale);
@@ -157,7 +160,7 @@ std::vector<std::string> pretokenize_modern_bpe(const std::string& text, int dig
         else if ((cp >= '0' && cp <= '9') || (cp >= 0xff10 && cp <= 0xff19) ||
                  (cp >= 0x660 && cp <= 0x669) || (cp >= 0x6f0 && cp <= 0x6f9)) kinds.push_back(Kind::digit);
         else if ((fits && unicode.is(std::ctype_base::alpha, wc)) ||
-                 (combine_marks && cp >= 0x300 && cp <= 0x36f)) kinds.push_back(Kind::letter);
+                 (pattern == BpePattern::qwen_with_marks && cp >= 0x300 && cp <= 0x36f)) kinds.push_back(Kind::letter);
         else kinds.push_back(Kind::symbol);
     }
     auto is_space = [](Kind kind) { return kind == Kind::space || kind == Kind::newline; };
@@ -168,8 +171,11 @@ std::vector<std::string> pretokenize_modern_bpe(const std::string& text, int dig
             for (std::string_view suffix : {"s", "t", "re", "ve", "m", "ll", "d"}) {
                 if (i + suffix.size() >= chars.size()) continue;
                 size_t j = 0;
-                while (j < suffix.size() && chars[i + j + 1].size() == 1 &&
-                       std::tolower(static_cast<unsigned char>(chars[i + j + 1][0])) == suffix[j]) ++j;
+                while (j < suffix.size() && chars[i + j + 1].size() == 1) {
+                    const auto c = static_cast<unsigned char>(chars[i + j + 1][0]);
+                    if ((smollm ? c : std::tolower(c)) != suffix[j]) break;
+                    ++j;
+                }
                 if (j == suffix.size()) {
                     i += j + 1;
                     break;
@@ -178,8 +184,8 @@ std::vector<std::string> pretokenize_modern_bpe(const std::string& text, int dig
         }
         if (i == start) {
             const auto kind = kinds[i];
-            if (kind == Kind::letter || (kind != Kind::newline && kind != Kind::digit &&
-                                         i + 1 < chars.size() && kinds[i + 1] == Kind::letter)) {
+            const bool letter_prefix = smollm ? chars[i] == " " : kind != Kind::newline && kind != Kind::digit;
+            if (kind == Kind::letter || (letter_prefix && i + 1 < chars.size() && kinds[i + 1] == Kind::letter)) {
                 do { ++i; } while (i < chars.size() && kinds[i] == Kind::letter);
             } else if (kind == Kind::digit) {
                 do { ++i; } while (i < chars.size() && kinds[i] == Kind::digit &&
@@ -187,15 +193,17 @@ std::vector<std::string> pretokenize_modern_bpe(const std::string& text, int dig
             } else if (kind == Kind::symbol || (chars[i] == " " && i + 1 < chars.size() &&
                                                 kinds[i + 1] == Kind::symbol)) {
                 do { ++i; } while (i < chars.size() && kinds[i] == Kind::symbol);
-                while (i < chars.size() && kinds[i] == Kind::newline) ++i;
+                if (!smollm) {
+                    while (i < chars.size() && kinds[i] == Kind::newline) ++i;
+                }
             } else {
                 size_t last_newline = start;
                 while (i < chars.size() && is_space(kinds[i])) {
                     if (kinds[i] == Kind::newline) last_newline = i + 1;
                     ++i;
                 }
-                if (last_newline > start) i = last_newline;
-                else if (i < chars.size() && i - start > 1) --i;
+                if (!smollm && last_newline > start) i = last_newline;
+                else if (i < chars.size() && i - start > 1 && !(smollm && kinds[i] == Kind::digit)) --i;
             }
         }
         std::string chunk;
@@ -446,17 +454,18 @@ std::vector<int32_t> BpeTokenizer::encode(const std::string& text, bool add_bos)
         if (seg.empty()) return;
         if (gpt2_byte_bpe_) {
             const auto& b2u = gpt2_maps().b2u;
-            const bool llama = pretokenizer_ == "llama-bpe";
-            const bool qwen35 = pretokenizer_ == "qwen35";
-            const bool modern = llama || qwen35 || pretokenizer_ == "qwen2";
-            const auto chunks = modern ? pretokenize_modern_bpe(seg, llama ? 3 : 1, qwen35) : pretokenize_gpt2(seg);
+            const auto pattern = pretokenizer_ == "llama-bpe" ? BpePattern::llama :
+                                 pretokenizer_ == "qwen35" ? BpePattern::qwen_with_marks :
+                                 pretokenizer_ == "smollm" ? BpePattern::smollm : BpePattern::qwen;
+            const auto chunks = pattern != BpePattern::qwen || pretokenizer_ == "qwen2"
+                ? pretokenize_bpe(seg, pattern) : pretokenize_gpt2(seg);
             for (const auto& chunk : chunks) {
                 std::vector<std::string> syms;
                 syms.reserve(chunk.size());
                 for (unsigned char c : chunk) {
                     syms.push_back(b2u[c]);
                 }
-                if (llama) {
+                if (pattern == BpePattern::llama) {
                     std::string whole;
                     for (const auto& symbol : syms) whole += symbol;
                     if (auto it = token_to_id_.find(whole); it != token_to_id_.end()) {
@@ -582,8 +591,7 @@ bool BpeTokenizer::is_end_of_generation(int32_t id) const {
     return id == eos_id_ || std::find(end_ids_.begin(), end_ids_.end(), id) != end_ids_.end();
 }
 
-std::string BpeTokenizer::format_chat_messages(const std::vector<ChatMessage>& msgs,
-                                               bool add_generation_prompt) const {
+ChatFormat BpeTokenizer::chat_format() const {
     const bool has_known_template = chat_template_.find("<|im_start|>") != std::string::npos ||
                                     chat_template_.find("<|start_header_id|>") != std::string::npos ||
                                     chat_template_.find("<start_of_turn>") != std::string::npos;
@@ -591,8 +599,18 @@ std::string BpeTokenizer::format_chat_messages(const std::vector<ChatMessage>& m
         return token_to_id_.contains(marker) &&
                (!has_known_template || chat_template_.find(marker) != std::string::npos);
     };
+    if (uses("<|im_start|>") && has_chatml()) return ChatFormat::chatml;
+    if (uses("<|start_header_id|>") && token_to_id_.contains("<|end_header_id|>") &&
+        token_to_id_.contains("<|eot_id|>")) return ChatFormat::llama;
+    if (uses("<start_of_turn>") && token_to_id_.contains("<end_of_turn>")) return ChatFormat::turn;
+    return ChatFormat::plain;
+}
+
+std::string BpeTokenizer::format_chat_messages(const std::vector<ChatMessage>& msgs,
+                                               bool add_generation_prompt) const {
+    const auto format = chat_format();
     std::string out;
-    if (uses("<|im_start|>") && has_chatml()) {
+    if (format == ChatFormat::chatml) {
         constexpr std::string_view qwen_system = "You are Qwen, created by Alibaba Cloud. You are a helpful assistant.";
         if (chat_template_.find(qwen_system) != std::string::npos && (msgs.empty() || msgs[0].role != "system")) {
             out += "<|im_start|>system\n" + std::string(qwen_system) + "<|im_end|>\n";
@@ -604,8 +622,7 @@ std::string BpeTokenizer::format_chat_messages(const std::vector<ChatMessage>& m
                 out += "<think>\n";
             }
         }
-    } else if (uses("<|start_header_id|>") && token_to_id_.contains("<|end_header_id|>") &&
-               token_to_id_.contains("<|eot_id|>")) {
+    } else if (format == ChatFormat::llama) {
         auto header = [](const std::string& role) {
             return "<|start_header_id|>" + role + "<|end_header_id|>\n\n";
         };
@@ -620,7 +637,7 @@ std::string BpeTokenizer::format_chat_messages(const std::vector<ChatMessage>& m
             out += header(msgs[begin].role) + trim_chat(msgs[begin].content) + "<|eot_id|>";
         }
         if (add_generation_prompt) out += header("assistant");
-    } else if (uses("<start_of_turn>") && token_to_id_.contains("<end_of_turn>")) {
+    } else if (format == ChatFormat::turn) {
         std::string system;
         for (const auto& msg : msgs) {
             if (msg.role == "system") {

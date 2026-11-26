@@ -8,7 +8,7 @@
 #endif
 
 #include "fusionrt/server.h"
-#include "fusionrt/json.h"
+#include "agent.h"
 
 #include <algorithm>
 #include <charconv>
@@ -16,8 +16,6 @@
 #include <csignal>
 #include <ctime>
 #include <iostream>
-#include <limits>
-#include <mutex>
 #include <optional>
 #include <sstream>
 #include <stdexcept>
@@ -100,7 +98,7 @@ volatile std::sig_atomic_t StopHandler::stopping = 0;
 constexpr const char* cors =
     "Access-Control-Allow-Origin: *\r\n"
     "Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n"
-    "Access-Control-Allow-Headers: Content-Type, Authorization\r\n";
+    "Access-Control-Allow-Headers: Content-Type, Authorization, x-api-key, anthropic-version, anthropic-beta\r\n";
 
 bool send_all(SocketHandle fd, std::string_view text) {
     while (!text.empty()) {
@@ -118,8 +116,20 @@ void reply(SocketHandle fd, const char* status, const JsonValue& body) {
                  "\r\n\r\n" + text);
 }
 
-void error(SocketHandle fd, const char* status, const std::string& message) {
-    reply(fd, status, JsonObject{{"error", JsonObject{{"message", message}, {"type", "invalid_request_error"}}}});
+void error(SocketHandle fd, const char* status, const std::string& message,
+           std::optional<agent::Protocol> protocol = {}) {
+    const bool anthropic = protocol == agent::Protocol::messages;
+    const char* type = status[0] == '5' ? (anthropic ? "api_error" : "server_error") : "invalid_request_error";
+    JsonObject body{{"error", JsonObject{{"message", message}, {"type", type}}}};
+    if (anthropic) body["type"] = "error";
+    reply(fd, status, body);
+}
+
+std::optional<agent::Protocol> agent_route(std::string_view path) {
+    if (path == "/v1/chat/completions") return agent::Protocol::chat;
+    if (path == "/v1/responses") return agent::Protocol::responses;
+    if (path == "/v1/messages") return agent::Protocol::messages;
+    return std::nullopt;
 }
 
 struct Request {
@@ -180,87 +190,25 @@ std::optional<Request> read_request(SocketHandle fd) {
     return request;
 }
 
-const JsonValue& field(const JsonObject& obj, const char* key) {
-    static const JsonValue null;
-    auto it = obj.find(key);
-    return it == obj.end() ? null : it->second;
+std::vector<int32_t> encode_prompt(const BpeTokenizer& tokenizer, const std::string& text, int context) {
+    auto prompt = tokenizer.encode(text);
+    if (prompt.empty()) prompt.push_back(tokenizer.bos_id() >= 0 ? tokenizer.bos_id() : 0);
+    if (prompt.size() >= static_cast<size_t>(context)) throw std::invalid_argument("Prompt exceeds model context");
+    return prompt;
 }
 
-std::string require_string(const JsonValue& v, const char* field_name) {
-    if (!v.is_string()) throw std::invalid_argument(std::string(field_name) + " must be a string");
-    return v.as_string();
+bool start_stream(SocketHandle fd) {
+    return send_all(fd, std::string("HTTP/1.1 200 OK\r\nConnection: close\r\n") + cors +
+                    "Cache-Control: no-cache\r\nContent-Type: text/event-stream\r\n\r\n");
 }
 
-struct CompletionRequest {
-    std::vector<int32_t> prompt;
-    std::vector<std::string> stops;
-    SamplingParams sampling;
-    int max_tokens = 512;
-    bool stream = false;
-};
-
-CompletionRequest parse_completion(const std::string& body, const BpeTokenizer& tokenizer, bool chat, int context) {
-    const JsonValue parsed = JsonValue::parse(body);
-    if (!parsed.is_object()) throw std::invalid_argument("Expected a JSON object");
-    const auto& obj = parsed.as_object();
-    CompletionRequest req;
-    std::string prompt;
-    if (chat) {
-        const auto& value = field(obj, "messages");
-        if (!value.is_array() || value.as_array().empty()) throw std::invalid_argument("Expected messages");
-        std::vector<ChatMessage> messages;
-        for (const auto& item : value.as_array()) {
-            if (!item.is_object()) throw std::invalid_argument("Expected a message object");
-            const auto& msg = item.as_object();
-            auto role = require_string(field(msg, "role"), "role");
-            if (role != "system" && role != "user" && role != "assistant") {
-                throw std::invalid_argument("Unsupported message role: " + role);
-            }
-            messages.push_back({std::move(role), require_string(field(msg, "content"), "content")});
-        }
-        prompt = tokenizer.format_chat_messages(messages);
-    } else {
-        prompt = require_string(field(obj, "prompt"), "prompt");
-    }
-    req.prompt = tokenizer.encode(prompt);
-    if (req.prompt.empty()) req.prompt.push_back(tokenizer.bos_id() >= 0 ? tokenizer.bos_id() : 0);
-    if (req.prompt.size() >= static_cast<size_t>(context)) throw std::invalid_argument("Prompt exceeds model context");
-
-    auto number = [&](const char* key, float& out) {
-        const auto& v = field(obj, key);
-        if (v.is_null()) return;
-        if (!v.is_number()) throw std::invalid_argument(std::string(key) + " must be a number");
-        out = static_cast<float>(v.as_double());
-    };
-    auto integer = [&](const char* key, int64_t fallback, int64_t max) {
-        const auto& v = field(obj, key);
-        if (v.is_null()) return fallback;
-        if (!v.is_int() || v.as_int() < 0 || v.as_int() > max) {
-            throw std::invalid_argument(std::string(key) + " must be a nonnegative integer in range");
-        }
-        return v.as_int();
-    };
-    number("temperature", req.sampling.temperature);
-    number("top_p", req.sampling.top_p);
-    number("min_p", req.sampling.min_p);
-    number("repeat_penalty", req.sampling.repeat_penalty);
-    req.sampling.top_k = static_cast<int>(integer("top_k", req.sampling.top_k, std::numeric_limits<int>::max()));
-    req.sampling.seed = static_cast<uint64_t>(integer("seed", req.sampling.seed, INT64_MAX));
-    req.sampling.validate();
-    req.max_tokens = static_cast<int>(integer("max_tokens", req.max_tokens, std::numeric_limits<int>::max()));
-    req.max_tokens = std::min(req.max_tokens, context - static_cast<int>(req.prompt.size()));
-    const auto& stream = field(obj, "stream");
-    if (!stream.is_null() && !stream.is_bool()) throw std::invalid_argument("stream must be a boolean");
-    req.stream = stream.is_bool() && std::get<bool>(stream.val);
-    const auto& stop = field(obj, "stop");
-    if (stop.is_string()) req.stops.push_back(stop.as_string());
-    else if (stop.is_array()) {
-        for (const auto& entry : stop.as_array()) req.stops.push_back(require_string(entry, "stop"));
-    } else if (!stop.is_null()) throw std::invalid_argument("stop must be a string or string array");
-    if (req.stops.size() > 4 || std::any_of(req.stops.begin(), req.stops.end(), [](const auto& s) { return s.empty(); })) {
-        throw std::invalid_argument("Expected up to four nonempty stop strings");
-    }
-    return req;
+bool send_event(SocketHandle fd, std::string_view event, std::string_view data) {
+    std::string frame;
+    if (!event.empty()) frame = "event: " + std::string(event) + "\n";
+    frame += "data: ";
+    frame += data;
+    frame += "\n\n";
+    return send_all(fd, frame);
 }
 
 // Hold only the suffix that could become a stop sequence on a later token.
@@ -294,79 +242,116 @@ struct StopBuffer {
     }
 };
 
-void complete(SocketHandle fd, CudaContext& ctx, FusionModel& model, const BpeTokenizer& tokenizer,
-              const std::string& name, const CompletionRequest& req, bool chat, bool graph, uint64_t request_id) {
-    const int64_t created = std::time(nullptr);
-    const std::string id = std::string(chat ? "chatcmpl-" : "cmpl-") + std::to_string(created) +
-                           "-" + std::to_string(request_id);
-    const char* object = chat ? (req.stream ? "chat.completion.chunk" : "chat.completion") : "text_completion";
-    auto response = [&](JsonObject choice) {
-        choice["index"] = 0;
-        return JsonObject{{"id", id}, {"object", object}, {"created", created}, {"model", name},
-                          {"choices", JsonArray{std::move(choice)}}};
-    };
-    auto event = [&](const JsonValue& v) { return send_all(fd, "data: " + v.dump(0) + "\n\n"); };
-    if (req.stream) {
-        if (!send_all(fd, std::string("HTTP/1.1 200 OK\r\nConnection: close\r\n") + cors +
-                          "Cache-Control: no-cache\r\nContent-Type: text/event-stream\r\n\r\n")) return;
-        if (chat && !event(response({{"delta", JsonObject{{"role", "assistant"}}}, {"finish_reason", nullptr}}))) return;
-    }
-    std::string result;
-    bool connected = true;
-    bool end_token = false;
-    StopBuffer stop{req.stops, {}, false};
+struct Completion {
+    GenerationStats stats;
+    agent::Finish finish = agent::Finish::length;
+};
+
+template<class Emit>
+Completion generate(CudaContext& ctx, FusionModel& model, const BpeTokenizer& tokenizer,
+                    const std::vector<int32_t>& prompt, const agent::GenerationParams& params,
+                    int context, bool graph, bool reuse_prefix, Emit emit) {
+    StopBuffer stop{params.stops, {}, false};
     Utf8StreamDecoder utf8;
-    auto emit = [&](const std::string& text) {
-        if (text.empty()) return;
-        if (!req.stream) result += text;
-        else {
-            JsonObject choice{{"finish_reason", nullptr}};
-            if (chat) choice["delta"] = JsonObject{{"content", text}};
-            else choice["text"] = text;
-            connected = event(response(std::move(choice)));
-        }
-    };
+    Completion completion;
+    bool connected = true;
     GenerationOptions opts;
-    opts.sampling = req.sampling;
-    opts.reuse_prefix = true;
+    opts.sampling = params.sampling;
+    opts.reuse_prefix = reuse_prefix;
     opts.on_token = [&](int32_t id) {
         if (tokenizer.is_end_of_generation(id)) {
-            end_token = true;
+            completion.finish = agent::Finish::stop;
             return false;
         }
-        emit(stop.push(utf8.push(tokenizer.decode_token(id))));
+        connected = emit(stop.push(utf8.push(tokenizer.decode_token(id))));
         return connected && !stop.matched && !StopHandler::stopping;
     };
-    GenerationStats stats;
+    const int limit = std::min(params.max_tokens, context - static_cast<int>(prompt.size()));
+    model.generate_cuda(ctx, prompt, limit, true, graph, &completion.stats, false, 0, -1, opts);
+    if (connected && !stop.matched && emit(stop.push(utf8.finish())) && !stop.matched) emit(stop.pending);
+    if (stop.matched) completion.finish = agent::Finish::stop;
+    return completion;
+}
+
+void complete(SocketHandle fd, CudaContext& ctx, FusionModel& model, const BpeTokenizer& tokenizer,
+              const std::string& name, const std::vector<int32_t>& prompt, const agent::GenerationParams& params,
+              int context, bool graph, uint64_t request_id) {
+    const int64_t created = std::time(nullptr);
+    const std::string id = "cmpl-" + std::to_string(created) + "-" + std::to_string(request_id);
+    auto response = [&](JsonObject choice) {
+        choice["index"] = 0;
+        return JsonObject{{"id", id}, {"object", "text_completion"}, {"created", created}, {"model", name},
+                          {"choices", JsonArray{std::move(choice)}}};
+    };
+    auto event = [&](const JsonValue& v) { return send_event(fd, "", v.dump(0)); };
+    if (params.stream && !start_stream(fd)) return;
+    std::string result;
+    bool connected = true;
+    auto emit = [&](const std::string& text) {
+        if (text.empty()) return connected;
+        if (params.stream) connected = event(response({{"finish_reason", nullptr}, {"text", text}}));
+        else result += text;
+        return connected;
+    };
+    Completion completion;
     try {
-        model.generate_cuda(ctx, req.prompt, req.max_tokens, true, graph, &stats, false, 0, -1, opts);
+        completion = generate(ctx, model, tokenizer, prompt, params, context, graph, true, emit);
     } catch (const std::exception& e) {
-        if (!req.stream) throw;
-        if (connected) {
-            event(JsonObject{{"error", JsonObject{{"message", e.what()}, {"type", "server_error"}}}});
-            send_all(fd, "data: [DONE]\n\n");
+        if (!params.stream) throw;
+        if (connected && event(JsonObject{{"error", JsonObject{{"message", e.what()}, {"type", "server_error"}}}})) {
+            send_event(fd, "", "[DONE]");
         }
         return;
     }
     if (!connected) return;
-    if (!stop.matched) {
-        emit(stop.push(utf8.finish()));
-        if (connected) emit(stop.pending);
-    }
-    if (!connected) return;
-    const char* reason = end_token || stop.matched ? "stop" : "length";
-    JsonObject choice{{"finish_reason", reason}};
-    if (chat) {
-        if (req.stream) choice["delta"] = JsonObject{};
-        else choice["message"] = JsonObject{{"role", "assistant"}, {"content", std::move(result)}};
-    } else choice["text"] = std::move(result);
-    auto payload = response(std::move(choice));
-    if (req.stream) {
-        if (event(payload)) send_all(fd, "data: [DONE]\n\n");
+    auto payload = response({{"finish_reason", completion.finish == agent::Finish::stop ? "stop" : "length"},
+                             {"text", std::move(result)}});
+    if (params.stream) {
+        if (event(payload)) send_event(fd, "", "[DONE]");
     } else {
+        const auto& stats = completion.stats;
         payload["usage"] = JsonObject{{"prompt_tokens", stats.prompt_tokens}, {"completion_tokens", stats.generated_tokens},
                                       {"total_tokens", stats.prompt_tokens + stats.generated_tokens}};
         reply(fd, "200 OK", payload);
+    }
+}
+
+void complete_agent(SocketHandle fd, CudaContext& ctx, FusionModel& model, const BpeTokenizer& tokenizer,
+                    const std::string& name, agent::Protocol protocol, const agent::AgentRequest& request,
+                    const agent::AgentPrompt& rendered, const std::vector<int32_t>& prompt,
+                    int context, bool graph, uint64_t request_id) {
+    const int64_t created = std::time(nullptr);
+    const char* prefix = protocol == agent::Protocol::chat ? "chatcmpl-" :
+                         protocol == agent::Protocol::responses ? "resp_" : "msg_";
+    const auto id = prefix + std::to_string(created) + "-" + std::to_string(request_id);
+    agent::EventSink event;
+    if (request.generation.stream) {
+        if (!start_stream(fd)) return;
+        event = [fd](std::string_view type, std::string_view data) { return send_event(fd, type, data); };
+    }
+    agent::AgentResponse response(protocol, id, name, created, request.stream_usage, std::move(event));
+    response.start(static_cast<int>(prompt.size()));
+    if (!response.connected()) return;
+    agent::ToolParser parser(request, rendered, [&](std::string_view text) { response.text(text); },
+                             [&](agent::ToolCall call) { response.call(std::move(call)); });
+    try {
+        // Agent clients replay their history. A separate turn starts with fresh KV and recurrent state.
+        const auto completion = generate(ctx, model, tokenizer, prompt, request.generation, context, graph, false,
+            [&](const std::string& text) {
+                parser.push(text);
+                return response.connected();
+            });
+        if (!response.connected()) return;
+        parser.finish();
+        if ((request.choice == agent::Choice::required || request.choice == agent::Choice::named) &&
+            !response.result().has_calls() && completion.finish == agent::Finish::stop) {
+            throw std::runtime_error("The model ended its turn without producing the requested tool call");
+        }
+        response.finish(completion.finish, completion.stats.generated_tokens);
+        if (!request.generation.stream) reply(fd, "200 OK", response.body());
+    } catch (const std::exception& e) {
+        if (!request.generation.stream) throw;
+        response.error(e.what());
     }
 }
 
@@ -402,7 +387,6 @@ void serve_http(CudaContext& ctx, FusionModel& model, const BpeTokenizer& tokeni
     [[maybe_unused]] SocketRuntime sockets;
     Socket listener(listen_on(host, port));
     StopHandler stop_handler;
-    std::mutex engine;
     uint64_t request_id = 0;
     const auto& cfg = model.config();
     const std::string& arch = cfg.model_architecture.empty() ? cfg.arch : cfg.model_architecture;
@@ -430,10 +414,11 @@ void serve_http(CudaContext& ctx, FusionModel& model, const BpeTokenizer& tokeni
 #endif
         setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<const char*>(&timeout), sizeof(timeout));
         setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, reinterpret_cast<const char*>(&timeout), sizeof(timeout));
+        std::optional<agent::Protocol> protocol;
         try {
             auto req = read_request(fd);
             if (!req) continue;
-            const bool chat = req->path == "/v1/chat/completions";
+            protocol = agent_route(req->path);
             if (req->method == "OPTIONS") {
                 send_all(fd, std::string("HTTP/1.1 204 No Content\r\nConnection: close\r\n") + cors + "\r\n");
             } else if (req->method == "GET" && req->path == "/health") {
@@ -441,21 +426,35 @@ void serve_http(CudaContext& ctx, FusionModel& model, const BpeTokenizer& tokeni
             } else if (req->method == "GET" && req->path == "/v1/models") {
                 reply(fd, "200 OK", JsonObject{{"object", "list"}, {"data", JsonArray{JsonObject{
                       {"id", model_name}, {"object", "model"}, {"created", int64_t{0}}, {"owned_by", "fusionrt"}}}}});
-            } else if (req->method == "POST" && (chat || req->path == "/v1/completions")) {
-                CompletionRequest input;
-                try {
-                    input = parse_completion(req->body, tokenizer, chat, cfg.dense.max_seq_len);
-                } catch (const std::exception& e) {
-                    error(fd, "400 Bad Request", e.what());
-                    continue;
+            } else if (req->method == "POST" && (protocol || req->path == "/v1/completions")) {
+                const JsonValue parsed = [&] {
+                    try {
+                        return JsonValue::parse(req->body);
+                    } catch (const std::runtime_error& e) {
+                        throw std::invalid_argument(e.what());
+                    }
+                }();
+                if (!parsed.is_object()) throw std::invalid_argument("Expected a JSON object");
+                const auto& obj = parsed.as_object();
+                const int context = cfg.dense.max_seq_len;
+                if (protocol) {
+                    const auto input = agent::parse_request(obj, *protocol);
+                    const auto rendered = agent::render_prompt(input, tokenizer);
+                    const auto prompt = encode_prompt(tokenizer, rendered.text, context);
+                    complete_agent(fd, ctx, model, tokenizer, model_name, *protocol, input, rendered, prompt,
+                                   context, use_graph, ++request_id);
+                } else {
+                    const auto& text = agent::field(obj, "prompt");
+                    if (!text.is_string()) throw std::invalid_argument("prompt must be a string");
+                    const auto params = agent::parse_generation(obj, "max_tokens");
+                    const auto prompt = encode_prompt(tokenizer, text.as_string(), context);
+                    complete(fd, ctx, model, tokenizer, model_name, prompt, params, context, use_graph, ++request_id);
                 }
-                std::lock_guard lock(engine);
-                complete(fd, ctx, model, tokenizer, model_name, input, chat, use_graph, ++request_id);
-            } else error(fd, "404 Not Found", "Unknown route");
+            } else error(fd, "404 Not Found", "Unknown route", protocol);
         } catch (const std::invalid_argument& e) {
-            error(fd, "400 Bad Request", e.what());
+            error(fd, "400 Bad Request", e.what(), protocol);
         } catch (const std::exception& e) {
-            error(fd, "500 Internal Server Error", e.what());
+            error(fd, "500 Internal Server Error", e.what(), protocol);
         }
     }
 }

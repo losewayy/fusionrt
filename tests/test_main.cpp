@@ -3,6 +3,7 @@
 #include "fusionrt/models.h"
 #include "fusionrt/safetensors.h"
 #include "fusionrt/tokenizer.h"
+#include "agent.h"
 #ifdef FUSIONRT_ENABLE_CUDA
 #include "fusionrt/cuda_backend.h"
 #include "fusionrt/cuda_kernels.h"
@@ -24,6 +25,95 @@
 using namespace fusionrt;
 
 namespace {
+
+void test_agent_protocols() {
+    using namespace agent;
+    auto check = [](bool value, const char* label) {
+        if (!value) throw std::runtime_error(std::string("Agent protocol: ") + label);
+    };
+    auto parse = [](const char* json, Protocol protocol) {
+        return parse_request(JsonValue::parse(json).as_object(), protocol);
+    };
+    auto chat = parse(R"({
+        "messages":[{"role":"developer","content":[{"type":"text","text":"Be concise"}]},
+            {"role":"user","content":"Calculate"},
+            {"role":"assistant","tool_calls":[{"type":"function","id":"a","function":{"name":"calc","arguments":"{}"}}]},
+            {"role":"tool","tool_call_id":"a","content":"391"}],
+        "tools":[{"type":"function","function":{"name":"calc"}}],
+        "tool_choice":{"type":"function","function":{"name":"calc"}},
+        "stream_options":{"include_usage":true}
+    })", Protocol::chat);
+    check(chat.choice == Choice::named && chat.tool_name == "calc" && chat.stream_usage &&
+          chat.messages[0].role == Role::system && std::get<ToolResult>(chat.messages.back().content[0]).name == "calc",
+          "Chat maps developer, named choice and tool result");
+    const auto responses = parse(R"({"instructions":"Be concise","max_output_tokens":64,"input":[
+        {"role":"user","content":[{"type":"input_text","text":"Calculate"}]},
+        {"type":"function_call","name":"calc","call_id":"b","arguments":"{}"},
+        {"type":"function_call_output","call_id":"b","output":"391"}]})", Protocol::responses);
+    check(responses.generation.max_tokens == 64 &&
+          std::get<ToolResult>(responses.messages.back().content[0]).content == "391", "Responses input replay");
+    const auto anthropic = parse(R"({"system":[{"type":"text","text":"Be concise"}],"messages":[
+        {"role":"user","content":"Calculate"},
+        {"role":"assistant","content":[{"type":"tool_use","name":"calc","id":"c","input":{}}]},
+        {"role":"user","content":[{"type":"tool_result","tool_use_id":"c","is_error":true,"content":"Unavailable"}]}
+    ]})", Protocol::messages);
+    check(std::get<ToolResult>(anthropic.messages.back().content[0]).is_error, "Messages preserves tool failure");
+    bool rejected = false;
+    try {
+        parse(R"({"input":[{"type":"function_call_output","call_id":"other","output":"data"}]})", Protocol::responses);
+    } catch (const std::invalid_argument&) {
+        rejected = true;
+    }
+    check(rejected, "unknown result ID rejected");
+
+    struct Frame {
+        std::string event, data;
+    };
+    for (const auto protocol : {Protocol::chat, Protocol::responses, Protocol::messages}) {
+        std::vector<Frame> frames;
+        AgentResponse output(protocol, "sample", "model", 0, true, [&](std::string_view e, std::string_view d) {
+            frames.push_back({std::string(e), std::string(d)});
+            return true;
+        });
+        output.start(10);
+        ToolParser parser(chat, {}, [&](std::string_view text) { output.text(text); },
+                          [&](ToolCall call) { output.call(std::move(call)); });
+        const std::string generated = "<think>secret</think>ok<tool_call>"
+            R"({"name":"calc","arguments":{"text":"</tool_call>"}}</tool_call><tool_ca)";
+        for (const char c : generated) parser.push(std::string_view(&c, 1));
+        parser.finish();
+        output.finish(Finish::stop, 5);
+        const auto& blocks = output.result().output;
+        check(blocks.size() == 2 && std::get<std::string>(blocks[0]) == "ok" &&
+              std::get<ToolCall>(blocks[1]).arguments.at("text").as_string() == "</tool_call>",
+              "fragmented markup and quoted delimiters");
+        const auto& id = std::get<ToolCall>(blocks[1]).id;
+        const auto body = output.body().as_object();
+        if (protocol == Protocol::chat) {
+            const auto& choice = body.at("choices").as_array()[0].as_object();
+            const auto& message = choice.at("message").as_object();
+            check(choice.at("finish_reason").as_string() == "tool_calls" && frames.back().data == "[DONE]" &&
+                  message.at("tool_calls").as_array()[0].as_object().at("id").as_string() == id, "Chat completion");
+        } else if (protocol == Protocol::responses) {
+            const auto& call = body.at("output").as_array()[1].as_object();
+            check(frames.front().event == "response.created" && frames.back().event == "response.completed" &&
+                  call.at("call_id").as_string() == id && call.at("id").as_string() != id, "Responses completion");
+        } else {
+            const auto& call = body.at("content").as_array()[1].as_object();
+            check(frames.front().event == "message_start" && frames.back().event == "message_stop" &&
+                  body.at("stop_reason").as_string() == "tool_use" && call.at("id").as_string() == id,
+                  "Messages completion");
+        }
+    }
+    int count = 0;
+    AgentPrompt llama;
+    llama.llama_calls = true;
+    ToolParser llama_parser(chat, llama, [](std::string_view) {}, [&](ToolCall) { ++count; });
+    llama_parser.push(R"(<|python_tag|>{"name":"calc","parameters":{"number":391}})");
+    llama_parser.finish();
+    check(count == 1, "Llama native JSON tool call");
+    std::cout << "[agent] Request replay, tool extraction, and SSE completion passed\n";
+}
 
 void expect_close(const std::vector<float>& got, const std::vector<double>& ref,
                   double max_abs_tol, double rel_l2_tol, const std::string& label) {
@@ -117,6 +207,18 @@ void test_quant_and_io() {
         }
         if (gtok.decode(gids) != "<|im_start|>hello o") {
             throw std::runtime_error("GPT2 byte BPE decode mismatch: " + gtok.decode(gids));
+        }
+        std::filesystem::remove(gpt2_path);
+
+        gmeta["tokenizer.ggml.pre"] = std::string("smollm");
+        gmeta["tokenizer.ggml.tokens"] = std::vector<std::string>{
+            "a", "'", "s", "'s", "\xC4\x8A", "\xC4\x8A\xC4\x8A", "1", "2", "<|im_end|>"
+        };
+        gmeta["tokenizer.ggml.merges"] = std::vector<std::string>{"' s", "\xC4\x8A \xC4\x8A"};
+        if (!GgufFile::write_v3(gpt2_path, gmeta, {{"test.weight", src}}, &err) ||
+            !ggf.load(gpt2_path, &err) || !gtok.load_from_gguf(ggf) ||
+            gtok.encode("a's\n\n12\n\na") != std::vector<int32_t>{0, 3, 5, 6, 7, 4, 4, 0}) {
+            throw std::runtime_error("SmolLM pre-tokenization mismatch");
         }
         std::filesystem::remove(gpt2_path);
     }
@@ -1521,6 +1623,7 @@ void test_wave3() {
 void test_chunked_prefill_and_k_quant_gdn() {
     std::cout << "Testing chunked prefill and K-quant GDN GGUF...\n";
     CudaContext ctx(0, 64, 64);
+    ctx.set_prefill_batch(128);
     const auto mark = ctx.weight_arena().mark();
     for (const std::string arch : {"dense", "hybrid"}) {
         HybridModelConfig cfg;
@@ -1627,6 +1730,7 @@ int main() {
     std::cout << std::unitbuf;
     try {
         test_quant_and_io();
+        test_agent_protocols();
 #ifdef FUSIONRT_ENABLE_CUDA
         CudaContext cuda_ctx(0, 256, 512);
         test_cuda_fused_rmsnorm_linear(cuda_ctx);

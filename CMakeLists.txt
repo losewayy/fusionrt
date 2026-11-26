@@ -57,6 +57,9 @@ else()
 endif()
 
 set(FUSIONRT_SOURCES
+    src/server/agent_request.cpp
+    src/server/agent_template.cpp
+    src/server/agent_response.cpp
     src/core/tensor.cpp
     src/core/json.cpp
     src/core/sampler.cpp
@@ -153,6 +156,7 @@ endif()
 if(FUSIONRT_BUILD_TESTS)
     enable_testing()
     add_executable(fusionrt_tests tests/test_main.cpp)
+    target_include_directories(fusionrt_tests PRIVATE src/server)
     target_link_libraries(fusionrt_tests PRIVATE fusionrt_core)
     if(FUSIONRT_ENABLE_VULKAN)
         add_custom_command(TARGET fusionrt_tests POST_BUILD

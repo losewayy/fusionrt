@@ -3,6 +3,7 @@
 #include "fusionrt/gguf.h"
 #include <cstdint>
 #include <string>
+#include <string_view>
 #include <unordered_map>
 #include <vector>
 
@@ -12,6 +13,8 @@ struct ChatMessage {
     std::string role;
     std::string content;
 };
+
+enum class ChatFormat { plain, chatml, llama, turn };
 
 class BpeTokenizer {
 public:
@@ -32,6 +35,8 @@ public:
     std::string format_chat_messages(const std::vector<ChatMessage>& msgs,
                                      bool add_generation_prompt = true) const;
     bool is_end_of_generation(int32_t id) const;
+    ChatFormat chat_format() const;
+    std::string_view chat_template() const { return chat_template_; }
 
     int32_t bos_id() const { return bos_id_; }
     int32_t eos_id() const { return eos_id_; }
