@@ -11,12 +11,6 @@ namespace fusionrt::cuda_ops {
 void rmsnorm_f32(const float* x, const float* weight, float* y,
                  int rows, int cols, float eps, cudaStream_t stream);
 
-void rmsnorm_f16(const uint16_t* x, const uint16_t* weight, uint16_t* y,
-                 int rows, int cols, float eps, cudaStream_t stream);
-
-void linear_f16(const uint16_t* x, const uint16_t* w, uint16_t* y,
-                int M, int N, int K, cudaStream_t stream);
-
 void linear_f32(const float* x, const float* w, float* y,
                 int M, int N, int K, cudaStream_t stream);
 
@@ -81,9 +75,6 @@ void fused_add_rmsnorm_linear_q4_a(const float* a, const float* b, const float* 
                                    int N, int K, float eps, cudaStream_t stream);
 void fused_add_rmsnorm_linear_q8_a(const float* a, const float* b, const float* norm_w,
                                    const void* weight_q8_a, float* res_out, float* y,
-                                   int N, int K, float eps, cudaStream_t stream);
-void fused_add_rmsnorm_linear_q6_k(const float* a, const float* b, const float* norm_w,
-                                   const void* weight_q6_k, float* res_out, float* y,
                                    int N, int K, float eps, cudaStream_t stream);
 void split_q_gate_f32(const float* q_full, float* q_out, float* gate_out, int M, int num_q_heads, int head_dim, cudaStream_t stream, int src_row_stride = 0);
 void apply_sigmoid_gate_f32(float* attn_out, const float* gate, int n, cudaStream_t stream);
@@ -283,7 +274,5 @@ void moe_indexed_swiglu_gemv_f32(
     float* out,
     float* scratch_inter,
     int hidden, int inter, int top_k, cudaStream_t stream);
-
-void update_pos_and_kvlen_f32(int* pos_dev, int* kv_len_dev, int new_pos, int new_kv_len, cudaStream_t stream);
 
 }  // namespace fusionrt::cuda_ops

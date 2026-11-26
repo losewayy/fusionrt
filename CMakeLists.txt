@@ -79,7 +79,13 @@ set(FUSIONRT_SOURCES
 if(FUSIONRT_ENABLE_CUDA)
     list(APPEND FUSIONRT_SOURCES
         src/cuda/cuda_backend.cpp
-        src/cuda/cuda_kernels.cu
+        src/cuda/cuda_common.cuh
+        src/cuda/matmul/weight_tiles.cuh
+        src/cuda/matmul/gemv_decode.cu
+        src/cuda/matmul/mmq_prefill.cu
+        src/cuda/sequence/flash_attention.cu
+        src/cuda/sequence/linear_recurrence.cu
+        src/cuda/epilogue/boundary_ops.cu
         src/server/http_server.cpp
     )
 endif()
