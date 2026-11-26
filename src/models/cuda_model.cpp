@@ -1213,7 +1213,7 @@ static void execute_ir_graph_cuda(
                 const bool add = node.op == OpKind::FUSED_ADD_RMSNORM;
                 const float* a = bufs[node.inputs[0]].ptr<float>();
                 const float* b = add ? bufs[node.inputs[1]].ptr<float>() : nullptr;
-                float* res = add ? get_out_buf(node.residual_out, node.input_cols, rows).ptr<float>() : nullptr;
+                float* res = add ? get_out_buf(node.residual_out, node.input_cols, rows).template ptr<float>() : nullptr;
                 const float* weight = node.norm_weight->ptr<float>();
                 if (node.share_quantized_activation && (rows == 1 || rows >= ctx.mmq_crossover_m())) {
                     bufs[node.out] = ctx.scratch_arena().alloc_tensor({rows, node.input_cols}, DType::Q8_1);
@@ -1221,7 +1221,7 @@ static void execute_ir_graph_cuda(
                     cuda_ops::quantize_x_q8_1(a, b, weight, res, bufs[node.out].ptr(), rows,
                                               node.input_cols, node.norm_eps, ctx.stream());
                 } else {
-                    float* out = get_out_buf(node.out, node.output_cols, rows).ptr<float>();
+                    float* out = get_out_buf(node.out, node.output_cols, rows).template ptr<float>();
                     if (add) cuda_ops::add_rmsnorm_f32(a, b, weight, res, out, rows, node.input_cols,
                                                        node.norm_eps, ctx.stream());
                     else cuda_ops::rmsnorm_f32(a, weight, out, rows, node.input_cols, node.norm_eps, ctx.stream());
@@ -1249,7 +1249,7 @@ static void execute_ir_graph_cuda(
                     if (node.secondary_weight) {
                         const Tensor& other = *node.secondary_weight;
                         const int cols = static_cast<int>(other.shape[0]);
-                        auto* extra = get_out_buf(node.secondary_out, cols, rows).ptr<float>();
+                        auto* extra = get_out_buf(node.secondary_out, cols, rows).template ptr<float>();
                         if (packed && cuda_ops::project_q4_a_and_q8_a(in_p, w.ptr(), other.ptr(), out_t.ptr<float>(),
                                 extra, rows, node.output_cols, cols, node.input_cols, ctx.stream(),
                                 ctx.preferred_gemv_geometry())) return;
@@ -1281,7 +1281,7 @@ static void execute_ir_graph_cuda(
             }
             case OpKind::FUSED_ADD_RMSNORM_LINEAR: {
                 if (is_lm_head && !compute_logits) {
-                    auto& residual = get_out_buf(node.residual_out, node.input_cols, M);
+                    Tensor& residual = get_out_buf(node.residual_out, node.input_cols, M);
                     cuda_ops::add_residual_f32(bufs[node.inputs[0]].ptr<float>(), bufs[node.inputs[1]].ptr<float>(),
                                               residual.ptr<float>(), M * node.input_cols, ctx.stream());
                     break;
@@ -1460,7 +1460,7 @@ static void execute_ir_graph_cuda(
                 const bool geglu = node.op == OpKind::GEGLU_Q8_LINEAR;
                 const auto quantize = geglu ? cuda_ops::geglu_interleaved_q8_1 : cuda_ops::swiglu_interleaved_q8_1;
                 const float* gate_up = bufs[node.inputs[0]].ptr<float>();
-                float* out = get_out_buf(node.out, node.output_cols, rows).ptr<float>();
+                float* out = get_out_buf(node.out, node.output_cols, rows).template ptr<float>();
                 auto& arena = ctx.scratch_arena();
                 size_t scratch_mark = arena.mark();
                 if (rows == 1) {

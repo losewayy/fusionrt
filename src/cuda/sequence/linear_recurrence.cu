@@ -693,9 +693,17 @@ constexpr int kGdnChunk = 32;
 constexpr int kGdnCoeffStride = 2 * kGdnChunk * kGdnChunk + 2 * kGdnChunk;
 
 __device__ __forceinline__ unsigned round_tf32(float x) {
+#if __CUDA_ARCH__ >= 900
     unsigned q;
     asm("cvt.rn.tf32.f32 %0, %1;" : "=r"(q) : "f"(x));
     return q;
+#else
+    // Pre-sm_90 lacks the ties-to-even conversion. Round the 13 discarded mantissa bits.
+    const unsigned bits = __float_as_uint(x);
+    if ((bits & 0x7fffffffu) > 0x7f800000u) return 0x7fc00000u;
+    const unsigned lsb = (bits >> 13) & 1u;
+    return (bits + 0xfffu + lsb) & ~0x1fffu;
+#endif
 }
 
 __device__ __forceinline__ unsigned residual_tf32(float x, unsigned hi) {
