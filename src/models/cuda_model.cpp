@@ -251,6 +251,11 @@ void dispatch_add_rmsnorm_linear(CudaContext& ctx, const float* a, const float* 
 
 }  // namespace
 
+void model_io::vision_linear_cuda(CudaContext& ctx, const Tensor& input, const Tensor& weight, Tensor& output, int rows) {
+    dispatch_linear(ctx, input.ptr<float>(), weight, output.ptr<float>(), rows,
+                    static_cast<int>(weight.shape[0]), static_cast<int>(weight.shape[1]), true);
+}
+
 void CudaSparseMoELayer::forward_cuda(CudaContext& ctx, Tensor& x_in_out, bool use_fused) const {
     auto& arena = ctx.scratch_arena();
     struct ResetMoEScratch {
@@ -1882,14 +1887,31 @@ ModelMemory FusionModel::inspect_cuda(CudaContext& ctx) {
     return result;
 }
 
+static void validate_input_embeddings(std::span<const InputEmbedding> spans, size_t tokens, int width) {
+    size_t end = 0;
+    for (const auto& span : spans) {
+        const auto& t = span.rows;
+        if (span.start < 0 || static_cast<size_t>(span.start) < end || static_cast<size_t>(span.start) >= tokens ||
+            t.ndim != 2 || t.shape[1] != width || t.shape[0] <= 0 ||
+            static_cast<uint64_t>(t.shape[0]) > tokens - span.start ||
+            t.dtype != DType::F32 || t.backend != Backend::CUDA || !t.data || !t.is_contiguous()) {
+            throw std::invalid_argument("Invalid CUDA input embedding range or shape");
+        }
+        end = static_cast<size_t>(span.start) + static_cast<size_t>(t.shape[0]);
+    }
+}
+
 std::vector<float> FusionModel::forward_prefill_cuda(CudaContext& ctx, const std::vector<int32_t>& token_ids,
-                                                     int start_pos, bool use_fused) {
+                                                     int start_pos, bool use_fused,
+                                                     std::span<const InputEmbedding> inputs_embeds) {
+    validate_input_embeddings(inputs_embeds, token_ids.size(), static_cast<int>(tok_embeddings_.shape[1]));
     if (token_ids.empty()) return {};
     if (start_pos < 0 || token_ids.size() > static_cast<size_t>(cfg_.dense.max_seq_len - std::min(start_pos, cfg_.dense.max_seq_len))) {
         throw std::invalid_argument("Prompt exceeds model context");
     }
     clear_cuda_history();
-    return prefill_cuda_impl(ctx, token_ids.data(), static_cast<int>(token_ids.size()), start_pos, use_fused);
+    return prefill_cuda_impl(ctx, token_ids.data(), static_cast<int>(token_ids.size()), start_pos, use_fused,
+                             nullptr, nullptr, false, inputs_embeds);
 }
 
 std::vector<float> FusionModel::prefill_cached_cuda(CudaContext& ctx, const std::vector<int32_t>& prompt,
@@ -1999,7 +2021,8 @@ std::vector<float> FusionModel::prefill_cached_cuda(CudaContext& ctx, const std:
 
 void FusionModel::execute_prefill_chunks(CudaContext& ctx, const int32_t* token_ids, int count,
                                          int start_pos, bool use_fused, LayerTrace* layer_trace,
-                                         OpTrace* op_trace, bool compute_logits, bool save_prefix_checkpoints) {
+                                         OpTrace* op_trace, bool compute_logits, bool save_prefix_checkpoints,
+                                         std::span<const InputEmbedding> inputs_embeds) {
     const int H = static_cast<int>(tok_embeddings_.shape[1]);
     auto& arena = ctx.scratch_arena();
     struct RestoreArena {
@@ -2030,6 +2053,15 @@ void FusionModel::execute_prefill_chunks(CudaContext& ctx, const int32_t* token_
         FUSIONRT_CUDA_CHECK(cudaMemcpyAsync(ids.ptr(), token_ids + begin, rows * sizeof(int32_t),
                                             cudaMemcpyHostToDevice, ctx.stream()));
         embed_tokens(ctx, tok_embeddings_, ids, hidden, rows, H, cfg_.embed_scale);
+        for (const auto& span : inputs_embeds) {
+            const int first = std::max(span.start, begin);
+            const int span_end = std::min(span.start + static_cast<int>(span.rows.shape[0]), begin + rows);
+            if (span_end <= first) continue;
+            const auto src = span.rows.ptr<float>() + static_cast<size_t>(first - span.start) * H;
+            const auto dst = hidden.ptr<float>() + static_cast<size_t>(first - begin) * H;
+            FUSIONRT_CUDA_CHECK(cudaMemcpyAsync(dst, src, static_cast<size_t>(span_end - first) * H * sizeof(float),
+                                                cudaMemcpyDeviceToDevice, ctx.stream()));
+        }
         if (pa.enabled) pa.reset();
         if (layer_trace || op_trace) {
             execute_ir_graph_cuda<true>(ir, ws, ctx, hidden, ids, cuda_workspace_.logits, rows, position, position,
@@ -2056,11 +2088,12 @@ void FusionModel::execute_prefill_chunks(CudaContext& ctx, const int32_t* token_
 
 std::vector<float> FusionModel::prefill_cuda_impl(CudaContext& ctx, const int32_t* token_ids, int count,
                                                  int start_pos, bool use_fused, LayerTrace* layer_trace,
-                                                 OpTrace* op_trace, bool save_prefix_checkpoints) {
+                                                 OpTrace* op_trace, bool save_prefix_checkpoints,
+                                                 std::span<const InputEmbedding> inputs_embeds) {
     std::vector<int32_t> tokens(token_ids, token_ids + count);
     for (auto& token : tokens) token = std::clamp(token, int32_t{0}, cfg_.vocab_size - 1);
     execute_prefill_chunks(ctx, tokens.data(), count, start_pos, use_fused, layer_trace, op_trace, true,
-                           save_prefix_checkpoints);
+                           save_prefix_checkpoints, inputs_embeds);
     HostTensor logits = ctx.download(cuda_workspace_.logits);
     return {logits.data<float>(), logits.data<float>() + cfg_.vocab_size};
 }
@@ -2174,12 +2207,16 @@ std::vector<int32_t> FusionModel::generate_cuda(CudaContext& ctx, const std::vec
     std::vector<int32_t> tokens = prompt_ids;
     if (tokens.empty()) tokens.push_back(std::min(1, cfg_.vocab_size - 1));
     const int prompt_len = static_cast<int>(tokens.size());
+    const auto embeds = options.inputs_embeds;
+    validate_input_embeddings(embeds, prompt_ids.size(), static_cast<int>(tok_embeddings_.shape[1]));
+    if (!embeds.empty() && (keep_state || draft || options.spec_ngram > 0))
+        throw std::invalid_argument("Image input requires a fresh prompt and standard decoding");
     if (static_cast<int64_t>(start_pos) + prompt_len > cfg_.dense.max_seq_len) {
         throw std::invalid_argument("Prompt exceeds model context");
     }
     max_new_tokens = std::min(max_new_tokens, cfg_.dense.max_seq_len - start_pos - prompt_len);
     if (json && max_new_tokens == 0) throw std::invalid_argument("JSON generation needs room for output tokens");
-    const bool reuse = options.reuse_prefix && !keep_state;
+    const bool reuse = options.reuse_prefix && !keep_state && embeds.empty();
     if (keep_state) clear_cuda_history();
     else if (!reuse) reset_kv_and_state(ctx);
     const bool greedy = options.sampling.greedy() && !json;
@@ -2213,7 +2250,7 @@ std::vector<int32_t> FusionModel::generate_cuda(CudaContext& ctx, const std::vec
     OpTrace* prefill_trace = options.op_trace ? &prefill_profile : nullptr;
     auto logits = reuse ? prefill_cached_cuda(ctx, tokens, use_fused, &prefilled, options.layer_trace, prefill_trace)
                         : prefill_cuda_impl(ctx, tokens.data(), prompt_len, start_pos, use_fused,
-                                            options.layer_trace, prefill_trace);
+                                            options.layer_trace, prefill_trace, false, embeds);
     // A failing callback or CUDA operation must not leave a reusable recurrent state.
     cuda_session().cached_tokens.clear();
     int draft_pos = 0;

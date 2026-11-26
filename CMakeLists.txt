@@ -68,6 +68,8 @@ set(FUSIONRT_SOURCES
     src/core/model_trace.cpp
     src/core/graph_ir.cpp
     src/io/gguf.cpp
+    src/io/image.cpp
+    src/models/vision.cpp
     src/io/safetensors.cpp
     src/io/tokenizer.cpp
     src/models/model_loader.cpp

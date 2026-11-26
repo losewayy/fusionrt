@@ -44,6 +44,10 @@ public:
 
     int32_t bos_id() const { return bos_id_; }
     int32_t eos_id() const { return eos_id_; }
+    int32_t token_id(std::string_view token) const {
+        const auto it = token_to_id_.find(std::string(token));
+        return it == token_to_id_.end() ? -1 : it->second;
+    }
     bool add_bos_default() const { return add_bos_default_; }
     bool has_chatml() const { return token_to_id_.count("<|im_start|>") && token_to_id_.count("<|im_end|>"); }
     int vocab_size() const { return static_cast<int>(id_to_token_.size()); }

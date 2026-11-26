@@ -47,10 +47,12 @@ std::string tool_instructions(const AgentRequest& req, bool llama) {
 
 }  // namespace
 
-AgentPrompt render_prompt(const AgentRequest& req, const BpeTokenizer& tokenizer) {
+AgentPrompt render_prompt(const AgentRequest& req, const BpeTokenizer& tokenizer,
+                           std::span<const Image> preset_images) {
     const auto format = tokenizer.chat_format();
     const bool llama = format == ChatFormat::llama;
     std::vector<ChatMessage> messages;
+    AgentPrompt prompt;
     std::string system;
     bool has_system = false;
     for (const auto& msg : req.messages) {
@@ -75,6 +77,15 @@ AgentPrompt render_prompt(const AgentRequest& req, const BpeTokenizer& tokenizer
         if (msg.role == Role::system) continue;
         std::string content;
         bool pending = false;
+        auto add_image = [&](const Image& image) {
+            content += image_placeholder;
+            prompt.images.push_back(&image);
+            pending = true;
+        };
+        if (msg.role == Role::user) {
+            for (const auto& image : preset_images) add_image(image);
+            preset_images = {};
+        }
         auto flush = [&] {
             if (!pending) return;
             messages.push_back({msg.role == Role::assistant ? "assistant" : "user", std::move(content)});
@@ -86,6 +97,8 @@ AgentPrompt render_prompt(const AgentRequest& req, const BpeTokenizer& tokenizer
             if (const auto* t = std::get_if<std::string>(&block)) {
                 content += *t;
                 pending = true;
+            } else if (const auto* image = std::get_if<Image>(&block)) {
+                add_image(*image);
             } else if (const auto* call = std::get_if<ToolCall>(&block)) {
                 if (!content.empty()) content += '\n';
                 if (llama) content += dump_call(*call, true);
@@ -112,7 +125,6 @@ AgentPrompt render_prompt(const AgentRequest& req, const BpeTokenizer& tokenizer
         });
         if (user != messages.end()) user->content.insert(0, instructions);
     }
-    AgentPrompt prompt;
     prompt.text = tokenizer.format_chat_messages(messages);
     if (llama_tools_in_user && !instructions.empty()) {
         const auto date = prompt.text.find("Cutting Knowledge Date: December 2023");

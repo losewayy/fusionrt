@@ -108,6 +108,11 @@ struct LayerTrace {
 
 class FusionModel;
 
+struct InputEmbedding {
+    int start = 0;  // Offset into prompt token IDs.
+    Tensor rows;
+};
+
 struct GenerationOptions {
     SamplingParams sampling;
     bool reuse_prefix = false;
@@ -118,6 +123,7 @@ struct GenerationOptions {
     int spec_ngram = 0;
     FusionModel* draft_model = nullptr;
     int draft_tokens = 4;
+    std::span<const InputEmbedding> inputs_embeds;
 };
 
 struct ModelMemory {
@@ -283,7 +289,8 @@ public:
     std::vector<float> forward_token_cuda(CudaContext& ctx, int32_t token_id, int pos,
                                           bool use_fused = true, bool use_graph = false);
     std::vector<float> forward_prefill_cuda(CudaContext& ctx, const std::vector<int32_t>& token_ids,
-                                            int start_pos, bool use_fused = true);
+                                            int start_pos, bool use_fused = true,
+                                            std::span<const InputEmbedding> inputs_embeds = {});
     std::vector<float> prefill_cached_cuda(CudaContext& ctx, const std::vector<int32_t>& prompt_ids,
                                           bool use_fused = true, int* prefilled_tokens = nullptr,
                                           LayerTrace* trace = nullptr, OpTrace* op_trace = nullptr);
@@ -385,10 +392,12 @@ private:
     bool recommend_cuda_graph_ = false;
     void execute_prefill_chunks(CudaContext& ctx, const int32_t* token_ids, int count, int start_pos,
                                 bool use_fused, LayerTrace* layer_trace, OpTrace* op_trace,
-                                bool compute_logits = true, bool save_prefix_checkpoints = false);
+                                bool compute_logits = true, bool save_prefix_checkpoints = false,
+                                std::span<const InputEmbedding> inputs_embeds = {});
     std::vector<float> prefill_cuda_impl(CudaContext& ctx, const int32_t* token_ids, int count,
                                          int start_pos, bool use_fused, LayerTrace* layer_trace = nullptr,
-                                         OpTrace* op_trace = nullptr, bool save_prefix_checkpoints = false);
+                                         OpTrace* op_trace = nullptr, bool save_prefix_checkpoints = false,
+                                         std::span<const InputEmbedding> inputs_embeds = {});
     void verify_cuda(CudaContext& ctx, const std::vector<int32_t>& input, int pos, bool use_fused,
                      std::vector<float>& logits, std::vector<int32_t>& argmax, bool greedy,
                      bool retain_last_logits);

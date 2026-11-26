@@ -5,6 +5,16 @@
 
 namespace fusionrt::cuda_ops {
 
+void layernorm_f32(const float* x, const float* weight, const float* bias, float* out,
+                   int rows, int cols, float eps, cudaStream_t stream);
+void rope_2d_f32(float* x, int height, int width, int heads, int dim, float theta,
+                 cudaStream_t stream, bool vision_layout = false);
+void vision_activation_f32(float* x, int count, bool gelu, bool quick_gelu, cudaStream_t stream);
+void vision_merge_f32(const float* x, float* out, int height, int width, int cols, int merge,
+                      bool average, cudaStream_t stream);
+void clamp_f32(const float* x, float* out, int count, float lo, float hi, cudaStream_t stream);
+void vision_standardize_f32(float* x, const float* bias, const float* scale, int rows, int cols, cudaStream_t stream);
+
 // -----------------------------------------------------------------------------
 // Unfused Baseline Kernels (for differential & ablation benchmarking)
 // -----------------------------------------------------------------------------
@@ -269,7 +279,8 @@ void gqa_prefill_causal_f32(
     float* out,              // [M, num_q_heads, head_dim]
     int M, int num_q_heads, int num_kv_heads, int head_dim,
     int start_pos, int max_seq, float scale, cudaStream_t stream,
-    int q_row_stride = 0, DType kv_dtype = DType::F32, CudaKvView cache = {}, int sliding_window = 0);
+    int q_row_stride = 0, DType kv_dtype = DType::F32, CudaKvView cache = {}, int sliding_window = 0,
+    bool causal = true);
 
 // Online Tensor Core prefill with FP32 softmax and accumulation.
 void gqa_prefill_online_f32(const float* q, int q_stride, CudaKvView cache, float* out,

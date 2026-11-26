@@ -1,6 +1,7 @@
 #pragma once
 
 #include "fusionrt/json.h"
+#include "fusionrt/image.h"
 #include "fusionrt/sampler.h"
 #include "fusionrt/tokenizer.h"
 
@@ -27,7 +28,7 @@ struct ToolResult {
     bool is_error = false;
 };
 
-using Block = std::variant<std::string, ToolCall, ToolResult>;
+using Block = std::variant<std::string, ToolCall, ToolResult, Image>;
 
 struct Message {
     Role role;
@@ -59,12 +60,14 @@ struct AgentPrompt {
     std::string call_prefix;
     bool open_thought = false;
     bool llama_calls = false;
+    std::vector<const Image*> images;
 };
 
 const JsonValue& field(const JsonObject& obj, const char* key);
 GenerationParams parse_generation(const JsonObject& obj, const char* limit_key);
-AgentRequest parse_request(const JsonObject& obj, Protocol protocol);
-AgentPrompt render_prompt(const AgentRequest& req, const BpeTokenizer& tokenizer);
+AgentRequest parse_request(const JsonObject& obj, Protocol protocol, bool allow_images = false);
+AgentPrompt render_prompt(const AgentRequest& req, const BpeTokenizer& tokenizer,
+                           std::span<const Image> preset_images = {});
 
 class ToolParser {
 public:

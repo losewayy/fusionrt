@@ -135,7 +135,7 @@ __global__ void k_gqa_prefill_causal(
     const Cache* __restrict__ v_cache,
     float* __restrict__ out,
     int M, int num_q_heads, int num_kv_heads, int head_dim,
-    int start_pos, float scale, CudaKvView cache, int sliding_window)
+    int start_pos, float scale, CudaKvView cache, int sliding_window, bool causal)
 {
     extern __shared__ float smem[];
     float* red_buf = smem;
@@ -156,7 +156,7 @@ __global__ void k_gqa_prefill_causal(
     }
     __syncthreads();
 
-    const int kv_end = start_pos + m + 1;
+    const int kv_end = start_pos + (causal ? m + 1 : M);
     const int first_key = sliding_window > 0 ? max(0, kv_end - sliding_window) : 0;
     float m_i = -1e30f;
     float l_i = 0.0f;
@@ -184,7 +184,8 @@ __global__ void k_gqa_prefill_causal(
     }
 }
 
-template <int HD, typename Cache, bool Decode = false, int Warps = 8, bool FirstPage = false, bool Windowed = false>
+template <int HD, typename Cache, bool Decode = false, int Warps = 8, bool FirstPage = false,
+          bool Windowed = false, bool Causal = true>
 __global__ void k_gqa_prefill_tiled(
     const float* __restrict__ q, int q_stride,
     const Cache* __restrict__ k_cache, const Cache* __restrict__ v_cache,
@@ -216,7 +217,7 @@ __global__ void k_gqa_prefill_tiled(
         }
     }
     int tile_start = Decode ? (kv_len * blockIdx.y) / splits : 0;
-    int kv_end = Decode ? (kv_len * (blockIdx.y + 1)) / splits : start_pos + m + 1;
+    int kv_end = Decode ? (kv_len * (blockIdx.y + 1)) / splits : start_pos + (Causal ? m + 1 : M);
     int first_key = 0;
     if constexpr (Windowed) {
         if constexpr (Decode) {
@@ -229,7 +230,7 @@ __global__ void k_gqa_prefill_tiled(
             tile_start = max(0, start_pos + first / group + 1 - sliding_window) / BKV * BKV;
         }
     }
-    const int tile_end = Decode ? kv_end : start_pos + min(M, (first + Warps - 1) / group + 1);
+    const int tile_end = Decode || !Causal ? kv_end : start_pos + min(M, (first + Warps - 1) / group + 1);
     const bool valid = Decode ? query < group : m < M;
     const float* qr = q + static_cast<int64_t>(min(m, M - 1)) * q_stride + qh * HD;
 
@@ -763,7 +764,7 @@ void gqa_prefill_causal_f32(
     const float* q, const void* k_cache, const void* v_cache, float* out,
     int M, int num_q_heads, int num_kv_heads, int head_dim,
     int start_pos, int /*max_seq*/, float scale, cudaStream_t stream,
-    int q_row_stride, DType kv_dtype, CudaKvView cache, int sliding_window)
+    int q_row_stride, DType kv_dtype, CudaKvView cache, int sliding_window, bool causal)
 {
     int qs = (q_row_stride > 0) ? q_row_stride : (num_q_heads * head_dim);
     auto launch = [&]<typename Cache>() {
@@ -773,6 +774,12 @@ void gqa_prefill_causal_f32(
             const int group = num_q_heads / num_kv_heads;
             const dim3 grid(num_kv_heads, (M * group + 7) / 8);
             auto tiled = [&]<int HD>() {
+                if (!causal) {
+                    k_gqa_prefill_tiled<HD, Cache, false, 8, false, false, false><<<grid, 256, 0, stream>>>(
+                        q, qs, keys, values, out, M, num_q_heads, num_kv_heads, start_pos, scale,
+                        nullptr, 1, nullptr, cache);
+                    return;
+                }
                 if (sliding_window > 0) {
                     k_gqa_prefill_tiled<HD, Cache, false, 8, false, true><<<grid, 256, 0, stream>>>(
                         q, qs, keys, values, out, M, num_q_heads, num_kv_heads, start_pos, scale,
@@ -800,7 +807,8 @@ void gqa_prefill_causal_f32(
         const size_t smem_bytes = (32 + static_cast<size_t>(head_dim)) * sizeof(float);
         const dim3 grid(num_q_heads, M);
         k_gqa_prefill_causal<<<grid, threads, smem_bytes, stream>>>(
-            q, qs, keys, values, out, M, num_q_heads, num_kv_heads, head_dim, start_pos, scale, cache, sliding_window);
+            q, qs, keys, values, out, M, num_q_heads, num_kv_heads, head_dim, start_pos, scale,
+            cache, causal ? sliding_window : 0, causal);
     };
     if (kv_dtype == DType::Q8_0) launch.template operator()<int8_t>();
     else if (kv_dtype == DType::F16) launch.template operator()<half>();

@@ -8,6 +8,7 @@
 #endif
 
 #include "fusionrt/server.h"
+#include "fusionrt/vision.h"
 #include "agent.h"
 
 #include <algorithm>
@@ -251,7 +252,7 @@ template<class Emit>
 Completion generate(CudaContext& ctx, FusionModel& model, const BpeTokenizer& tokenizer,
                     const std::vector<int32_t>& prompt, const agent::GenerationParams& params,
                     int context, bool graph, bool reuse_prefix, Emit emit,
-                    const JsonConstraint* constraint = nullptr) {
+                    const JsonConstraint* constraint = nullptr, std::span<const InputEmbedding> embeds = {}) {
     StopBuffer stop{params.stops, {}, false};
     Utf8StreamDecoder utf8;
     Completion completion;
@@ -260,6 +261,7 @@ Completion generate(CudaContext& ctx, FusionModel& model, const BpeTokenizer& to
     opts.sampling = params.sampling;
     opts.reuse_prefix = reuse_prefix;
     opts.json_constraint = constraint;
+    opts.inputs_embeds = embeds;
     opts.on_token = [&](int32_t id) {
         if (tokenizer.is_end_of_generation(id)) {
             completion.finish = agent::Finish::stop;
@@ -281,7 +283,7 @@ Completion generate(CudaContext& ctx, FusionModel& model, const BpeTokenizer& to
 
 void complete(SocketHandle fd, CudaContext& ctx, FusionModel& model, const BpeTokenizer& tokenizer,
               const std::string& name, const std::vector<int32_t>& prompt, const agent::GenerationParams& params,
-              int context, bool graph, uint64_t request_id) {
+              int context, bool graph, uint64_t request_id, std::span<const InputEmbedding> embeds = {}) {
     const int64_t created = std::time(nullptr);
     const std::string id = "cmpl-" + std::to_string(created) + "-" + std::to_string(request_id);
     auto response = [&](JsonObject choice) {
@@ -301,7 +303,7 @@ void complete(SocketHandle fd, CudaContext& ctx, FusionModel& model, const BpeTo
     };
     Completion completion;
     try {
-        completion = generate(ctx, model, tokenizer, prompt, params, context, graph, true, emit);
+        completion = generate(ctx, model, tokenizer, prompt, params, context, graph, true, emit, nullptr, embeds);
     } catch (const std::exception& e) {
         if (!params.stream) throw;
         if (connected && event(JsonObject{{"error", JsonObject{{"message", e.what()}, {"type", "server_error"}}}})) {
@@ -325,7 +327,8 @@ void complete(SocketHandle fd, CudaContext& ctx, FusionModel& model, const BpeTo
 void complete_agent(SocketHandle fd, CudaContext& ctx, FusionModel& model, const BpeTokenizer& tokenizer,
                     const std::string& name, agent::Protocol protocol, const agent::AgentRequest& request,
                     const agent::AgentPrompt& rendered, const std::vector<int32_t>& prompt,
-                    int context, bool graph, uint64_t request_id, const JsonConstraint* constraint) {
+                    int context, bool graph, uint64_t request_id, const JsonConstraint* constraint,
+                    std::span<const InputEmbedding> embeds) {
     const int64_t created = std::time(nullptr);
     const char* prefix = protocol == agent::Protocol::chat ? "chatcmpl-" :
                          protocol == agent::Protocol::responses ? "resp_" : "msg_";
@@ -346,7 +349,7 @@ void complete_agent(SocketHandle fd, CudaContext& ctx, FusionModel& model, const
                 if (constraint) response.text(text);
                 else parser.push(text);
                 return response.connected();
-            }, constraint);
+            }, constraint, embeds);
         if (!response.connected()) return;
         parser.finish();
         if ((request.choice == agent::Choice::required || request.choice == agent::Choice::named) &&
@@ -389,7 +392,9 @@ SocketHandle listen_on(const std::string& host, int port) {
 }  // namespace
 
 void serve_http(CudaContext& ctx, FusionModel& model, const BpeTokenizer& tokenizer,
-                const std::string& model_name, const std::string& host, int port, bool use_graph) {
+                const std::string& model_name, const std::string& host, int port, bool use_graph,
+                const VisionEncoder* vision, std::span<const Image> preset_images) {
+    if (!vision && !preset_images.empty()) throw std::invalid_argument("Preset images require --mmproj");
     [[maybe_unused]] SocketRuntime sockets;
     Socket listener(listen_on(host, port));
     StopHandler stop_handler;
@@ -452,9 +457,11 @@ void serve_http(CudaContext& ctx, FusionModel& model, const BpeTokenizer& tokeni
                 const auto& obj = parsed.as_object();
                 const int context = cfg.dense.max_seq_len;
                 if (protocol) {
-                    const auto input = agent::parse_request(obj, *protocol);
-                    const auto rendered = agent::render_prompt(input, tokenizer);
-                    const auto prompt = encode_prompt(tokenizer, rendered.text, context);
+                    const auto input = agent::parse_request(obj, *protocol, vision != nullptr);
+                    const auto rendered = agent::render_prompt(input, tokenizer, preset_images);
+                    VisionPrompt prompt;
+                    if (rendered.images.empty()) prompt.tokens = encode_prompt(tokenizer, rendered.text, context);
+                    else prompt = encode_vision_prompt(ctx, *vision, tokenizer, rendered.text, rendered.images, context);
                     const JsonConstraint* constraint = nullptr;
                     if (input.generation.json != agent::JsonMode::none) {
                         const bool object_only = input.generation.json == agent::JsonMode::object;
@@ -462,14 +469,25 @@ void serve_http(CudaContext& ctx, FusionModel& model, const BpeTokenizer& tokeni
                         if (!cached) cached.emplace(tokenizer, cfg.vocab_size, object_only);
                         constraint = &*cached;
                     }
-                    complete_agent(fd, ctx, model, tokenizer, model_name, *protocol, input, rendered, prompt,
-                                   context, use_graph, ++request_id, constraint);
+                    complete_agent(fd, ctx, model, tokenizer, model_name, *protocol, input, rendered, prompt.tokens,
+                                   context, use_graph, ++request_id, constraint, prompt.inputs_embeds);
                 } else {
                     const auto& text = agent::field(obj, "prompt");
                     if (!text.is_string()) throw std::invalid_argument("prompt must be a string");
                     const auto params = agent::parse_generation(obj, "max_tokens");
-                    const auto prompt = encode_prompt(tokenizer, text.as_string(), context);
-                    complete(fd, ctx, model, tokenizer, model_name, prompt, params, context, use_graph, ++request_id);
+                    VisionPrompt prompt;
+                    if (preset_images.empty()) prompt.tokens = encode_prompt(tokenizer, text.as_string(), context);
+                    else {
+                        std::vector<const Image*> images;
+                        std::string marked;
+                        for (const auto& image : preset_images) {
+                            images.push_back(&image);
+                            marked += image_placeholder;
+                        }
+                        prompt = encode_vision_prompt(ctx, *vision, tokenizer, marked + text.as_string(), images, context);
+                    }
+                    complete(fd, ctx, model, tokenizer, model_name, prompt.tokens, params, context, use_graph,
+                             ++request_id, prompt.inputs_embeds);
                 }
             } else error(fd, "404 Not Found", "Unknown route", protocol);
         } catch (const std::invalid_argument& e) {

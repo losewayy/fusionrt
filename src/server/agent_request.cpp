@@ -77,6 +77,49 @@ std::string text_content(const JsonValue& v) {
     return out;
 }
 
+struct ImageBudget {
+    bool allowed;
+    int count = 0;
+    size_t bytes = 0;
+
+    void check(Role role) const {
+        if (!allowed) throw std::invalid_argument("Image input requires a loaded --mmproj");
+        if (role != Role::user) throw std::invalid_argument("Image input requires a user message");
+        if (count >= 8) throw std::invalid_argument("Too many images in request");
+    }
+    void append(Message& msg, Image image) {
+        if (image.rgb.size() > 64 * 1024 * 1024 - bytes)
+            throw std::invalid_argument("Decoded images exceed request size limit");
+        bytes += image.rgb.size();
+        ++count;
+        msg.content.emplace_back(std::move(image));
+    }
+};
+
+void openai_content(Message& msg, const JsonValue& value, Protocol protocol, ImageBudget& budget) {
+    if (!value.is_array()) {
+        msg.content.emplace_back(text_content(value));
+        return;
+    }
+    for (const auto& item : value.as_array()) {
+        const auto& block = object(item, "content block");
+        const auto type = identifier(block, "type");
+        if (type == "text" || type == "input_text" || type == "output_text") {
+            auto text = string(field(block, "text"), "text");
+            auto* previous = msg.content.empty() ? nullptr : std::get_if<std::string>(&msg.content.back());
+            if (previous) *previous += text;
+            else msg.content.emplace_back(std::move(text));
+        } else if (protocol == Protocol::chat && type == "image_url") {
+            budget.check(msg.role);
+            const auto& image = object(field(block, "image_url"), "image_url");
+            budget.append(msg, decode_image_data_uri(identifier(image, "url")));
+        } else if (protocol == Protocol::responses && type == "input_image") {
+            budget.check(msg.role);
+            budget.append(msg, decode_image_data_uri(identifier(block, "image_url")));
+        } else throw std::invalid_argument("Unsupported OpenAI content block: " + type);
+    }
+}
+
 JsonObject arguments(const JsonObject& obj) {
     const auto encoded = string(field(obj, "arguments"), "arguments");
     try {
@@ -86,7 +129,7 @@ JsonObject arguments(const JsonObject& obj) {
     }
 }
 
-void chat_messages(AgentRequest& req, const JsonValue& input) {
+void chat_messages(AgentRequest& req, const JsonValue& input, ImageBudget& budget) {
     for (const auto& item : array(input, "messages")) {
         const auto& o = object(item, "message");
         Message msg{role(identifier(o, "role")), {}};
@@ -95,7 +138,7 @@ void chat_messages(AgentRequest& req, const JsonValue& input) {
             msg.content.emplace_back(ToolResult{identifier(o, "tool_call_id"), optional_string(o, "name"),
                                                 text_content(content)});
         } else if (!content.is_null() || msg.role != Role::assistant) {
-            msg.content.emplace_back(text_content(content));
+            openai_content(msg, content, Protocol::chat, budget);
         }
         const auto& calls = field(o, "tool_calls");
         if (!calls.is_null()) {
@@ -111,7 +154,7 @@ void chat_messages(AgentRequest& req, const JsonValue& input) {
     }
 }
 
-void responses_input(AgentRequest& req, const JsonValue& input) {
+void responses_input(AgentRequest& req, const JsonValue& input, ImageBudget& budget) {
     if (input.is_string()) {
         req.messages.push_back({Role::user, {input.as_string()}});
         return;
@@ -122,7 +165,9 @@ void responses_input(AgentRequest& req, const JsonValue& input) {
         if (type.empty() || type == "message") {
             auto r = role(identifier(o, "role"));
             if (r == Role::tool) throw std::invalid_argument("Use function_call_output for tool results");
-            req.messages.push_back({r, {text_content(field(o, "content"))}});
+            Message msg{r, {}};
+            openai_content(msg, field(o, "content"), Protocol::responses, budget);
+            req.messages.push_back(std::move(msg));
         } else if (type == "function_call") {
             ToolCall call{identifier(o, "call_id"), identifier(o, "name"), arguments(o)};
             if (req.messages.empty() || req.messages.back().role != Role::assistant) {
@@ -138,7 +183,7 @@ void responses_input(AgentRequest& req, const JsonValue& input) {
     }
 }
 
-void anthropic_messages(AgentRequest& req, const JsonValue& input) {
+void anthropic_messages(AgentRequest& req, const JsonValue& input, ImageBudget& budget) {
     for (const auto& item : array(input, "messages")) {
         const auto& o = object(item, "message");
         Message msg{role(identifier(o, "role")), {}};
@@ -154,6 +199,12 @@ void anthropic_messages(AgentRequest& req, const JsonValue& input) {
                 const auto type = identifier(b, "type");
                 if (type == "text") {
                     msg.content.emplace_back(string(field(b, "text"), "text"));
+                } else if (type == "image") {
+                    budget.check(msg.role);
+                    const auto& source = object(field(b, "source"), "image source");
+                    if (identifier(source, "type") != "base64" || !identifier(source, "media_type").starts_with("image/"))
+                        throw std::invalid_argument("Expected an Anthropic base64 image source");
+                    budget.append(msg, decode_image_base64(identifier(source, "data")));
                 } else if (type == "tool_use" && msg.role == Role::assistant) {
                     msg.content.emplace_back(ToolCall{identifier(b, "id"), identifier(b, "name"),
                                                      object(field(b, "input"), "input")});
@@ -258,8 +309,9 @@ GenerationParams parse_generation(const JsonObject& obj, const char* limit_key) 
     return params;
 }
 
-AgentRequest parse_request(const JsonObject& obj, Protocol protocol) {
+AgentRequest parse_request(const JsonObject& obj, Protocol protocol, bool allow_images) {
     AgentRequest req;
+    ImageBudget budget{allow_images};
     const char* limit = protocol == Protocol::responses ? "max_output_tokens" : "max_tokens";
     if (protocol == Protocol::chat && !field(obj, "max_completion_tokens").is_null()) limit = "max_completion_tokens";
     req.generation = parse_generation(obj, limit);
@@ -270,13 +322,13 @@ AgentRequest parse_request(const JsonObject& obj, Protocol protocol) {
         }
         const auto instructions = optional_string(obj, "instructions");
         if (!instructions.empty()) req.messages.push_back({Role::system, {instructions}});
-        responses_input(req, field(obj, "input"));
+        responses_input(req, field(obj, "input"), budget);
     } else if (protocol == Protocol::messages) {
         const auto& system = field(obj, "system");
         if (!system.is_null()) req.messages.push_back({Role::system, {text_content(system)}});
-        anthropic_messages(req, field(obj, "messages"));
+        anthropic_messages(req, field(obj, "messages"), budget);
     } else {
-        chat_messages(req, field(obj, "messages"));
+        chat_messages(req, field(obj, "messages"), budget);
         const auto& options = field(obj, "stream_options");
         if (!options.is_null()) req.stream_usage = boolean(object(options, "stream_options"), "include_usage");
     }

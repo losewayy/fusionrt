@@ -5,6 +5,7 @@
 #include "fusionrt/safetensors.h"
 #include "fusionrt/server.h"
 #include "fusionrt/tokenizer.h"
+#include "fusionrt/vision.h"
 #ifdef FUSIONRT_ENABLE_CUDA
 #include "fusionrt/cuda_backend.h"
 #endif
@@ -42,9 +43,11 @@ void print_usage() {
               << "               [--temp 0] [--top-k 40] [--top-p 0.95] [--min-p 0.05] [--repeat-penalty 1] [--seed 42]\n"
               << "               [--profile <json>] [--profile-ops <json>] [--trace-layers <json>]\n"
               << "               [--json-grammar] [--spec-ngram <k> | --draft-model <gguf> [--draft-tokens 4]]\n"
+              << "               [--mmproj <gguf> --image <path> ...] (use <image> to place images in the prompt)\n"
               << "  fusionrt inspect --model <path> [--max-seq 4096] [--device-memory]\n"
               << "  fusionrt chat --model <path> [--system <text>] [--temp 0.7] [--max-tokens 512]\n"
-              << "  fusionrt serve --model <path> [--host 127.0.0.1] [--port 8080] [--max-seq 4096] [--slots 1] [--profile <json>]\n"
+              << "  fusionrt serve --model <path> [--mmproj <gguf>] [--image <preset> ...]\n"
+              << "                 [--host 127.0.0.1] [--port 8080] [--max-seq 4096] [--slots 1] [--profile <json>]\n"
               << "  fusionrt bench-model --model <path> [--pp 128] [--tg 64] [--decode-prefix 0] [--ubatch 512] [--reps 5] [--graph] [--profile-ops <json>]\n"
               << "  CUDA run, chat, serve, inspect and bench-model accept --kv-type {f32|f16|q8_0}.\n"
               << "  CUDA placement options: --kv-vram-mb <MiB> (0: auto), --host-kv-mb <MiB> (0: disabled),\n"
@@ -247,6 +250,8 @@ struct WeightSummary {
 
 int cmd_daily(const std::string& cmd, int argc, char** argv) {
     std::string path, system, profile, host = "127.0.0.1";
+    std::string mmproj;
+    std::vector<std::string> image_paths;
     int max_seq = 4096, steps = 512, port = 8080, slots = 1;
     std::optional<bool> graph;
     bool inspect_device = false;
@@ -275,6 +280,8 @@ int cmd_daily(const std::string& cmd, int argc, char** argv) {
         else if (placement.parse(arg, value)) continue;
         else if (cmd == "serve" && arg == "--host") host = value;
         else if (cmd == "serve" && arg == "--port") port = std::stoi(value);
+        else if (cmd == "serve" && arg == "--mmproj") mmproj = value;
+        else if (cmd == "serve" && arg == "--image") image_paths.push_back(value);
         else if (cmd == "serve" && arg == "--slots") {
             size_t parsed = 0;
             slots = std::stoi(value, &parsed);
@@ -290,12 +297,23 @@ int cmd_daily(const std::string& cmd, int argc, char** argv) {
         throw std::invalid_argument("Expected --model and positive context, generation length and port");
     }
     sampling.validate();
+    if (!image_paths.empty() && mmproj.empty()) throw std::invalid_argument("--image requires --mmproj");
     GgufFile header;
     const bool inspect_gguf = cmd == "inspect" && is_gguf(path);
     if (inspect_gguf && !inspect_device) {
         const auto start = std::chrono::steady_clock::now();
         std::string error;
         if (!header.load(path, &error, false)) throw std::runtime_error(error);
+        if (header.find_tensor("v.patch_embd.weight")) {
+            const auto vision = VisionInfo::from_gguf(header);
+            std::cout << "model=" << model_filename(path) << " architecture=" << vision.architecture
+                      << " projector=" << vision.projector << " layout=vision"
+                      << " patch_size=" << vision.patch_size << " image_size=" << vision.image_size
+                      << " hidden_size=" << vision.hidden_size << " heads=" << vision.heads
+                      << " layers=" << vision.layers << " output_size=" << vision.output_size
+                      << " spatial_merge=" << vision.spatial_merge << '\n';
+            return 0;
+        }
         const auto arch = header.get_string("general.architecture", "llama");
         const auto prefix = arch + ".";
         const auto hidden = header.get_int(prefix + "embedding_length");
@@ -386,7 +404,11 @@ int cmd_daily(const std::string& cmd, int argc, char** argv) {
     BpeTokenizer tokenizer;
     if (!load_tokenizer(tokenizer, path)) throw std::runtime_error("Model tokenizer could not be loaded");
     if (cmd == "chat") return interactive_chat(ctx, model, tokenizer, system, sampling, steps, true, use_graph, true);
-    serve_http(ctx, model, tokenizer, model_filename(path), host, port, use_graph);
+    std::unique_ptr<VisionEncoder> vision;
+    if (!mmproj.empty()) vision = std::make_unique<VisionEncoder>(ctx, mmproj, model.config().dense.hidden_size);
+    std::vector<Image> preset_images;
+    for (const auto& image_path : image_paths) preset_images.push_back(load_image(image_path));
+    serve_http(ctx, model, tokenizer, model_filename(path), host, port, use_graph, vision.get(), preset_images);
     return 0;
 #endif
 }
@@ -469,6 +491,8 @@ int cmd_run(int argc, char** argv) {
     std::string backend_s = "cuda";
     std::string model_path;
     std::string draft_path;
+    std::string mmproj;
+    std::vector<std::string> image_paths;
     std::string prompt = "Hello fusionrt";
     int steps = 16;
     int spec_ngram = 0, draft_tokens = 4;
@@ -495,6 +519,8 @@ int cmd_run(int argc, char** argv) {
         else if (a == "--json-grammar") json_grammar = true;
         else if (a == "--spec-ngram" && i + 1 < argc) spec_ngram = std::stoi(argv[++i]);
         else if (a == "--draft-model" && i + 1 < argc) draft_path = argv[++i];
+        else if (a == "--mmproj" && i + 1 < argc) mmproj = argv[++i];
+        else if (a == "--image" && i + 1 < argc) image_paths.push_back(argv[++i]);
         else if (a == "--draft-tokens" && i + 1 < argc) {
             draft_tokens = std::stoi(argv[++i]);
             draft_tokens_set = true;
@@ -522,6 +548,11 @@ int cmd_run(int argc, char** argv) {
     if (kv_dtype && backend_s != "cuda") throw std::invalid_argument("--kv-type requires the CUDA backend");
     if (placement.specified && backend_s != "cuda") throw std::invalid_argument("Placement options require the CUDA backend");
     if (steps < 0 || max_seq <= 0) throw std::invalid_argument("Invalid --steps or --max-seq");
+    if (!image_paths.empty() && mmproj.empty()) throw std::invalid_argument("--image requires --mmproj");
+    if (!mmproj.empty() && (backend_s != "cuda" || chat_mode))
+        throw std::invalid_argument("--mmproj requires non-interactive CUDA run");
+    if (!image_paths.empty() && (spec_ngram > 0 || !draft_path.empty()))
+        throw std::invalid_argument("Image input requires standard decoding");
     if (spec_ngram < 0 || draft_tokens <= 0 || (draft_tokens_set && draft_path.empty())) {
         throw std::invalid_argument("Expected --spec-ngram >= 0 and --draft-tokens > 0 with --draft-model");
     }
@@ -573,6 +604,8 @@ int cmd_run(int argc, char** argv) {
             model.set_device_profile(ctx, DeviceProfile::load(profile));
         }
         load_tok_if_present();
+        std::unique_ptr<VisionEncoder> vision;
+        if (!mmproj.empty()) vision = std::make_unique<VisionEncoder>(ctx, mmproj, model.config().dense.hidden_size);
         std::unique_ptr<FusionModel> draft;
         if (!draft_path.empty()) {
             BpeTokenizer draft_tok;
@@ -594,10 +627,24 @@ int cmd_run(int argc, char** argv) {
             return interactive_chat(ctx, model, tok, "", sampling, steps, use_fused, use_graph, stop_on_eos);
         }
 
+        if (!image_paths.empty() && prompt.find(image_placeholder) == std::string::npos) {
+            std::string prefix;
+            for (size_t i = 0; i < image_paths.size(); ++i) prefix += image_placeholder;
+            prompt = prefix + prompt;
+        }
         std::string final_prompt = use_chatml && tok.has_chatml()
             ? "<|im_start|>user\n" + prompt + "<|im_end|>\n<|im_start|>assistant\n"
             : prompt;
-        auto prompt_ids = tok.encode(final_prompt, true);
+        VisionPrompt prepared;
+        if (image_paths.empty()) prepared.tokens = tok.encode(final_prompt, true);
+        else {
+            std::vector<Image> images;
+            std::vector<const Image*> refs;
+            for (const auto& path : image_paths) images.push_back(load_image(path));
+            for (const auto& image : images) refs.push_back(&image);
+            prepared = encode_vision_prompt(ctx, *vision, tok, final_prompt, refs, model.config().dense.max_seq_len);
+        }
+        auto& prompt_ids = prepared.tokens;
         if (prompt_ids.empty()) prompt_ids.push_back(1);
         OpTrace op_trace;
         LayerTrace trace;
@@ -610,6 +657,7 @@ int cmd_run(int argc, char** argv) {
         options.spec_ngram = spec_ngram;
         options.draft_model = draft.get();
         options.draft_tokens = draft_tokens;
+        options.inputs_embeds = prepared.inputs_embeds;
         options.op_trace = profile_ops.empty() ? nullptr : &op_trace;
         options.layer_trace = layer_trace.empty() ? nullptr : &trace;
         if (stream || stop_on_eos) {

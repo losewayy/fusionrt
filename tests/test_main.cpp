@@ -4,6 +4,7 @@
 #include "fusionrt/models.h"
 #include "fusionrt/safetensors.h"
 #include "fusionrt/tokenizer.h"
+#include "fusionrt/vision.h"
 #include "agent.h"
 #ifdef FUSIONRT_ENABLE_CUDA
 #include "../src/core/cpu_moe.h"
@@ -2026,6 +2027,204 @@ void test_phase2_loaders_prefill_and_vulkan_e2e(CudaContext& cuda_ctx) {
 }
 #endif
 
+void test_stage7b_images_and_protocols() {
+    using namespace agent;
+    const std::string ppm = "UDYKMSAxCjI1NQr/AAA=";
+    const std::vector<uint8_t> colors{255,0,0,0,255,0,0,0,255,255,255,255};
+    for (const auto* b64 : {
+        "iVBORw0KGgoAAAANSUhEUgAAAAIAAAACCAIAAAD91JpzAAAAGUlEQVR4AQEOAPH/AP8AAAD/AAAAAP////8f7gX73t3sKwAAAABJRU5ErkJggg==",
+        "iVBORw0KGgoAAAANSUhEUgAAAAIAAAACCAIAAAD91JpzAAAAFElEQVR4AWP4z8DAAMIM/////w8AH+4F+w7A5KwAAAAASUVORK5CYII="}) {
+        const auto decoded = decode_image_base64(b64);
+        if (decoded.width != 2 || decoded.height != 2 || decoded.rgb != colors)
+            throw std::runtime_error("Stored/fixed PNG decoding");
+    }
+    const auto dynamic = decode_image_base64("iVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAIAAAD8GO2jAAAAT0lEQVR42u2VuQ0AQAjDvErmYn8pY9wUviolFYI8BkiSu7u2ZfP3GXsf9j3Y/8LWA1tvbD9h+xU7D9h5w84zdl+wvhwPxoPxYDwYD37w4AFHlCw9N3VFOgAAAABJRU5ErkJggg==");
+    if (dynamic.width != 32 || dynamic.height != 32) throw std::runtime_error("Dynamic PNG geometry");
+    constexpr std::array<uint8_t, 4> tones{0, 33, 91, 232};
+    for (int y = 0; y < 32; ++y) for (int x = 0; x < 96; ++x) {
+        if (dynamic.rgb[y * 96 + x] != tones[((y * 97 + x + 1) / 4) % 4])
+            throw std::runtime_error("Dynamic PNG pixels");
+    }
+    std::vector<uint8_t> bmp(58);
+    bmp[0] = 'B'; bmp[1] = 'M'; bmp[2] = 58; bmp[10] = 54; bmp[14] = 40;
+    bmp[18] = 1; bmp[22] = 1; bmp[26] = 1; bmp[28] = 24; bmp[56] = 255;
+    if (decode_image(bmp).rgb != std::vector<uint8_t>{255,0,0} ||
+        decode_image_base64("UDUKMSAxCjI1NQoR").rgb != std::vector<uint8_t>{17,17,17})
+        throw std::runtime_error("BMP or PGM decoding");
+
+    const std::string uri = "data:image/x-portable-pixmap;base64," + ppm;
+    BpeTokenizer tok;
+    tok.init_byte_fallback();
+    const std::vector<std::pair<Protocol, std::string>> requests{
+        {Protocol::chat, R"({"messages":[{"role":"user","content":[{"type":"text","text":"before"},{"type":"image_url","image_url":{"url":")" + uri + R"("}},{"type":"text","text":"after"}]}]})"},
+        {Protocol::responses, R"({"input":[{"role":"user","content":[{"type":"input_image","image_url":")" + uri + R"("}]}]})"},
+        {Protocol::messages, R"({"messages":[{"role":"user","content":[{"type":"image","source":{"type":"base64","media_type":"image/x-portable-pixmap","data":")" + ppm + R"("}}]}]})"}
+    };
+    auto bad_request = [](const auto& obj, Protocol protocol, bool loaded) {
+        try { (void)parse_request(obj, protocol, loaded); }
+        catch (const std::invalid_argument&) { return; } // The HTTP dispatcher returns 400 for this exception.
+        throw std::runtime_error("Invalid image request was accepted");
+    };
+    for (const auto& [protocol, json] : requests) {
+        const auto obj = JsonValue::parse(json).as_object();
+        const auto parsed = parse_request(obj, protocol, true);
+        const auto prompt = render_prompt(parsed, tok);
+        if (prompt.images.size() != 1 || prompt.images[0]->rgb != std::vector<uint8_t>{255,0,0} ||
+            prompt.text.find(image_placeholder) == std::string::npos ||
+            (protocol == Protocol::chat && prompt.text.find("before<image>after") == std::string::npos))
+            throw std::runtime_error("Image request or prompt order");
+        bad_request(obj, protocol, false);
+        auto broken = json;
+        broken.replace(broken.find(ppm), ppm.size(), "!!!!");
+        bad_request(JsonValue::parse(broken).as_object(), protocol, true);
+        broken = json;
+        broken.replace(broken.find(ppm), ppm.size(), "QUJDRA==");
+        bad_request(JsonValue::parse(broken).as_object(), protocol, true);
+    }
+    std::cout << "  [PASS] PNG stored/fixed/dynamic, BMP/PPM/PGM, three image protocols and 400 paths\n";
+}
+
+#ifdef FUSIONRT_ENABLE_CUDA
+void test_stage7b_cuda_vision() {
+    CudaContext ctx(0, 24, 32);
+    auto& scratch = ctx.scratch_arena();
+    std::mt19937_64 rng(712);
+    auto compare = [&](const Tensor& result, const std::vector<double>& reference, const char* name) {
+        const auto host = ctx.download(result);
+        const std::vector<float> values(host.data<float>(), host.data<float>() + host.desc.numel());
+        double diff = 0, base = 0;
+        for (size_t i = 0; i < values.size(); ++i) {
+            const double d = values[i] - reference[i];
+            diff += d * d;
+            base += reference[i] * reference[i];
+        }
+        const double rel = std::sqrt(diff / base);
+        if (!(rel < 1e-5)) throw std::runtime_error(std::string(name) + " relative error: " + std::to_string(rel));
+        std::cout << "  [PASS] " << name << " rel_l2=" << rel << '\n';
+    };
+    {
+        constexpr int rows = 6, dim = 64;
+        const auto q = rand_f32({rows, dim}, rng), k = rand_f32({rows, dim}, rng), v = rand_f32({rows, dim}, rng);
+        auto dq = ctx.upload(q, false), dk = ctx.upload(k, false), dv = ctx.upload(v, false);
+        auto output = scratch.alloc_tensor({rows, dim}, DType::F32);
+        const float scale = 1.f / std::sqrt(static_cast<float>(dim));
+        cuda_ops::gqa_prefill_causal_f32(dq.ptr<float>(), dk.ptr<float>(), dv.ptr<float>(), output.ptr<float>(),
+            rows, 1, 1, dim, 0, rows, scale, ctx.stream(), 0, DType::F32, {}, 0, false);
+        std::vector<double> ref(rows * dim);
+        for (int i = 0; i < rows; ++i) {
+            double sum = 0;
+            for (int j = 0; j < rows; ++j) {
+                double score = 0;
+                for (int d = 0; d < dim; ++d) score += double(q.data<float>()[i*dim+d]) * k.data<float>()[j*dim+d];
+                const double p = std::exp(score * scale);
+                sum += p;
+                for (int d = 0; d < dim; ++d) ref[i*dim+d] += p * v.data<float>()[j*dim+d];
+            }
+            for (int d = 0; d < dim; ++d) ref[i*dim+d] /= sum;
+        }
+        compare(output, ref, "Bidirectional FA2 vs FP64");
+        auto w = make_ones_f32({dim}), b = rand_f32({dim}, rng);
+        auto dw = ctx.upload(w, false), db = ctx.upload(b, false);
+        cuda_ops::layernorm_f32(dq.ptr<float>(), dw.ptr<float>(), db.ptr<float>(), output.ptr<float>(), rows, dim, 1e-5f, ctx.stream());
+        for (int row = 0; row < rows; ++row) {
+            const auto* x = q.data<float>() + row * dim;
+            double sum = 0, sq = 0;
+            for (int d = 0; d < dim; ++d) sum += x[d];
+            const double mean = sum / dim;
+            for (int d = 0; d < dim; ++d) sq += (x[d] - mean) * (x[d] - mean);
+            for (int d = 0; d < dim; ++d) ref[row*dim+d] = (x[d] - mean) / std::sqrt(sq / dim + 1e-5) + b.data<float>()[d];
+        }
+        compare(output, ref, "LayerNorm vs FP64");
+        constexpr int width = 3, quarter = dim / 4;
+        for (const bool qwen : {false, true}) {
+            auto d_rope = ctx.upload(q, false);
+            cuda_ops::rope_2d_f32(d_rope.ptr<float>(), 2, width, 1, dim, 10000.f, ctx.stream(), qwen);
+            for (int row = 0; row < rows; ++row) for (int axis = 0; axis < 2; ++axis) for (int d = 0; d < quarter; ++d) {
+                const int lo = row*dim + (qwen ? axis*quarter : axis*2*quarter) + d;
+                const int hi = lo + (qwen ? 2*quarter : quarter);
+                const double angle = ((axis != 0) != qwen ? row / width : row % width) /
+                                     std::pow(10000.0, double(d)/quarter);
+                ref[lo] = q.data<float>()[lo]*std::cos(angle) - q.data<float>()[hi]*std::sin(angle);
+                ref[hi] = q.data<float>()[lo]*std::sin(angle) + q.data<float>()[hi]*std::cos(angle);
+            }
+            compare(d_rope, ref, qwen ? "2D RoPE vision layout vs FP64" : "2D RoPE split spatial axes vs FP64");
+        }
+    }
+    scratch.reset();
+    constexpr int H = 64;
+    struct Fixture {
+        std::string path = "stage7b-test-mmproj.gguf";
+        ~Fixture() { std::error_code ec; std::filesystem::remove(path, ec); }
+    } fixture;
+    const std::map<std::string, GgufMetaValue> meta{
+        {"general.architecture", std::string("clip")}, {"clip.vision.patch_size", uint32_t{1}},
+        {"clip.vision.image_size", uint32_t{4}}, {"clip.vision.embedding_length", uint32_t{H}},
+        {"clip.vision.attention.head_count", uint32_t{1}}, {"clip.vision.block_count", uint32_t{1}},
+        {"clip.vision.spatial_merge_size", uint32_t{2}}, {"clip.vision.rope.freq_base", 10000.0f}
+    };
+    const std::vector<std::pair<std::string, HostTensor>> tensors{
+        {"v.patch_embd.weight", rand_f32({H,3,1,1}, rng)}, {"v.patch_embd.bias", HostTensor({H}, DType::F32)},
+        {"v.position_embd.weight", rand_f32({4,H}, rng, 0.02f)},
+        {"v.blk.0.ln1.weight", make_ones_f32({H})}, {"v.blk.0.ln2.weight", make_ones_f32({H})},
+        {"v.blk.0.attn_qkv.weight", rand_f32({3*H,H}, rng, 0.05f)},
+        {"v.blk.0.attn_out.weight", rand_f32({H,H}, rng, 0.05f)},
+        {"v.blk.0.ffn_up.weight", rand_f32({2*H,H}, rng, 0.05f)},
+        {"v.blk.0.ffn_down.weight", rand_f32({H,2*H}, rng, 0.05f)},
+        {"mm.0.weight", rand_f32({H,4*H}, rng, 0.08f)}, {"mm.2.weight", rand_f32({H,H}, rng, 0.12f)}
+    };
+    std::string error;
+    if (!GgufFile::write_v3(fixture.path, meta, tensors, &error)) throw std::runtime_error(error);
+    VisionEncoder vision(ctx, fixture.path, H);
+    if (vision.info().layers != 1 || vision.info().heads != 1 || vision.info().spatial_merge != 2)
+        throw std::runtime_error("mmproj geometry roundtrip");
+    const auto red = decode_image_base64("UDYKMSAxCjI1NQr/AAA=");
+    const auto green = decode_image_base64("UDYKMSAxCjI1NQoA/wA=");
+    const Image* images[] = {&red};
+    BpeTokenizer tokenizer;
+    tokenizer.init_byte_fallback();
+    const auto a = encode_vision_prompt(ctx, vision, tokenizer, "A<image>Z", images, 64);
+    images[0] = &green;
+    const auto b = encode_vision_prompt(ctx, vision, tokenizer, "A<image>Z", images, 64);
+    if (a.tokens != b.tokens || a.inputs_embeds[0].rows.shape[0] != 4) throw std::runtime_error("Image placeholder geometry");
+    HybridModelConfig cfg;
+    cfg.vocab_size = tokenizer.vocab_size();
+    cfg.num_layers = 2;
+    cfg.dense.hidden_size = H;
+    cfg.dense.intermediate_size = 2 * H;
+    cfg.dense.num_attention_heads = 2;
+    cfg.dense.num_key_value_heads = 1;
+    cfg.dense.head_dim = 32;
+    cfg.dense.max_seq_len = 64;
+    FusionModel model(cfg);
+    model.set_num_slots(2);
+    model.init_synthetic(ctx, 71);
+    ctx.set_prefill_batch(3);
+    model.reset_kv_and_state(ctx);
+    const auto logits_a = model.forward_prefill_cuda(ctx, a.tokens, 0, true, a.inputs_embeds);
+    const auto logits_b = model.forward_prefill_cuda(ctx, b.tokens, 0, true, b.inputs_embeds);
+    if (logits_a == logits_b) throw std::runtime_error("Different images produced identical logits");
+    GenerationStats stats;
+    auto generate = [&](const VisionPrompt& p) {
+        GenerationOptions op;
+        op.reuse_prefix = true;
+        op.inputs_embeds = p.inputs_embeds;
+        auto ids = model.generate_cuda(ctx, p.tokens, 6, true, true, &stats, false, 0, -1, op);
+        if (stats.prefilled_tokens != static_cast<int>(p.tokens.size())) throw std::runtime_error("Vision prefix reused text KV");
+        return ids;
+    };
+    model.prefill_cached_cuda(ctx, a.tokens);
+    auto text_alternative = a.tokens;
+    text_alternative[0] = 35;
+    model.prefill_cached_cuda(ctx, text_alternative);
+    const auto out_a = generate(a), out_b = generate(b);
+    if (out_a != generate(a) || out_a == out_b) throw std::runtime_error("Image generation or slot isolation");
+    int prefilled = 0;
+    model.prefill_cached_cuda(ctx, a.tokens, true, &prefilled);
+    if (prefilled != 1) throw std::runtime_error("Vision request invalidated unrelated text slot");
+    std::cout << "  [PASS] mmproj vision encode and chunked CUDA splice, distinct image tokens, isolated prefix slots\n";
+}
+#endif
+
 void test_stage7a_json() {
     std::cout << "Testing incremental JSON grammar and constrained sampling...\n";
     auto check = [](bool passed, const char* error) {
@@ -2777,8 +2976,10 @@ int main() {
 #endif
         test_wave3();
         test_stage7a_json();
+        test_stage7b_images_and_protocols();
 #ifdef FUSIONRT_ENABLE_CUDA
         test_stage7a_speculative();
+        test_stage7b_cuda_vision();
         test_chunked_prefill_and_k_quant_gdn();
         test_cuda_session_slots();
         test_tiered_cuda_kv();

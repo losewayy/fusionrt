@@ -6,6 +6,68 @@ namespace fusionrt::cuda_ops {
 
 namespace {
 
+__global__ void k_layernorm(const float* x, const float* weight, const float* bias, float* out,
+                            int cols, float eps) {
+    __shared__ float reduce[32];
+    const auto* src = x + blockIdx.x * cols;
+    auto* dst = out + blockIdx.x * cols;
+    float sum = 0;
+    for (int i = threadIdx.x; i < cols; i += blockDim.x) sum += src[i];
+    const float mean = block_reduce_sum(sum, reduce) / cols;
+    __syncthreads();
+    float sq = 0;
+    for (int i = threadIdx.x; i < cols; i += blockDim.x) {
+        const float d = src[i] - mean;
+        sq = fmaf(d, d, sq);
+    }
+    const float inv = rsqrtf(block_reduce_sum(sq, reduce) / cols + eps);
+    for (int i = threadIdx.x; i < cols; i += blockDim.x)
+        dst[i] = (src[i] - mean) * inv * weight[i] + (bias ? bias[i] : 0.0f);
+}
+
+__global__ void k_vision_merge(const float* x, float* out, int count, int width, int cols, int merge, bool average) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= count) return;
+    const int stride = cols * (average ? 1 : merge * merge);
+    const int group = i / stride, lane = i % stride;
+    const int base = (group / (width / merge) * width + group % (width / merge)) * merge;
+    if (average) {
+        float sum = 0;
+        for (int y = 0; y < merge; ++y)
+            for (int xx = 0; xx < merge; ++xx) sum += x[(base + y * width + xx) * cols + lane];
+        out[i] = sum / (merge * merge);
+    } else {
+        const int patch = lane / cols;
+        out[i] = x[(base + patch / merge * width + patch % merge) * cols + lane % cols];
+    }
+}
+
+__global__ void k_rope_2d(float* x, int width, int heads, int half_dim, float theta, bool vision_layout) {
+    const int patch = blockIdx.x / heads, pair = threadIdx.x;
+    const int quarter = half_dim / 2;
+    const bool row_axis = pair >= quarter;
+    const int pos = row_axis != vision_layout ? patch / width : patch % width;
+    const float angle = pos * powf(theta, -static_cast<float>(pair % quarter) / quarter);
+    float s, c;
+    sincosf(angle, &s, &c);
+    const int lo = vision_layout ? pair : pair + (row_axis ? quarter : 0);
+    const int hi = lo + (vision_layout ? half_dim : quarter);
+    auto* v = x + blockIdx.x * (2 * half_dim);
+    const float a = v[lo], b = v[hi];
+    v[lo] = a * c - b * s;
+    v[hi] = a * s + b * c;
+}
+
+__global__ void k_clamp(const float* x, float* out, int count, float lo, float hi) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < count) out[i] = fminf(hi, fmaxf(lo, x[i]));
+}
+
+__global__ void k_vision_standardize(float* x, const float* bias, const float* scale, int count, int cols) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < count) x[i] = (x[i] - bias[i % cols]) * scale[i % cols];
+}
+
 __global__ void k_rmsnorm_f32(const float* __restrict__ x, const float* __restrict__ w,
                               float* __restrict__ y, int cols, float eps) {
     __shared__ float smem[32];
@@ -67,6 +129,15 @@ __device__ __forceinline__ float gated_activation(float gate, float up) {
         return (0.5f * gate) * (1.0f + tanhf(0.7978845608028654f * gate * (1.0f + 0.044715f * gate * gate))) * up;
     else
         return silu_f(gate) * up;
+}
+
+__global__ void k_vision_activation(float* x, int count, bool gelu, bool quick) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < count) {
+        const float t = x[i];
+        x[i] = quick ? t / (1.0f + expf(-1.702f * t)) :
+               gelu ? gated_activation<true>(t, 1.f) : silu_f(t);
+    }
 }
 
 template <bool Gelu>
@@ -647,6 +718,36 @@ __global__ void k_add_rmsnorm_f32(const float* __restrict__ a,
 }
 
 }  // namespace
+
+void layernorm_f32(const float* x, const float* weight, const float* bias, float* out,
+                   int rows, int cols, float eps, cudaStream_t stream) {
+    const int threads = std::min(256, ((cols + 31) / 32) * 32);
+    k_layernorm<<<rows, threads, 0, stream>>>(x, weight, bias, out, cols, eps);
+}
+
+void vision_merge_f32(const float* x, float* out, int height, int width, int cols, int merge,
+                      bool average, cudaStream_t stream) {
+    const int count = height / merge * (width / merge) * cols * (average ? 1 : merge * merge);
+    k_vision_merge<<<(count + 255) / 256, 256, 0, stream>>>(x, out, count, width, cols, merge, average);
+}
+
+void rope_2d_f32(float* x, int height, int width, int heads, int dim, float theta,
+                 cudaStream_t stream, bool vision_layout) {
+    k_rope_2d<<<height * width * heads, dim / 2, 0, stream>>>(x, width, heads, dim / 2, theta, vision_layout);
+}
+
+void vision_activation_f32(float* x, int count, bool gelu, bool quick_gelu, cudaStream_t stream) {
+    k_vision_activation<<<(count + 255) / 256, 256, 0, stream>>>(x, count, gelu, quick_gelu);
+}
+
+void clamp_f32(const float* x, float* out, int count, float lo, float hi, cudaStream_t stream) {
+    k_clamp<<<(count + 255) / 256, 256, 0, stream>>>(x, out, count, lo, hi);
+}
+
+void vision_standardize_f32(float* x, const float* bias, const float* scale, int rows, int cols, cudaStream_t stream) {
+    const int count = rows * cols;
+    k_vision_standardize<<<(count + 255) / 256, 256, 0, stream>>>(x, bias, scale, count, cols);
+}
 
 void rmsnorm_f32(const float* x, const float* weight, float* y,
                  int rows, int cols, float eps, cudaStream_t stream) {
