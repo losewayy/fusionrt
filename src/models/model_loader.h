@@ -8,6 +8,12 @@ namespace fusionrt::model_io {
 struct LoadedLayerRaw {
     int kind = 0;  // 0=dense, 1=gdn, 2=moe
     bool gated_q_attn = false;
+    int kv_source_layer = -1;
+    int sliding_window = 0;
+    int query_heads = 0, kv_heads = 0, head_dim = 0, rotary_dims = 0;
+    float rope_theta = 0.0f;
+    float output_scale = 1.0f;
+    HostTensor attn_post_norm, ffn_post_norm;
     // Dense
     HostTensor attn_norm, q_proj, k_proj, v_proj, qkv_proj, q_norm, k_norm, o_proj, mlp_norm, gate_up, gate, up, down;
     HostTensor q_bias, k_bias, v_bias;

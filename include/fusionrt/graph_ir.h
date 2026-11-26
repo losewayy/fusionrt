@@ -21,6 +21,8 @@ enum class OpKind : uint8_t {
     SWIGLU_Q8_LINEAR = 9,
     FUSED_ADD_RMSNORM = 10,
     SHARED_Q8_PROJECTIONS = 11,
+    GEGLU_INTERLEAVED = 12,
+    GEGLU_Q8_LINEAR = 13,
 };
 
 inline const char* op_kind_name(OpKind op) {
@@ -36,6 +38,8 @@ inline const char* op_kind_name(OpKind op) {
         case OpKind::FUSED_ADD_RMSNORM:        return "FUSED_ADD_RMSNORM";
         case OpKind::SHARED_Q8_PROJECTIONS:    return "SHARED_Q8_PROJECTIONS";
         case OpKind::SWIGLU_Q8_LINEAR:         return "SWIGLU_Q8_LINEAR";
+        case OpKind::GEGLU_INTERLEAVED:        return "GEGLU_INTERLEAVED";
+        case OpKind::GEGLU_Q8_LINEAR:          return "GEGLU_Q8_LINEAR";
         case OpKind::MOE_FFN_BLOCK:            return "MOE_FFN_BLOCK";
     }
     return "UNKNOWN";
@@ -83,6 +87,7 @@ struct IRNode {
     const Tensor* norm_weight = nullptr;
     bool share_quantized_activation = false;
     bool output_logits = false;
+    float output_scale = 1.0f;
 
     // Attention and recurrent nodes refer to session state by layer index.
     int layer_index = -1;
@@ -108,6 +113,8 @@ struct MiniGraph {
     int input_value = -1;
     int output_value = -1;
     int hidden_size = 0;
+    float final_logit_softcapping = 0.0f;
+    int decode_split_kv_heads = 0;
     std::vector<ValueMeta> values;
     std::vector<IRNode> nodes;
     FusionPassStats stats;

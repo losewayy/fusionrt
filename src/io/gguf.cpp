@@ -125,6 +125,10 @@ GgufMetaValue read_gguf_val(std::ifstream& ifs, uint32_t vtype) {
                 arr.reserve(static_cast<size_t>(n));
                 for (uint64_t i = 0; i < n; ++i) arr.push_back(read_str(ifs));
                 return arr;
+            } else if (elem_type == static_cast<uint32_t>(GgufValType::BOOL)) {
+                std::vector<bool> arr(static_cast<size_t>(n));
+                for (uint64_t i = 0; i < n; ++i) arr[i] = read_le<uint8_t>(ifs) != 0;
+                return arr;
             } else if (elem_type == static_cast<uint32_t>(GgufValType::INT32)) {
                 std::vector<int32_t> arr(static_cast<size_t>(n));
                 if (n > 0) ifs.read(reinterpret_cast<char*>(arr.data()), static_cast<std::streamsize>(n * 4));
@@ -193,6 +197,12 @@ void write_gguf_val(std::ofstream& ofs, const GgufMetaValue& mv) {
         const auto& arr = std::get<std::vector<std::string>>(mv);
         write_le<uint64_t>(ofs, arr.size());
         for (const auto& s : arr) write_str(ofs, s);
+    } else if (std::holds_alternative<std::vector<bool>>(mv)) {
+        write_le(ofs, static_cast<uint32_t>(GgufValType::ARRAY));
+        write_le(ofs, static_cast<uint32_t>(GgufValType::BOOL));
+        const auto& arr = std::get<std::vector<bool>>(mv);
+        write_le<uint64_t>(ofs, arr.size());
+        for (bool value : arr) write_le<uint8_t>(ofs, value);
     } else if (std::holds_alternative<std::vector<int32_t>>(mv)) {
         write_le(ofs, static_cast<uint32_t>(GgufValType::ARRAY));
         write_le(ofs, static_cast<uint32_t>(GgufValType::INT32));

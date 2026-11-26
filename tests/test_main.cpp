@@ -902,7 +902,7 @@ void test_cuda_wave1_decode(CudaContext& ctx) {
     ctx.weight_arena().reset(weights_mark);
 }
 
-void test_repacked_k_quants(CudaContext& ctx) {
+void test_repacked_quants(CudaContext& ctx) {
     constexpr int M = 129, N = 4097, K = 256;
     std::mt19937_64 rng(91);
     auto& arena = ctx.scratch_arena();
@@ -928,7 +928,7 @@ void test_repacked_k_quants(CudaContext& ctx) {
         auto raw = HostTensor::create({N, K}, raw_type);
         auto packed = HostTensor::create({N, K}, packed_type);
         for (auto& byte : raw.storage) byte = static_cast<uint8_t>(rng());
-        for (int n = 0; n < N; ++n) {
+        for (size_t n = 0; n < static_cast<size_t>(raw.desc.numel()) / dtype_block_size(raw_type); ++n) {
             raw.data<Raw>()[n].d = fp32_to_fp16(0.00021f);
             if constexpr (std::is_same_v<Raw, BlockQ4_K>) raw.data<Raw>()[n].dmin = fp32_to_fp16(0.00031f);
         }
@@ -960,11 +960,253 @@ void test_repacked_k_quants(CudaContext& ctx) {
         got = ctx.download(y);
         expect_close({got.data<float>(), got.data<float>() + M * N}, expected, 3e-5, 1e-5, label + " MMQ");
     };
+    check(DType::Q4_0, DType::Q4_A, repack_q4_0_to_q4_a, dequantize_row_q4_0, dequantize_row_q4_a,
+          cuda_ops::gemv_q4_a_q8_1, cuda_ops::mmq_q4_a_q8_1);
     check(DType::Q4_K, DType::Q4_KA, repack_q4_k_to_q4_ka, dequantize_row_q4_k, dequantize_row_q4_ka,
           cuda_ops::gemv_q4_ka_q8_1, cuda_ops::mmq_q4_ka_q8_1);
+    std::cout << "  [PASS] TileQ4_144 Q4_A and Q4_KA GEMV/MMQ parity\n";
     check(DType::Q6_K, DType::Q6_A, repack_q6_k_to_q6_a, dequantize_row_q6_k, dequantize_row_q6_a,
           cuda_ops::gemv_q6_a_q8_1, cuda_ops::mmq_q6_a_q8_1);
     arena.reset(mark);
+}
+
+void test_cuda_sliding_window(CudaContext& ctx) {
+    constexpr int seq = 192, window = 32, nq = 4, nkv = 2, splits = 8;
+    std::mt19937_64 rng(343);
+    auto& arena = ctx.scratch_arena();
+    const auto mark = arena.mark();
+    for (const int hd : {64, 256}) {
+        const int q_dim = nq * hd, kv_dim = nkv * hd;
+        const float scale = 1.0f / std::sqrt(static_cast<float>(hd));
+        const auto q = rand_f32({seq, q_dim}, rng, 0.5f);
+        const auto k = rand_f32({seq, kv_dim}, rng, 0.5f);
+        const auto v = rand_f32({seq, kv_dim}, rng, 0.25f);
+        const auto dq = ctx.upload(q, false), dk = ctx.upload(k, false), dv = ctx.upload(v, false);
+        const auto out = arena.alloc_tensor({seq, q_dim}, DType::F32);
+        const auto decoded = arena.alloc_tensor({q_dim}, DType::F32);
+        const auto partial = arena.alloc_tensor({nq, splits, hd}, DType::F32);
+        const auto stats = arena.alloc_tensor({nq, splits, 2}, DType::F32);
+
+        std::vector<double> reference(seq * q_dim);
+        for (int pos = 0; pos < seq; ++pos) {
+            const int first = std::max(0, pos + 1 - window);
+            for (int h = 0; h < nq; ++h) {
+                const int kh = h / (nq / nkv);
+                const auto* query = q.data<float>() + pos * q_dim + h * hd;
+                auto* dst = reference.data() + pos * q_dim + h * hd;
+                float probability[window];
+                float sum = 0.0f;
+                for (int t = first; t <= pos; ++t) {
+                    const auto* key = k.data<float>() + t * kv_dim + kh * hd;
+                    float dot = 0.0f;
+                    for (int i = 0; i < hd; ++i) dot += query[i] * key[i];
+                    const float p = std::exp(dot * scale);
+                    probability[t - first] = p;
+                    sum += p;
+                }
+                for (int t = first; t <= pos; ++t) {
+                    const auto* value = v.data<float>() + t * kv_dim + kh * hd;
+                    for (int i = 0; i < hd; ++i) dst[i] += (probability[t - first] / sum) * value[i];
+                }
+            }
+        }
+        for (const auto dtype : {DType::F32, DType::F16}) {
+            const auto cache = make_cuda_kv_view(arena, dtype, seq, nkv, hd);
+            CudaKvPool pool;
+            CudaKvPool::Table pages;
+            pool.ensure(ctx, std::span(&cache, 1), pages, 0, seq);
+            cuda_ops::batched_qk_norm_rope_kv_append_f32(dq.ptr<float>(), dk.ptr<float>(), dv.ptr<float>(),
+                nullptr, nullptr, nullptr, nullptr, seq, nq, nkv, hd, 0, 0, seq, 10000.0f, 1e-6f, true,
+                ctx.stream(), q_dim, kv_dim, kv_dim, nullptr, dtype, cache);
+            auto read = [&](const Tensor& t) {
+                const auto host = ctx.download(t);
+                return std::vector<float>(host.data<float>(), host.data<float>() + host.desc.numel());
+            };
+
+            cuda_ops::gqa_prefill_online_f32(dq.ptr<float>(), q_dim, cache, out.ptr<float>(), seq, nq, nkv,
+                hd, 0, scale, ctx.stream(), window);
+            expect_close(read(out), reference, 2.5e-4, 2e-3, "SWA paged online prefill");
+            cuda_ops::gqa_prefill_causal_f32(dq.ptr<float>(), nullptr, nullptr, out.ptr<float>(), seq, nq, nkv,
+                hd, 0, seq, scale, ctx.stream(), q_dim, dtype, cache, window);
+            expect_close(read(out), reference, 8e-5, 1e-3, "SWA paged tiled prefill");
+            for (const int length : {3, kKvPageTokens + 3, seq}) {
+                cuda_ops::gqa_splitk_decode_f32(dq.ptr<float>() + (length - 1) * q_dim, nullptr, nullptr,
+                    decoded.ptr<float>(), partial.ptr<float>(), stats.ptr<float>(), nq, nkv, hd, nullptr,
+                    length, seq, scale, splits, ctx.stream(), true, dtype, nullptr, nullptr, cache, window);
+                auto first = reference.begin() + (length - 1) * q_dim;
+                expect_close(read(decoded), {first, first + q_dim}, 8e-5, 1e-3, "SWA paged Split-KV decode");
+            }
+        }
+        arena.reset(mark);
+    }
+    std::cout << "  [PASS] SWA window 32, 192 tokens, online/tiled prefill and Split-KV decode vs FP32\n";
+}
+
+void test_cuda_gemma_epilogues(CudaContext& ctx) {
+    constexpr int rows = 3, width = 64;
+    constexpr float eps = 1e-6f, cap = 0.5f;
+    std::mt19937_64 rng(419);
+    auto& arena = ctx.scratch_arena();
+    const auto mark = arena.mark();
+    const auto gate_up = rand_f32({rows, 2 * width}, rng, 2.0f);
+    const auto w = rand_f32({width}, rng, 1.0f);
+    const auto dgu = ctx.upload(gate_up, false), dw = ctx.upload(w, false);
+    const auto out = arena.alloc_tensor({rows, width}, DType::F32);
+    const auto q8 = arena.alloc_tensor({rows, width}, DType::Q8_1);
+    std::vector<double> act(rows * width), post(rows * width);
+    for (int r = 0; r < rows; ++r) {
+        const auto* gate = gate_up.data<float>() + r * 2 * width;
+        float sq = 0.0f;
+        for (int i = 0; i < width; ++i) {
+            const float x = gate[i];
+            const float y = 0.5f * x * (1.0f + std::tanh(std::sqrt(2.0f / 3.14159265359f) *
+                (x + 0.044715f * x * x * x))) * gate[width + i];
+            act[r * width + i] = y;
+            sq += y * y;
+        }
+        const float inv = 1.0f / std::sqrt(sq / width + eps);
+        for (int i = 0; i < width; ++i) post[r * width + i] = act[r * width + i] * inv * w.data<float>()[i];
+    }
+    auto read = [&]() {
+        const auto h = ctx.download(out);
+        return std::vector<float>(h.data<float>(), h.data<float>() + rows * width);
+    };
+    cuda_ops::geglu_interleaved_f32(dgu.ptr<float>(), out.ptr<float>(), rows, width, ctx.stream());
+    expect_close(read(), act, 2e-6, 1e-6, "GeGLU F32");
+    cuda_ops::geglu_interleaved_q8_1(dgu.ptr<float>(), q8.ptr(), rows, width, ctx.stream());
+    const auto packed = ctx.download(q8);
+    for (int i = 0; i < rows * width; i += 32) {
+        const auto& block = packed.data<BlockQ8_1>()[i / 32];
+        const auto* bytes = reinterpret_cast<const int8_t*>(block.qs);
+        float maximum = 0.0f;
+        int lo = 0, hi = 0;
+        for (int j = 0; j < 32; ++j) {
+            maximum = std::max(maximum, static_cast<float>(std::abs(act[i + j])));
+            (j < 16 ? lo : hi) += bytes[j];
+            if (std::abs(block.d * bytes[j] - act[i + j]) > block.d * 0.5f + 3e-6f) {
+                throw std::runtime_error("GeGLU Q8_1 quantization parity");
+            }
+        }
+        if (std::abs(block.d - maximum / 127.0f) > 1e-7f ||
+            std::abs(block.s_lo - block.d * lo) > 1e-6f ||
+            std::abs(block.s_hi - block.d * hi) > 1e-6f ||
+            std::abs(block.s_all - block.d * (lo + hi)) > 1e-6f) {
+            throw std::runtime_error("GeGLU Q8_1 block metadata parity");
+        }
+    }
+    const auto normalized = arena.alloc_tensor({rows, width}, DType::F32);
+    cuda_ops::rmsnorm_f32(out.ptr<float>(), dw.ptr<float>(), normalized.ptr<float>(), rows, width, eps, ctx.stream());
+    auto host = ctx.download(normalized);
+    expect_close({host.data<float>(), host.data<float>() + rows * width}, post, 2e-6, 1e-6, "Gemma post RMSNorm");
+    cuda_ops::softcap_f32(normalized.ptr<float>(), rows * width, cap, ctx.stream());
+    for (auto& x : post) x = cap * std::tanh(x / cap);
+    host = ctx.download(normalized);
+    expect_close({host.data<float>(), host.data<float>() + rows * width}, post, 2e-6, 1e-6, "Gemma logit softcap");
+    arena.reset(mark);
+    std::cout << "  [PASS] GeGLU F32/Q8_1, post RMSNorm and logit softcap vs FP32\n";
+}
+
+void test_cuda_gemma4_gguf() {
+    constexpr int layers = 4, hidden = 64, vocab = 64, nq = 4, window = 32, seq = 136;
+    constexpr float cap = 0.5f;
+    struct Fixture {
+        std::filesystem::path path = "test-gemma4.gguf";
+        ~Fixture() { std::error_code ec; std::filesystem::remove(path, ec); }
+    } fixture;
+    const std::vector<bool> swa{true, false, true, false};
+    const std::vector<uint32_t> ff{64, 96, 128, 96};
+    std::map<std::string, GgufMetaValue> meta{
+        {"general.architecture", std::string("gemma4")}, {"gemma4.block_count", uint32_t{layers}},
+        {"gemma4.embedding_length", uint32_t{hidden}}, {"gemma4.attention.head_count", uint32_t{nq}},
+        {"gemma4.attention.head_count_kv", std::vector<uint32_t>{2, 1, 0, 0}},
+        {"gemma4.attention.key_length", uint32_t{512}}, {"gemma4.attention.key_length_swa", uint32_t{64}},
+        {"gemma4.attention.sliding_window", uint32_t{window}},
+        {"gemma4.attention.sliding_window_pattern", swa}, {"gemma4.attention.shared_kv_layers", uint32_t{2}},
+        {"gemma4.rope.freq_base", 1000000.0f}, {"gemma4.rope.freq_base_swa", 10000.0f},
+        {"gemma4.feed_forward_length", ff}, {"gemma4.final_logit_softcapping", cap},
+        {"gemma4.embedding_length_per_layer_input", uint32_t{0}}
+    };
+
+    std::mt19937_64 rng(391);
+    auto output_factors = make_ones_f32({256});
+    output_factors.data<float>()[255] = 1.0e9f;
+    std::vector<std::pair<std::string, HostTensor>> weights{
+        {"token_embd.weight", rand_f32({vocab, hidden}, rng, 0.1f)},
+        {"output_norm.weight", make_ones_f32({hidden})},
+        {"rope_freqs.weight", std::move(output_factors)}
+    };
+    for (int i = 0; i < layers; ++i) {
+        const std::string p = "blk." + std::to_string(i) + ".";
+        const int hd = swa[i] ? 64 : 512, kv_heads = swa[i] ? 2 : 1;
+        const int width = static_cast<int>(ff[i]);
+        auto matrix = [&](const char* name, int r, int c) {
+            weights.emplace_back(p + name, rand_f32({r, c}, rng, 0.035f));
+        };
+        auto norm = [&](const char* name, int n, float value = 1.0f) {
+            auto weight = make_ones_f32({n});
+            for (int j = 0; j < n; ++j) weight.data<float>()[j] = value;
+            weights.emplace_back(p + name, std::move(weight));
+        };
+        norm("attn_norm.weight", hidden);
+        norm("attn_q_norm.weight", hd);
+        if (i < 2) {
+            matrix("attn_k.weight", kv_heads * hd, hidden);
+            if (swa[i]) matrix("attn_v.weight", kv_heads * hd, hidden);
+            norm("attn_k_norm.weight", hd);
+        }
+        matrix("attn_q.weight", nq * hd, hidden);
+        matrix("attn_output.weight", hidden, nq * hd);
+        norm("post_attention_norm.weight", hidden, 0.35f);
+        norm("ffn_norm.weight", hidden);
+        matrix("ffn_gate.weight", width, hidden);
+        matrix("ffn_up.weight", width, hidden);
+        matrix("ffn_down.weight", hidden, width);
+        norm("post_ffw_norm.weight", hidden, 0.25f);
+        norm("layer_output_scale.weight", 1, 0.9f);
+    }
+    CudaContext ctx(0, 0, 64);
+    FusionModel model(HybridModelConfig{});
+    std::string err;
+    if (!GgufFile::write_v3(fixture.path.string(), meta, weights, &err) ||
+        !model.load_gguf(ctx, fixture.path.string(), &err, 160)) {
+        throw std::runtime_error("Gemma 4 GGUF load: " + err);
+    }
+    const auto& loaded = model.dense_layers();
+    if (model.config().embed_scale != 8.0f || model.config().final_logit_softcapping != cap ||
+        loaded.size() != layers || loaded[0].sliding_window != window || loaded[0].rope_factors.data ||
+        loaded[1].cfg.head_dim != 512 || loaded[1].v_proj.data || !loaded[1].rope_factors.data ||
+        loaded[2].kv_source_layer != 0 || loaded[3].kv_source_layer != 1 ||
+        loaded[2].k_proj.data || loaded[3].v_proj.data || !loaded[3].ffn_post_norm_w.data) {
+        throw std::runtime_error("Gemma 4 GGUF layer wiring");
+    }
+
+    std::vector<int32_t> prompt(seq);
+    for (auto& token : prompt) token = static_cast<int32_t>(rng() % vocab);
+    const auto batched = model.forward_prefill_cuda(ctx, prompt, 0);
+    const size_t expected_kv_bytes = 2 * 2 * kKvPageTokens * (2 * 64 + 512) * sizeof(float);
+    if (model.cuda_cache_memory().kv_bytes != expected_kv_bytes) {
+        throw std::runtime_error("Gemma 4 shared layers allocated their own KV pages");
+    }
+    model.reset_kv_and_state(ctx);
+    std::vector<float> sequential;
+    for (int i = 0; i < seq; ++i) sequential = model.forward_token_cuda(ctx, prompt[i], i);
+    double squared_error = 0.0, squared_ref = 0.0;
+    for (int i = 0; i < vocab; ++i) {
+        const double diff = batched[i] - sequential[i];
+        squared_error += diff * diff;
+        squared_ref += double(sequential[i]) * sequential[i];
+        if (std::abs(batched[i]) > cap) throw std::runtime_error("Gemma 4 logits exceed softcap");
+    }
+    const double rel_l2 = std::sqrt(squared_error / squared_ref);
+    if (!(rel_l2 < 1e-5)) throw std::runtime_error("Gemma 4 batched/sequential rel_l2: " + std::to_string(rel_l2));
+
+    const auto eager = model.generate_cuda(ctx, prompt, 16, true, false);
+    const auto graph = model.generate_cuda(ctx, prompt, 16, true, true);
+    if (eager != graph || graph.size() != seq + 16) {
+        throw std::runtime_error("Gemma 4 CUDA Graph/eager tokens differ");
+    }
+    std::cout << "  [PASS] Gemma 4 four-layer GGUF, prefill rel_l2=" << rel_l2
+              << ", Graph/eager 16/16 tokens, shared KV bytes=" << expected_kv_bytes << "\n";
 }
 
 void test_cuda_wave2_prefill(CudaContext& ctx) {
@@ -2096,8 +2338,11 @@ int main() {
         test_cuda_qk_rope_and_gqa_64k(cuda_ctx);
         test_cuda_graph_and_moe_offload(cuda_ctx);
         test_cuda_wave1_decode(cuda_ctx);
-        test_repacked_k_quants(cuda_ctx);
+        test_repacked_quants(cuda_ctx);
         test_cuda_wave2_prefill(cuda_ctx);
+        test_cuda_sliding_window(cuda_ctx);
+        test_cuda_gemma_epilogues(cuda_ctx);
+        test_cuda_gemma4_gguf();
 #endif
 #ifdef FUSIONRT_ENABLE_VULKAN
         test_vulkan_all_devices();

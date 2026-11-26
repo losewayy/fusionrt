@@ -158,7 +158,7 @@ void optimize_graph(MiniGraph& g) {
     {
         for (size_t i = 0; i < g.nodes.size(); ++i) {
             IRNode& add = g.nodes[i];
-            if (!add.alive || add.op != OpKind::ADD_RESIDUAL) continue;
+            if (!add.alive || add.op != OpKind::ADD_RESIDUAL || add.output_scale != 1.0f) continue;
             int v_res = add.out;
             int first_use_idx = -1;
             for (size_t j = i + 1; j < g.nodes.size(); ++j) {
@@ -191,11 +191,12 @@ void optimize_graph(MiniGraph& g) {
     for (size_t i = 1; i < g.nodes.size(); ++i) {
         IRNode& act = g.nodes[i - 1];
         IRNode& lin = g.nodes[i];
-        if (!act.alive || act.op != OpKind::SWIGLU_INTERLEAVED || act.inputs.size() != 1 || uses[act.out] != 1 ||
+        const bool geglu = act.op == OpKind::GEGLU_INTERLEAVED;
+        if (!act.alive || (act.op != OpKind::SWIGLU_INTERLEAVED && !geglu) || act.inputs.size() != 1 || uses[act.out] != 1 ||
             !lin.alive || lin.op != OpKind::LINEAR || lin.inputs.size() != 1 ||
             lin.inputs[0] != act.out || lin.input_cols != act.output_cols || !lin.weight ||
             !supports_q8_1_decode(lin.weight->dtype)) continue;
-        lin.op = OpKind::SWIGLU_Q8_LINEAR;
+        lin.op = geglu ? OpKind::GEGLU_Q8_LINEAR : OpKind::SWIGLU_Q8_LINEAR;
         lin.inputs[0] = act.inputs[0];
         act.alive = false;
     }

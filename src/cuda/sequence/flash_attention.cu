@@ -20,7 +20,7 @@ __global__ void k_gqa_splitk_part1(
     float* __restrict__ partial_ml,
     int num_q_heads, int num_kv_heads, int head_dim,
     const int* __restrict__ kv_len_dev, int kv_len_host,
-    float scale, int num_splits, CudaKvView cache)
+    float scale, int num_splits, CudaKvView cache, int sliding_window)
 {
     extern __shared__ float smem[];
     float* red_buf = smem;       // [32]
@@ -40,8 +40,10 @@ __global__ void k_gqa_splitk_part1(
     }
     __syncthreads();
 
-    int t_start = (kv_len * split_id) / num_splits;
-    int t_end = (kv_len * (split_id + 1)) / num_splits;
+    const int first_key = sliding_window > 0 ? max(0, kv_len - sliding_window) : 0;
+    const int visible = kv_len - first_key;
+    const int t_start = first_key + (visible * split_id) / num_splits;
+    const int t_end = first_key + (visible * (split_id + 1)) / num_splits;
 
     float m_i = -1e30f;
     float l_i = 0.0f;
@@ -133,7 +135,7 @@ __global__ void k_gqa_prefill_causal(
     const Cache* __restrict__ v_cache,
     float* __restrict__ out,
     int M, int num_q_heads, int num_kv_heads, int head_dim,
-    int start_pos, float scale, CudaKvView cache)
+    int start_pos, float scale, CudaKvView cache, int sliding_window)
 {
     extern __shared__ float smem[];
     float* red_buf = smem;
@@ -154,12 +156,13 @@ __global__ void k_gqa_prefill_causal(
     }
     __syncthreads();
 
-    int kv_end = start_pos + m + 1;
+    const int kv_end = start_pos + m + 1;
+    const int first_key = sliding_window > 0 ? max(0, kv_end - sliding_window) : 0;
     float m_i = -1e30f;
     float l_i = 0.0f;
     float o_j = 0.0f;
 
-    for (int t = 0; t < kv_end; ++t) {
+    for (int t = first_key; t < kv_end; ++t) {
         const auto* keys = kv_row<false>(k_cache, cache, t, kvh, num_kv_heads, head_dim);
         const auto* values = kv_row<true>(v_cache, cache, t, kvh, num_kv_heads, head_dim);
         const float qk_part = tid < head_dim
@@ -167,7 +170,7 @@ __global__ void k_gqa_prefill_causal(
         float score = block_reduce_sum(qk_part, red_buf);
 
         float m_new = fmaxf(m_i, score);
-        float alpha = (t == 0) ? 0.0f : expf(m_i - m_new);
+        float alpha = (t == first_key) ? 0.0f : expf(m_i - m_new);
         float p = expf(score - m_new);
         l_i = l_i * alpha + p;
         if (tid < head_dim) {
@@ -181,13 +184,13 @@ __global__ void k_gqa_prefill_causal(
     }
 }
 
-template <int HD, typename Cache, bool Decode = false, int Warps = 8, bool FirstPage = false>
+template <int HD, typename Cache, bool Decode = false, int Warps = 8, bool FirstPage = false, bool Windowed = false>
 __global__ void k_gqa_prefill_tiled(
     const float* __restrict__ q, int q_stride,
     const Cache* __restrict__ k_cache, const Cache* __restrict__ v_cache,
     float* __restrict__ out, int M, int num_q_heads, int num_kv_heads,
     int start_pos, float scale, const int* kv_len_dev = nullptr, int splits = 1,
-    float* partial_ml = nullptr, CudaKvView cache = {})
+    float* partial_ml = nullptr, CudaKvView cache = {}, int sliding_window = 0)
 {
     constexpr int BKV = std::is_same_v<Cache, float> ? 8 : 16, DP = HD / 32;
     constexpr int TokensPerWarp = Decode ? 4 : 1;
@@ -212,8 +215,20 @@ __global__ void k_gqa_prefill_tiled(
             cache.pages = nullptr;
         }
     }
-    const int tile_start = Decode ? (kv_len * blockIdx.y) / splits : 0;
-    const int kv_end = Decode ? (kv_len * (blockIdx.y + 1)) / splits : start_pos + m + 1;
+    int tile_start = Decode ? (kv_len * blockIdx.y) / splits : 0;
+    int kv_end = Decode ? (kv_len * (blockIdx.y + 1)) / splits : start_pos + m + 1;
+    int first_key = 0;
+    if constexpr (Windowed) {
+        if constexpr (Decode) {
+            first_key = max(0, kv_len - sliding_window);
+            const int visible = kv_len - first_key;
+            tile_start = first_key + (visible * blockIdx.y) / splits;
+            kv_end = first_key + (visible * (blockIdx.y + 1)) / splits;
+        } else {
+            first_key = max(0, kv_end - sliding_window);
+            tile_start = max(0, start_pos + first / group + 1 - sliding_window) / BKV * BKV;
+        }
+    }
     const int tile_end = Decode ? kv_end : start_pos + min(M, (first + Warps - 1) / group + 1);
     const bool valid = Decode ? query < group : m < M;
     const float* qr = q + static_cast<int64_t>(min(m, M - 1)) * q_stride + qh * HD;
@@ -262,7 +277,7 @@ __global__ void k_gqa_prefill_tiled(
             }
         }
         __syncthreads();
-        if (valid && base < kv_end) {
+        if (valid && base < kv_end && (!Windowed || base + BKV > first_key)) {
             float scores[BKV];
             float next_max = max_score;
             #pragma unroll
@@ -285,7 +300,8 @@ __global__ void k_gqa_prefill_tiled(
                 #pragma unroll
                 for (int j = 0; j < TokensPerWarp; ++j) {
                     const float score = Decode ? __shfl_sync(0xffffffffu, dot, j * ScoreLanes) : dot;
-                    scores[t + j] = base + t + j < kv_end ? score : -INFINITY;
+                    const int pos = base + t + j;
+                    scores[t + j] = pos < kv_end && (!Windowed || pos >= first_key) ? score : -INFINITY;
                     next_max = fmaxf(next_max, scores[t + j]);
                 }
             }
@@ -468,11 +484,24 @@ __device__ __forceinline__ unsigned attention_rescale(unsigned x, half2 alpha) {
     return reinterpret_cast<const unsigned&>(y);
 }
 
-__device__ __forceinline__ unsigned attention_mask_pair(unsigned x, int col, int last) {
+template <bool Windowed>
+__device__ __forceinline__ unsigned attention_mask_pair(unsigned x, int col, int last, int first) {
     constexpr unsigned neg_inf = 0xfc00u;
+    if constexpr (Windowed) {
+        if (col + 1 < first) return neg_inf | (neg_inf << 16);
+        if (col < first) return (x & 0xffff0000u) | neg_inf;
+    }
     if (col > last) return neg_inf | (neg_inf << 16);
     if (col == last) return (x & 0xffffu) | (neg_inf << 16);
     return x;
+}
+
+template <bool Windowed>
+__device__ __forceinline__ float attention_weight(float score, float maximum) {
+    if constexpr (Windowed) {
+        if (maximum == -INFINITY) return 0.0f;
+    }
+    return attention_exp2(score - maximum);
 }
 
 template <int HD, int Warps>
@@ -483,9 +512,9 @@ struct OnlineAttentionTile {
 
 // Keep scores, softmax state and output fragments on chip; K and V are shared
 // by all query rows and heads in this KV group.
-template <int HD, int Warps, typename Cache>
+template <int HD, int Warps, typename Cache, bool Windowed>
 __device__ __forceinline__ void gqa_prefill_online(const float* q, int q_stride, CudaKvView cache, float* out,
-                                                  int rows, int nq, int nkv, int start, float scale, half* sh) {
+                                                  int rows, int nq, int nkv, int start, float scale, half* sh, int sliding_window) {
     using Tile = OnlineAttentionTile<HD, Warps>;
     constexpr int Q = Tile::Q, K = Tile::K;
     constexpr bool HalfPV = HD == 256, HalfQK = HD == 256;
@@ -520,7 +549,10 @@ __device__ __forceinline__ void gqa_prefill_online(const float* q, int q_stride,
     __syncthreads();
     float max0 = -INFINITY, max1 = -INFINITY, sum0 = 0.0f, sum1 = 0.0f;
     std::conditional_t<HalfPV, uint2, float4> acc[HD / 8]{};
-    for (int base = 0; base <= last; base += K) {
+    const int first0 = Windowed ? max(0, last0 + 1 - sliding_window) : 0;
+    const int first1 = Windowed ? max(0, last1 + 1 - sliding_window) : 0;
+    const int start_tile = Windowed ? max(0, first + 1 - sliding_window) / K * K : 0;
+    for (int base = start_tile; base <= last; base += K) {
         if constexpr (HD == 256) {
             attention_stage_kv_tile<Cache, HD, K, Warps>(sk, sv, cache, base, last, head, nkv);
         } else {
@@ -554,12 +586,12 @@ __device__ __forceinline__ void gqa_prefill_online(const float* q, int q_stride,
         };
         if constexpr (HalfQK) {
             // Only the tiles intersecting the causal boundary need per-query masks.
-            if (base + K - 1 > first) {
+            if (Windowed || base + K - 1 > first) {
                 #pragma unroll
                 for (int i = 0; i < K / 8; ++i) {
                     const int t = base + 8 * i + col;
                     auto& s = scores[i];
-                    s = {attention_mask_pair(s.x, t, last0), attention_mask_pair(s.y, t, last1)};
+                    s = {attention_mask_pair<Windowed>(s.x, t, last0, first0), attention_mask_pair<Windowed>(s.y, t, last1, first1)};
                 }
             }
         }
@@ -569,8 +601,10 @@ __device__ __forceinline__ void gqa_prefill_online(const float* q, int q_stride,
             if constexpr (!HalfQK) {
                 const int t = base + 8 * i + col;
                 auto& s = scores[i];
-                s = {t <= last0 ? s.x * scale : -INFINITY, t + 1 <= last0 ? s.y * scale : -INFINITY,
-                     t <= last1 ? s.z * scale : -INFINITY, t + 1 <= last1 ? s.w * scale : -INFINITY};
+                s = {t >= first0 && t <= last0 ? s.x * scale : -INFINITY,
+                     t + 1 >= first0 && t + 1 <= last0 ? s.y * scale : -INFINITY,
+                     t >= first1 && t <= last1 ? s.z * scale : -INFINITY,
+                     t + 1 >= first1 && t + 1 <= last1 ? s.w * scale : -INFINITY};
             }
             const auto s = score(scores[i]);
             next0 = fmaxf(next0, fmaxf(s.x, s.y));
@@ -581,7 +615,7 @@ __device__ __forceinline__ void gqa_prefill_online(const float* q, int q_stride,
             next0 = fmaxf(next0, __shfl_xor_sync(mask, next0, x));
             next1 = fmaxf(next1, __shfl_xor_sync(mask, next1, x));
         }
-        const float alpha0 = attention_exp2(max0 - next0), alpha1 = attention_exp2(max1 - next1);
+        const float alpha0 = attention_weight<Windowed>(max0, next0), alpha1 = attention_weight<Windowed>(max1, next1);
         max0 = next0;
         max1 = next1;
         float tile0 = 0.0f, tile1 = 0.0f;
@@ -589,10 +623,10 @@ __device__ __forceinline__ void gqa_prefill_online(const float* q, int q_stride,
         #pragma unroll
         for (int i = 0; i < K / 16; ++i) {
             const auto a = score(scores[2 * i]), b = score(scores[2 * i + 1]);
-            const float ax = attention_exp2(a.x - max0), ay = attention_exp2(a.y - max0);
-            const float az = attention_exp2(a.z - max1), aw = attention_exp2(a.w - max1);
-            const float bx = attention_exp2(b.x - max0), by = attention_exp2(b.y - max0);
-            const float bz = attention_exp2(b.z - max1), bw = attention_exp2(b.w - max1);
+            const float ax = attention_weight<Windowed>(a.x, max0), ay = attention_weight<Windowed>(a.y, max0);
+            const float az = attention_weight<Windowed>(a.z, max1), aw = attention_weight<Windowed>(a.w, max1);
+            const float bx = attention_weight<Windowed>(b.x, max0), by = attention_weight<Windowed>(b.y, max0);
+            const float bz = attention_weight<Windowed>(b.z, max1), bw = attention_weight<Windowed>(b.w, max1);
             tile0 += ax + ay + bx + by;
             tile1 += az + aw + bz + bw;
             p[i] = {attention_prob(ax, ay), attention_prob(az, aw),
@@ -646,21 +680,21 @@ __device__ __forceinline__ void gqa_prefill_online(const float* q, int q_stride,
     }
 }
 
-template <int HD, int Warps, typename Cache>
+template <int HD, int Warps, typename Cache, bool Windowed>
     requires (HD != 256)
 __global__ void k_gqa_prefill_online(const float* q, int q_stride, CudaKvView cache, float* out,
-                                     int rows, int nq, int nkv, int start, float scale) {
+                                     int rows, int nq, int nkv, int start, float scale, int sliding_window) {
     extern __shared__ __align__(16) half sh[];
-    gqa_prefill_online<HD, Warps, Cache>(q, q_stride, cache, out, rows, nq, nkv, start, scale, sh);
+    gqa_prefill_online<HD, Warps, Cache, Windowed>(q, q_stride, cache, out, rows, nq, nkv, start, scale, sh, sliding_window);
 }
 
-template <int HD, int Warps, typename Cache>
+template <int HD, int Warps, typename Cache, bool Windowed>
     requires (HD == 256)
 __global__ __launch_bounds__(32 * Warps, 3)
 void k_gqa_prefill_online(const float* q, int q_stride, CudaKvView cache, float* out,
-                          int rows, int nq, int nkv, int start, float scale) {
+                          int rows, int nq, int nkv, int start, float scale, int sliding_window) {
     extern __shared__ __align__(16) half sh[];
-    gqa_prefill_online<HD, Warps, Cache>(q, q_stride, cache, out, rows, nq, nkv, start, scale, sh);
+    gqa_prefill_online<HD, Warps, Cache, Windowed>(q, q_stride, cache, out, rows, nq, nkv, start, scale, sh, sliding_window);
 }
 
 }  // namespace
@@ -671,13 +705,13 @@ void gqa_splitk_decode_f32(
     int num_q_heads, int num_kv_heads, int head_dim,
     const int* kv_len_dev, int kv_len_host, int /*max_seq*/,
     float scale, int max_splits, cudaStream_t stream, bool fixed_splits, DType kv_dtype,
-    BlockQ8_1* q8_out, const float* gate, CudaKvView cache)
+    BlockQ8_1* q8_out, const float* gate, CudaKvView cache, int sliding_window)
 {
     int num_splits = max_splits;
     if (!kv_len_dev && !fixed_splits && !q8_out) {
         num_splits = select_decode_splits({}, kv_len_host, num_kv_heads, max_splits);
     }
-    int threads = std::min(256, std::max(32, ((head_dim + 31) / 32) * 32));
+    int threads = std::min(1024, std::max(32, ((head_dim + 31) / 32) * 32));
     size_t smem_bytes = (32 + static_cast<size_t>(head_dim)) * sizeof(float);
 
     auto launch = [&]<typename Cache>() {
@@ -689,9 +723,15 @@ void gqa_splitk_decode_f32(
                 const dim3 grid(num_kv_heads, num_splits);
                 auto grouped = [&]<int HD>() {
                     auto run = [&]<int Warps>() {
-                        k_gqa_prefill_tiled<HD, Cache, true, Warps><<<grid, Warps * 32, 0, stream>>>(
-                            q, 0, keys, values, partial_out, 1, num_q_heads, num_kv_heads,
-                            kv_len_host, scale, kv_len_dev, num_splits, partial_ml, cache);
+                        if (sliding_window > 0) {
+                            k_gqa_prefill_tiled<HD, Cache, true, Warps, false, true><<<grid, Warps * 32, 0, stream>>>(
+                                q, 0, keys, values, partial_out, 1, num_q_heads, num_kv_heads,
+                                kv_len_host, scale, kv_len_dev, num_splits, partial_ml, cache, sliding_window);
+                        } else {
+                            k_gqa_prefill_tiled<HD, Cache, true, Warps><<<grid, Warps * 32, 0, stream>>>(
+                                q, 0, keys, values, partial_out, 1, num_q_heads, num_kv_heads,
+                                kv_len_host, scale, kv_len_dev, num_splits, partial_ml, cache);
+                        }
                     };
                     if (num_q_heads / num_kv_heads <= 4) run.template operator()<4>();
                     else run.template operator()<8>();
@@ -705,7 +745,7 @@ void gqa_splitk_decode_f32(
         const dim3 grid(num_q_heads, num_splits);
         k_gqa_splitk_part1<<<grid, threads, smem_bytes, stream>>>(
             q, keys, values, num_splits == 1 ? out : partial_out, partial_ml,
-            num_q_heads, num_kv_heads, head_dim, kv_len_dev, kv_len_host, scale, num_splits, cache);
+            num_q_heads, num_kv_heads, head_dim, kv_len_dev, kv_len_host, scale, num_splits, cache, sliding_window);
     };
     if (kv_dtype == DType::Q8_0) launch.template operator()<int8_t>();
     else if (kv_dtype == DType::F16) launch.template operator()<half>();
@@ -723,7 +763,7 @@ void gqa_prefill_causal_f32(
     const float* q, const void* k_cache, const void* v_cache, float* out,
     int M, int num_q_heads, int num_kv_heads, int head_dim,
     int start_pos, int /*max_seq*/, float scale, cudaStream_t stream,
-    int q_row_stride, DType kv_dtype, CudaKvView cache)
+    int q_row_stride, DType kv_dtype, CudaKvView cache, int sliding_window)
 {
     int qs = (q_row_stride > 0) ? q_row_stride : (num_q_heads * head_dim);
     auto launch = [&]<typename Cache>() {
@@ -733,6 +773,12 @@ void gqa_prefill_causal_f32(
             const int group = num_q_heads / num_kv_heads;
             const dim3 grid(num_kv_heads, (M * group + 7) / 8);
             auto tiled = [&]<int HD>() {
+                if (sliding_window > 0) {
+                    k_gqa_prefill_tiled<HD, Cache, false, 8, false, true><<<grid, 256, 0, stream>>>(
+                        q, qs, keys, values, out, M, num_q_heads, num_kv_heads, start_pos, scale,
+                        nullptr, 1, nullptr, cache, sliding_window);
+                    return;
+                }
                 if constexpr (!std::is_same_v<Cache, int8_t>) {
                     if (cache.pages && start_pos + M <= kKvPageTokens) {
                         k_gqa_prefill_tiled<HD, Cache, false, 8, true><<<grid, 256, 0, stream>>>(
@@ -749,11 +795,11 @@ void gqa_prefill_causal_f32(
             else tiled.template operator()<256>();
             return;
         }
-        const int threads = std::min(256, std::max(32, ((head_dim + 31) / 32) * 32));
+        const int threads = std::min(1024, std::max(32, ((head_dim + 31) / 32) * 32));
         const size_t smem_bytes = (32 + static_cast<size_t>(head_dim)) * sizeof(float);
         const dim3 grid(num_q_heads, M);
         k_gqa_prefill_causal<<<grid, threads, smem_bytes, stream>>>(
-            q, qs, keys, values, out, M, num_q_heads, num_kv_heads, head_dim, start_pos, scale, cache);
+            q, qs, keys, values, out, M, num_q_heads, num_kv_heads, head_dim, start_pos, scale, cache, sliding_window);
     };
     if (kv_dtype == DType::Q8_0) launch.template operator()<int8_t>();
     else if (kv_dtype == DType::F16) launch.template operator()<half>();
@@ -762,14 +808,20 @@ void gqa_prefill_causal_f32(
 
 void gqa_prefill_online_f32(const float* q, int q_stride, CudaKvView cache, float* out,
                             int rows, int q_heads, int kv_heads, int head_dim, int start_pos,
-                            float scale, cudaStream_t stream) {
+                            float scale, cudaStream_t stream, int sliding_window) {
     auto launch = [&]<int HD, int Warps, typename Cache>() {
         constexpr int Q = OnlineAttentionTile<HD, Warps>::Q;
         constexpr size_t bytes = OnlineAttentionTile<HD, Warps>::Bytes;
         const int queries = rows * (q_heads / kv_heads);
         const dim3 grid(kv_heads, (queries + Q - 1) / Q);
-        k_gqa_prefill_online<HD, Warps, Cache><<<grid, 32 * Warps, bytes, stream>>>(
-            q, q_stride, cache, out, rows, q_heads, kv_heads, start_pos, scale * 1.4426950408889634f);
+        const float scale2 = scale * 1.4426950408889634f;
+        if (sliding_window > 0) {
+            k_gqa_prefill_online<HD, Warps, Cache, true><<<grid, 32 * Warps, bytes, stream>>>(
+                q, q_stride, cache, out, rows, q_heads, kv_heads, start_pos, scale2, sliding_window);
+        } else {
+            k_gqa_prefill_online<HD, Warps, Cache, false><<<grid, 32 * Warps, bytes, stream>>>(
+                q, q_stride, cache, out, rows, q_heads, kv_heads, start_pos, scale2, 0);
+        }
     };
     auto dispatch = [&]<int HD, int Warps>() {
         if (cache.dtype == DType::Q8_0) launch.template operator()<HD, Warps, int8_t>();

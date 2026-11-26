@@ -174,7 +174,7 @@ struct GgufArchitecture {
 constexpr GgufArchitecture supported_architectures[] = {
     {"llama", false}, {"qwen2", true}, {"qwen3", true}, {"qwen35", true, true},
     {"qwen3moe", true, false, true}, {"mistral", true}, {"phi3", true},
-    {"gemma", true}, {"dense", true}, {"hybrid", true, true}, {"moe", true, false, true},
+    {"gemma", true}, {"gemma4", true}, {"dense", true}, {"hybrid", true, true}, {"moe", true, false, true},
 };
 
 }  // namespace
@@ -191,6 +191,7 @@ bool parse_gguf_model_raw(const std::string& path, int max_seq_override, LoadedM
         return false;
     }
     out.cfg.model_architecture = arch;
+    const bool gemma4 = arch == "gemma4";
     const std::string prefix = arch + ".";
     auto get_arch_int = [&](const std::string& suffix, int64_t def) {
         return gf.get_int(prefix + suffix, def);
@@ -198,6 +199,30 @@ bool parse_gguf_model_raw(const std::string& path, int max_seq_override, LoadedM
     auto get_arch_float = [&](const std::string& suffix, double def) {
         return gf.get_float(prefix + suffix, def);
     };
+
+    if (gemma4) {
+        if (get_arch_int("expert_count", 0) > 0) {
+            if (err) *err = "Gemma 4 expert layers are unsupported";
+            return false;
+        }
+        const bool has_ple = get_arch_int("embedding_length_per_layer_input", 0) > 0 ||
+            std::any_of(gf.tensors().begin(), gf.tensors().end(), [](const GgufTensorInfo& t) {
+                return t.name.starts_with("per_layer_") || t.name.find(".per_layer_") != std::string::npos ||
+                    t.name.ends_with(".inp_gate.weight");
+            });
+        if (has_ple) {
+            if (err) *err = "Gemma 4 per-layer inputs (PLE) are unsupported";
+            return false;
+        }
+        const bool multimodal = std::any_of(gf.tensors().begin(), gf.tensors().end(), [](const GgufTensorInfo& t) {
+            return t.name.starts_with("v.") || t.name.starts_with("a.") || t.name.starts_with("mm.") ||
+                t.name.starts_with("vision.") || t.name.starts_with("vision_") || t.name.starts_with("audio.");
+        });
+        if (multimodal) {
+            if (err) *err = "Gemma 4 vision and audio tensors are unsupported";
+            return false;
+        }
+    }
 
     if (!gf.find_tensor("token_embd.weight")) {
         if (err) *err = "GGUF missing required tensor: token_embd.weight";
@@ -236,7 +261,7 @@ bool parse_gguf_model_raw(const std::string& path, int max_seq_override, LoadedM
     int rot_dim = static_cast<int>(get_arch_int("rope.dimension_count", hd));
     float partial_rot = (hd > 0) ? (static_cast<float>(rot_dim) / static_cast<float>(hd)) : 1.0f;
 
-    if (get_arch_int("attention.sliding_window", 0) > 0) {
+    if (!gemma4 && get_arch_int("attention.sliding_window", 0) > 0) {
         if (err) *err = "GGUF architecture " + arch + " requires sliding-window attention";
         return false;
     }
@@ -258,6 +283,10 @@ bool parse_gguf_model_raw(const std::string& path, int max_seq_override, LoadedM
 
     out.cfg.vocab_size = static_cast<int>(emb_vocab);
     out.cfg.num_layers = num_layers;
+    if (gemma4) {
+        out.cfg.embed_scale = std::sqrt(static_cast<float>(H));
+        out.cfg.final_logit_softcapping = static_cast<float>(get_arch_float("final_logit_softcapping", 0.0));
+    }
     out.cfg.dense.hidden_size = H;
     out.cfg.dense.num_attention_heads = nq;
     out.cfg.dense.num_key_value_heads = nkv;
@@ -309,25 +338,91 @@ bool parse_gguf_model_raw(const std::string& path, int max_seq_override, LoadedM
         return gf.read_tensor(name);
     };
 
+    auto layer_int = [&](const std::string& suffix, int index, int fallback) -> int {
+        auto meta = gf.metadata().find(prefix + suffix);
+        if (meta == gf.metadata().end()) return fallback;
+        auto at = [&](const auto& values) {
+            if (values.size() != static_cast<size_t>(num_layers)) {
+                throw std::runtime_error("Invalid GGUF per-layer array: " + prefix + suffix);
+            }
+            return static_cast<int>(values[index]);
+        };
+        if (const auto* values = std::get_if<std::vector<int32_t>>(&meta->second)) return at(*values);
+        if (const auto* values = std::get_if<std::vector<uint32_t>>(&meta->second)) return at(*values);
+        if (const auto* values = std::get_if<std::vector<bool>>(&meta->second)) return at(*values);
+        if (const auto* value = std::get_if<bool>(&meta->second)) return *value;
+        return static_cast<int>(get_arch_int(suffix, fallback));
+    };
+
     try {
+        const int window = gemma4 ? static_cast<int>(get_arch_int("attention.sliding_window", 0)) : 0;
+        const int shared_kv = gemma4 ? static_cast<int>(get_arch_int("attention.shared_kv_layers", 0)) : 0;
+        const int swa_hd = gemma4 ? static_cast<int>(get_arch_int("attention.key_length_swa", hd)) : hd;
+        const int swa_rot = gemma4 ? static_cast<int>(get_arch_int("rope.dimension_count_swa", swa_hd)) : rot_dim;
+        const float swa_theta = gemma4 ? static_cast<float>(get_arch_float("rope.freq_base_swa", rope_theta)) : rope_theta;
+        if (gemma4 && (window < 0 || shared_kv < 0 || shared_kv >= num_layers || swa_hd < 2 ||
+                       get_arch_int("attention.value_length_swa", swa_hd) != swa_hd ||
+                       swa_rot < 2 || swa_rot > swa_hd || swa_rot % 2 != 0 ||
+                       !(swa_theta > 0) || !std::isfinite(swa_theta) ||
+                       !(eps > 0) || !std::isfinite(eps) ||
+                       out.cfg.final_logit_softcapping < 0 || !std::isfinite(out.cfg.final_logit_softcapping))) {
+            throw std::runtime_error("Invalid Gemma 4 attention or softcapping metadata");
+        }
+        if (gemma4 && window > 0 && !gf.metadata().contains(prefix + "attention.sliding_window_pattern")) {
+            throw std::runtime_error("Gemma 4 GGUF missing attention.sliding_window_pattern");
+        }
+        int last_kv_source[2] = {-1, -1};
         if (gf.find_tensor("rope_freqs.weight")) {
             out.rope_factors = to_f32_host(req("rope_freqs.weight"));
             if (out.rope_factors.desc.ndim != 1 || out.rope_factors.desc.shape[0] != rot_dim / 2 ||
                 std::any_of(out.rope_factors.data<float>(), out.rope_factors.data<float>() + rot_dim / 2,
-                            [](float factor) { return !(factor > 0) || !std::isfinite(factor); })) {
+                            [&](float factor) { return !(factor > 0) || (!gemma4 && !std::isfinite(factor)); })) {
                 throw std::runtime_error("Invalid GGUF RoPE frequency factors");
             }
         }
         for (int i = 0; i < num_layers; ++i) {
             std::string p = "blk." + std::to_string(i) + ".";
             LoadedLayerRaw& L = out.layers[static_cast<size_t>(i)];
+            int layer_nq = nq, layer_nkv = nkv, layer_hd = hd, layer_inter = inter;
+            if (gemma4) {
+                const int swa = layer_int("attention.sliding_window_pattern", i, 0);
+                if (swa < 0 || swa > 1 || (swa && window == 0)) {
+                    throw std::runtime_error("Invalid Gemma 4 sliding-window pattern: " + p);
+                }
+                layer_nq = layer_int("attention.head_count", i, nq);
+                layer_nkv = layer_int("attention.head_count_kv", i, nkv);
+                layer_hd = swa ? swa_hd : hd;
+                layer_inter = layer_int("feed_forward_length", i, inter);
+                L.rotary_dims = swa ? swa_rot : rot_dim;
+                L.rope_theta = swa ? swa_theta : rope_theta;
+                L.sliding_window = swa ? window : 0;
+                if (i >= num_layers - shared_kv) {
+                    L.kv_source_layer = last_kv_source[swa];
+                    if (L.kv_source_layer < 0) throw std::runtime_error("Missing Gemma 4 shared KV source: " + p);
+                    const auto& source = out.layers[L.kv_source_layer];
+                    if (layer_nkv != 0 && layer_nkv != source.kv_heads) {
+                        throw std::runtime_error("Incompatible Gemma 4 shared KV head count: " + p);
+                    }
+                    layer_nkv = source.kv_heads;
+                } else {
+                    last_kv_source[swa] = i;
+                }
+                if (layer_nq <= 0 || layer_nkv <= 0 || layer_nq % layer_nkv != 0 ||
+                    layer_hd > 1024 || layer_inter <= 0) {
+                    throw std::runtime_error("Invalid Gemma 4 layer dimensions: " + p);
+                }
+                L.query_heads = layer_nq;
+                L.kv_heads = layer_nkv;
+                L.head_dim = layer_hd;
+                if (i == 0) out.cfg.dense.num_key_value_heads = layer_nkv;
+            }
 
             const bool has_attn = gf.find_tensor(p + "attn_q.weight") || gf.find_tensor(p + "attn_qkv.weight");
             const bool has_gdn = gf.find_tensor(p + "ssm_conv1d.weight") || gf.find_tensor(p + "gdn_conv.weight");
             if (gf.find_tensor(p + "attn_kv_a_mqa.weight")) {
                 throw std::runtime_error("GGUF architecture " + arch + " requires multi-head latent attention");
             }
-            if (arch.starts_with("gemma") && (gf.find_tensor(p + "post_ffw_norm.weight") ||
+            if (!gemma4 && arch.starts_with("gemma") && (gf.find_tensor(p + "post_ffw_norm.weight") ||
                                                gf.find_tensor(p + "post_attention_norm.weight"))) {
                 throw std::runtime_error("GGUF architecture " + arch + " requires Gemma attention and FFN blocks");
             }
@@ -446,31 +541,56 @@ bool parse_gguf_model_raw(const std::string& path, int max_seq_override, LoadedM
             } else {
                 L.kind = 0;
                 L.attn_norm = to_f32_host(req(p + "attn_norm.weight"));
+                auto norm = [&](const std::string& name, int width) {
+                    auto t = to_f32_host(req(p + name));
+                    if (t.desc.ndim != 1 || t.desc.shape[0] != width) {
+                        throw std::runtime_error("Invalid Gemma 4 normalization or scale shape: " + p + name);
+                    }
+                    return t;
+                };
+                if (gemma4) {
+                    if (L.attn_norm.desc.ndim != 1 || L.attn_norm.desc.shape[0] != H) {
+                        throw std::runtime_error("Invalid Gemma 4 attention norm shape: " + p);
+                    }
+                    L.attn_post_norm = norm(gf.find_tensor(p + "post_attention_norm.weight")
+                        ? "post_attention_norm.weight" : "attn_post_norm.weight", H);
+                    L.ffn_post_norm = norm(gf.find_tensor(p + "post_ffw_norm.weight")
+                        ? "post_ffw_norm.weight" : "ffn_post_norm.weight", H);
+                    if (gf.find_tensor(p + "layer_output_scale.weight")) {
+                        L.output_scale = norm("layer_output_scale.weight", 1).data<float>()[0];
+                        if (!std::isfinite(L.output_scale)) throw std::runtime_error("Invalid Gemma 4 output scale: " + p);
+                    }
+                }
+                const bool owns_kv = L.kv_source_layer < 0;
+                const int q_dim = layer_nq * layer_hd;
+                const int kv_dim = layer_nkv * layer_hd;
                 if (gf.find_tensor(p + "attn_qkv.weight")) {
                     L.qkv_proj = gf.read_tensor(p + "attn_qkv.weight");
                     // Split q, k, v host slices for unfused/Vulkan paths
-                    int q_dim = nq * hd;
-                    int kv_dim = nkv * hd;
                     if (L.qkv_proj.desc.ndim != 2 || L.qkv_proj.desc.shape[1] != H ||
                         L.qkv_proj.desc.shape[0] != q_dim + 2 * kv_dim) {
                         throw std::runtime_error("Invalid GGUF packed QKV shape: " + p + "attn_qkv.weight");
                     }
                     size_t row_b = row_nbytes(L.qkv_proj.desc.dtype, H);
                     L.q_proj = HostTensor::create({q_dim, H}, L.qkv_proj.desc.dtype);
-                    L.k_proj = HostTensor::create({kv_dim, H}, L.qkv_proj.desc.dtype);
-                    L.v_proj = HostTensor::create({kv_dim, H}, L.qkv_proj.desc.dtype);
                     std::memcpy(L.q_proj.storage.data(), L.qkv_proj.storage.data(), static_cast<size_t>(q_dim) * row_b);
-                    std::memcpy(L.k_proj.storage.data(), L.qkv_proj.storage.data() + static_cast<size_t>(q_dim) * row_b, static_cast<size_t>(kv_dim) * row_b);
-                    std::memcpy(L.v_proj.storage.data(), L.qkv_proj.storage.data() + static_cast<size_t>(q_dim + kv_dim) * row_b, static_cast<size_t>(kv_dim) * row_b);
+                    if (owns_kv) {
+                        L.k_proj = HostTensor::create({kv_dim, H}, L.qkv_proj.desc.dtype);
+                        L.v_proj = HostTensor::create({kv_dim, H}, L.qkv_proj.desc.dtype);
+                        std::memcpy(L.k_proj.storage.data(), L.qkv_proj.storage.data() + static_cast<size_t>(q_dim) * row_b, static_cast<size_t>(kv_dim) * row_b);
+                        std::memcpy(L.v_proj.storage.data(), L.qkv_proj.storage.data() + static_cast<size_t>(q_dim + kv_dim) * row_b, static_cast<size_t>(kv_dim) * row_b);
+                    }
                 } else {
                     L.q_proj = req(p + "attn_q.weight");
-                    L.k_proj = req(p + "attn_k.weight");
-                    L.v_proj = req(p + "attn_v.weight");
-                    L.gated_q_attn = (L.q_proj.desc.shape[0] == static_cast<int64_t>(2 * nq * hd));
+                    if (owns_kv) {
+                        L.k_proj = req(p + "attn_k.weight");
+                        if (!gemma4 || gf.find_tensor(p + "attn_v.weight")) L.v_proj = req(p + "attn_v.weight");
+                    }
+                    L.gated_q_attn = !gemma4 && L.q_proj.desc.shape[0] == static_cast<int64_t>(2 * q_dim);
                     if (L.gated_q_attn) out.cfg.dense.gated_q_attn = true;
-                    const int q_dim = (L.gated_q_attn ? 2 : 1) * nq * hd;
-                    const int kv_dim = nkv * hd;
-                    if (!matrix(L.q_proj, q_dim, H) || !matrix(L.k_proj, kv_dim, H) || !matrix(L.v_proj, kv_dim, H)) {
+                    if (!matrix(L.q_proj, L.gated_q_attn ? 2 * q_dim : q_dim, H) ||
+                        (owns_kv && !matrix(L.k_proj, kv_dim, H)) ||
+                        (!L.v_proj.storage.empty() && !matrix(L.v_proj, kv_dim, H))) {
                         throw std::runtime_error("Invalid GGUF QKV projection shapes: " + p);
                     }
                 }
@@ -484,26 +604,33 @@ bool parse_gguf_model_raw(const std::string& path, int max_seq_override, LoadedM
                     return to_f32_host(tensor);
                 };
                 L.q_bias = bias("attn_q.bias", L.q_proj.desc.shape[0]);
-                L.k_bias = bias("attn_k.bias", L.k_proj.desc.shape[0]);
-                L.v_bias = bias("attn_v.bias", L.v_proj.desc.shape[0]);
+                if (owns_kv) L.k_bias = bias("attn_k.bias", L.k_proj.desc.shape[0]);
+                if (!L.v_proj.storage.empty()) L.v_bias = bias("attn_v.bias", L.v_proj.desc.shape[0]);
                 const bool has_q_norm = gf.find_tensor(p + "attn_q_norm.weight") != nullptr;
                 const bool has_k_norm = gf.find_tensor(p + "attn_k_norm.weight") != nullptr;
-                if (has_q_norm != has_k_norm) throw std::runtime_error("Incomplete GGUF Q/K normalization: " + p);
-                if (has_q_norm) {
+                if (gemma4) {
+                    L.q_norm = norm("attn_q_norm.weight", layer_hd);
+                    if (owns_kv) L.k_norm = norm("attn_k_norm.weight", layer_hd);
+                    out.cfg.dense.qk_norm = true;
+                } else if (has_q_norm != has_k_norm) throw std::runtime_error("Incomplete GGUF Q/K normalization: " + p);
+                if (!gemma4 && has_q_norm) {
                     out.cfg.dense.qk_norm = true;
                     L.q_norm = to_f32_host(gf.read_tensor(p + "attn_q_norm.weight"));
                     L.k_norm = to_f32_host(gf.read_tensor(p + "attn_k_norm.weight"));
                 }
                 L.o_proj = req(p + "attn_output.weight");
-                if (!matrix(L.o_proj, H, nq * hd)) throw std::runtime_error("Invalid GGUF attention output shape: " + p);
+                if (!matrix(L.o_proj, H, q_dim)) throw std::runtime_error("Invalid GGUF attention output shape: " + p);
             }
             if (has_moe) continue;
-            L.mlp_norm = to_f32_host(gf.find_tensor(p + "post_attention_norm.weight") ? gf.read_tensor(p + "post_attention_norm.weight") : req(p + "ffn_norm.weight"));
+            L.mlp_norm = to_f32_host(!gemma4 && gf.find_tensor(p + "post_attention_norm.weight") ? gf.read_tensor(p + "post_attention_norm.weight") : req(p + "ffn_norm.weight"));
+            if (gemma4 && (L.mlp_norm.desc.ndim != 1 || L.mlp_norm.desc.shape[0] != H)) {
+                throw std::runtime_error("Invalid Gemma 4 FFN norm shape: " + p);
+            }
             if (gf.find_tensor(p + "ffn_gate_up.weight")) {
                 L.gate_up = req(p + "ffn_gate_up.weight");
             } else {
                 auto up = req(p + "ffn_up.weight");
-                if (!gf.find_tensor(p + "ffn_gate.weight") && up.desc.shape[0] == 2 * inter) {
+                if (!gf.find_tensor(p + "ffn_gate.weight") && up.desc.shape[0] == 2 * layer_inter) {
                     L.gate_up = std::move(up);  // Phi-3 stores gate and up in one tensor.
                 } else {
                     auto gate = req(p + "ffn_gate.weight");
@@ -517,9 +644,9 @@ bool parse_gguf_model_raw(const std::string& path, int max_seq_override, LoadedM
             }
             L.down = req(p + "ffn_down.weight");
             const bool valid_gate_up = L.gate_up.storage.empty()
-                ? matrix(L.gate, inter, H) && matrix(L.up, inter, H)
-                : matrix(L.gate_up, 2 * inter, H);
-            if (!valid_gate_up || !matrix(L.down, H, inter)) {
+                ? matrix(L.gate, layer_inter, H) && matrix(L.up, layer_inter, H)
+                : matrix(L.gate_up, 2 * layer_inter, H);
+            if (!valid_gate_up || !matrix(L.down, H, layer_inter)) {
                 throw std::runtime_error("Invalid GGUF FFN projection shapes: " + p);
             }
         }

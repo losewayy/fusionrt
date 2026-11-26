@@ -16,7 +16,8 @@ using GgufMetaValue = std::variant<
     std::vector<std::string>,
     std::vector<int32_t>,
     std::vector<uint32_t>,
-    std::vector<float>
+    std::vector<float>,
+    std::vector<bool>
 >;
 
 struct GgufTensorInfo {

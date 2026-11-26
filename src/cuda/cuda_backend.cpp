@@ -130,6 +130,7 @@ void CudaKvPool::ensure(CudaContext& ctx, std::span<const CudaKvView> layers, Ta
     std::vector<uint8_t*> entries(layers.size() * added);
     size_t offset = 0;
     for (size_t i = 0; i < layers.size(); ++i) {
+        if (!layers[i].pages) continue;  // Shared KV layers have no page table.
         auto* entry = entries.data() + i * added;
         for (int p = 0; p < added; ++p) entry[p] = physical_[table.pages_[table.published_ + p]].data + offset;
         FUSIONRT_CUDA_CHECK(cudaMemcpyAsync(layers[i].pages + table.published_, entry, added * sizeof(*entry),

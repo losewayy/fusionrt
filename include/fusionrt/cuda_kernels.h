@@ -35,6 +35,11 @@ void kv_append_f32(const float* k_in, const float* v_in,
                    int num_kv_heads, int head_dim, int pos, int max_seq,
                    cudaStream_t stream);
 
+void scale_f32(float* x, int n, float scale, cudaStream_t stream);
+void softcap_f32(float* x, int n, float cap, cudaStream_t stream);
+void geglu_f32(const float* gate, const float* up, float* out, int n, cudaStream_t stream);
+void geglu_interleaved_f32(const float* gate_up, float* out, int rows, int inter_dim, cudaStream_t stream);
+void geglu_interleaved_q8_1(const float* gate_up, void* q8_out, int M, int inter_dim, cudaStream_t stream);
 void swiglu_f32(const float* gate, const float* up, float* out, int n, cudaStream_t stream);
 void swiglu_interleaved_f32(const float* gate_up, float* out, int rows, int inter_dim, cudaStream_t stream);
 // Q8_1 buffers must be 16-byte aligned, with one block per 32 columns.
@@ -190,7 +195,7 @@ void fused_qk_norm_rope_kv_append_f32(
     int num_q_heads, int num_kv_heads, int head_dim, int rot_dim,
     const int* pos_dev, int pos_host, int max_seq,
     float theta, float eps, bool neox, cudaStream_t stream, const float* rotary_factors = nullptr,
-    DType kv_dtype = DType::F32, CudaKvView cache = {});
+    DType kv_dtype = DType::F32, CudaKvView cache = {}, bool v_norm = false);
 
 // Batched Q/K Norm + RoPE + KV Cache Append for M > 1 prompt prefill
 void batched_qk_norm_rope_kv_append_f32(
@@ -204,7 +209,7 @@ void batched_qk_norm_rope_kv_append_f32(
     int M, int num_q_heads, int num_kv_heads, int head_dim, int rot_dim,
     int start_pos, int max_seq, float theta, float eps, bool neox, cudaStream_t stream,
     int q_row_stride = 0, int k_row_stride = 0, int v_row_stride = 0,
-    const float* rotary_factors = nullptr, DType kv_dtype = DType::F32, CudaKvView cache = {});
+    const float* rotary_factors = nullptr, DType kv_dtype = DType::F32, CudaKvView cache = {}, bool v_norm = false);
 
 // Fusion 4: Fused W4/Q8 Dequantize-GEMV/GEMM (supports arbitrary M >= 1)
 void fused_gemv_q8_0(const float* x, const void* w_q8, float* y,
@@ -251,7 +256,8 @@ void gqa_splitk_decode_f32(
     int num_q_heads, int num_kv_heads, int head_dim,
     const int* kv_len_dev, int kv_len_host, int max_seq,
     float scale, int max_splits, cudaStream_t stream, bool fixed_splits = false,
-    DType kv_dtype = DType::F32, BlockQ8_1* q8_out = nullptr, const float* gate = nullptr, CudaKvView cache = {});
+    DType kv_dtype = DType::F32, BlockQ8_1* q8_out = nullptr, const float* gate = nullptr, CudaKvView cache = {},
+    int sliding_window = 0);
 
 // Batched Causal GQA Prefill Attention (M queries at start_pos .. start_pos + M - 1)
 void gqa_prefill_causal_f32(
@@ -261,12 +267,12 @@ void gqa_prefill_causal_f32(
     float* out,              // [M, num_q_heads, head_dim]
     int M, int num_q_heads, int num_kv_heads, int head_dim,
     int start_pos, int max_seq, float scale, cudaStream_t stream,
-    int q_row_stride = 0, DType kv_dtype = DType::F32, CudaKvView cache = {});
+    int q_row_stride = 0, DType kv_dtype = DType::F32, CudaKvView cache = {}, int sliding_window = 0);
 
 // Online Tensor Core prefill with FP32 softmax and accumulation.
 void gqa_prefill_online_f32(const float* q, int q_stride, CudaKvView cache, float* out,
                             int rows, int q_heads, int kv_heads, int head_dim,
-                            int start_pos, float scale, cudaStream_t stream);
+                            int start_pos, float scale, cudaStream_t stream, int sliding_window = 0);
 
 // Sparse MoE helper kernels
 void moe_topk_router_f32(const float* logits, int* topk_idx, float* topk_weight,

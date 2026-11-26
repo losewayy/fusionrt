@@ -760,18 +760,18 @@ __global__ void k_gemv_q4_a_dp4a(const float* __restrict__ x,
     for (int b = lane; b < nb; b += 32) {
         int s = b >> 3;
         int sb = b & 7;
-        uint4 qw = *reinterpret_cast<const uint4*>(&wb[s].qs[sb * 4]);
+        uint4 qw = *TileQ4Trait<BlockQ4_A>::nibbles(wb[s], sb);
         const int32_t* xb = &sh_q8_qs[b * 9];
         int dot = 0;
-        dot = __dp4a(static_cast<int>(qw.x & 0x0F0F0F0Fu), xb[0], dot);
-        dot = __dp4a(static_cast<int>((qw.x >> 4) & 0x0F0F0F0Fu), xb[4], dot);
-        dot = __dp4a(static_cast<int>(qw.y & 0x0F0F0F0Fu), xb[1], dot);
-        dot = __dp4a(static_cast<int>((qw.y >> 4) & 0x0F0F0F0Fu), xb[5], dot);
-        dot = __dp4a(static_cast<int>(qw.z & 0x0F0F0F0Fu), xb[2], dot);
-        dot = __dp4a(static_cast<int>((qw.z >> 4) & 0x0F0F0F0Fu), xb[6], dot);
-        dot = __dp4a(static_cast<int>(qw.w & 0x0F0F0F0Fu), xb[3], dot);
-        dot = __dp4a(static_cast<int>((qw.w >> 4) & 0x0F0F0F0Fu), xb[7], dot);
-        float d_w = half_bits_to_f32(__ldg(&wb[s].d[sb]));
+        dot = __dp4a(static_cast<int>(unpack_q4_words(qw.x, 0)), xb[0], dot);
+        dot = __dp4a(static_cast<int>(unpack_q4_words(qw.x, 4)), xb[4], dot);
+        dot = __dp4a(static_cast<int>(unpack_q4_words(qw.y, 0)), xb[1], dot);
+        dot = __dp4a(static_cast<int>(unpack_q4_words(qw.y, 4)), xb[5], dot);
+        dot = __dp4a(static_cast<int>(unpack_q4_words(qw.z, 0)), xb[2], dot);
+        dot = __dp4a(static_cast<int>(unpack_q4_words(qw.z, 4)), xb[6], dot);
+        dot = __dp4a(static_cast<int>(unpack_q4_words(qw.w, 0)), xb[3], dot);
+        dot = __dp4a(static_cast<int>(unpack_q4_words(qw.w, 4)), xb[7], dot);
+        float d_w = TileQ4Trait<BlockQ4_A>::scales(wb[s], sb).x;
         acc += d_w * (static_cast<float>(dot) * sh_d[b] + sh_neg8sum[b]);
     }
     float s = warp_reduce_sum(acc);
@@ -865,8 +865,8 @@ __global__ void k_quant_gemv_q4_a_f32(const float* __restrict__ x,
     for (int b = bi; b < nb; b += 4) {
         int s = b >> 3;
         int sb = b & 7;
-        float d = half_bits_to_f32(__ldg(&wb[s].d[sb]));
-        uint16_t raw2 = __ldg(reinterpret_cast<const uint16_t*>(&wb[s].qs[sb * 4]) + sub);
+        float d = TileQ4Trait<BlockQ4_A>::scales(wb[s], sb).x;
+        uint16_t raw2 = __ldg(reinterpret_cast<const uint16_t*>(TileQ4Trait<BlockQ4_A>::nibbles(wb[s], sb)) + sub);
         uint8_t b0 = raw2 & 0xFFu;
         uint8_t b1 = raw2 >> 8;
         float q0 = static_cast<float>(static_cast<int>(b0 & 0x0Fu) - 8) * d;

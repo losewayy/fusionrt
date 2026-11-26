@@ -61,13 +61,23 @@ __global__ void k_kv_append_f32(const float* __restrict__ k_in, const float* __r
     v_cache[dst_off] = v_in[idx];
 }
 
-__global__ void k_swiglu_f32(const float* __restrict__ gate, const float* __restrict__ up,
-                             float* __restrict__ out, int n) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx < n) out[idx] = silu_f(gate[idx]) * up[idx];
+template <bool Gelu>
+__device__ __forceinline__ float gated_activation(float gate, float up) {
+    if constexpr (Gelu)
+        return (0.5f * gate) * (1.0f + tanhf(0.7978845608028654f * gate * (1.0f + 0.044715f * gate * gate))) * up;
+    else
+        return silu_f(gate) * up;
 }
 
-__global__ void k_swiglu_interleaved_f32(const float* __restrict__ gate_up, float* __restrict__ out,
+template <bool Gelu>
+__global__ void k_gated_f32(const float* __restrict__ gate, const float* __restrict__ up,
+                             float* __restrict__ out, int n) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < n) out[idx] = gated_activation<Gelu>(gate[idx], up[idx]);
+}
+
+template <bool Gelu>
+__global__ void k_gated_interleaved_f32(const float* __restrict__ gate_up, float* __restrict__ out,
                                          int rows, int inter_dim) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     int total = rows * inter_dim;
@@ -76,7 +86,16 @@ __global__ void k_swiglu_interleaved_f32(const float* __restrict__ gate_up, floa
     int c = idx % inter_dim;
     float g = gate_up[r * (2 * inter_dim) + c];
     float u = gate_up[r * (2 * inter_dim) + inter_dim + c];
-    out[idx] = silu_f(g) * u;
+    out[idx] = gated_activation<Gelu>(g, u);
+}
+
+template <bool Softcap>
+__global__ void k_scale_f32(float* x, int n, float scale) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) {
+        if constexpr (Softcap) x[i] = scale * tanhf(x[i] / scale);
+        else x[i] *= scale;
+    }
 }
 
 __global__ void k_add_residual_f32(const float* __restrict__ a, const float* __restrict__ b,
@@ -169,7 +188,7 @@ __global__ void k_argmax_f32(const float* __restrict__ x, int n, int32_t* __rest
     }
 }
 
-template <typename Cache>
+template <typename Cache, bool ValueNorm>
 __global__ void k_qk_norm_rope_kv_append(
     float* __restrict__ q,
     float* __restrict__ k,
@@ -241,15 +260,22 @@ __global__ void k_qk_norm_rope_kv_append(
     }
     auto* keys = kv_row<false>(k_cache, cache, pos, kh, num_kv_heads, head_dim);
     auto* values = kv_row<true>(v_cache, cache, pos, kh, num_kv_heads, head_dim);
-    const auto* src_v = v + m * v_stride + kh * head_dim;
+    const auto* src_v = ValueNorm && !v ? vec : v + m * v_stride + kh * head_dim;
+    float v_inv = 1.0f;
+    if constexpr (ValueNorm) {
+        float v_sq = 0.0f;
+        for (int i = tid; i < head_dim; i += blockDim.x) v_sq += src_v[i] * src_v[i];
+        v_inv = rsqrtf(block_reduce_sum(v_sq, red_buf) / static_cast<float>(head_dim) + eps);
+    }
     for (int i = tid; i < head_dim; i += blockDim.x) {
+        const float value = ValueNorm ? src_v[i] * v_inv : src_v[i];
         vec[i] = h_buf[i];
         if constexpr (std::is_same_v<Cache, int8_t>) {
             kv_quantize(h_buf[i], keys, kv_scales<false>(cache, pos, kh, num_kv_heads, head_dim), i);
-            kv_quantize(src_v[i], values, kv_scales<true>(cache, pos, kh, num_kv_heads, head_dim), i);
+            kv_quantize(value, values, kv_scales<true>(cache, pos, kh, num_kv_heads, head_dim), i);
         } else {
             keys[i] = h_buf[i];
-            values[i] = src_v[i];
+            values[i] = value;
         }
     }
 }
@@ -428,11 +454,7 @@ __global__ void k_embed_lookup_repacked_f32(const Block* __restrict__ table,
     const int lane = threadIdx.x;
     const auto& b = table[static_cast<int64_t>(token_ids[row]) * blocks_per_row + col];
     float val;
-    if constexpr (std::is_same_v<Block, BlockQ4_A>) {
-        const int i = lane & 31;
-        const uint8_t packed = reinterpret_cast<const uint8_t*>(b.qs)[(lane >> 5) * 16 + (i & 15)];
-        val = half_bits_to_f32(b.d[lane >> 5]) * ((i < 16 ? packed & 15 : packed >> 4) - 8);
-    } else if constexpr (std::is_same_v<Block, BlockQ8_A>) {
+    if constexpr (std::is_same_v<Block, BlockQ8_A>) {
         val = half_bits_to_f32(b.d[lane >> 5]) * reinterpret_cast<const int8_t*>(b.qs)[lane];
     } else {
         val = repacked_k_value(b, lane);
@@ -562,12 +584,13 @@ __global__ void k_quantize_x_q8_1(const float* x, const float* res_b, const floa
     }
 }
 
-__global__ void k_swiglu_interleaved_q8_1(const float* gate_up, BlockQ8_1* out, int inter_dim) {
+template <bool Gelu>
+__global__ void k_gated_interleaved_q8_1(const float* gate_up, BlockQ8_1* out, int inter_dim) {
     int col = blockIdx.x * blockDim.x + threadIdx.x;
     if (col >= inter_dim) return;
     int row = blockIdx.y;
     const float* gate = gate_up + static_cast<int64_t>(row) * 2 * inter_dim;
-    store_q8_1(silu_f(gate[col]) * gate[inter_dim + col],
+    store_q8_1(gated_activation<Gelu>(gate[col], gate[inter_dim + col]),
                out + (static_cast<int64_t>(row) * inter_dim + col) / 32);
 }
 
@@ -628,13 +651,35 @@ void kv_append_f32(const float* k_in, const float* v_in,
     k_kv_append_f32<<<blocks, 256, 0, stream>>>(k_in, v_in, k_cache, v_cache, num_kv_heads, head_dim, pos);
 }
 
+void scale_f32(float* x, int n, float scale, cudaStream_t stream) {
+    k_scale_f32<false><<<(n + 255) / 256, 256, 0, stream>>>(x, n, scale);
+}
+
+void softcap_f32(float* x, int n, float cap, cudaStream_t stream) {
+    k_scale_f32<true><<<(n + 255) / 256, 256, 0, stream>>>(x, n, cap);
+}
+
+void geglu_f32(const float* gate, const float* up, float* out, int n, cudaStream_t stream) {
+    k_gated_f32<true><<<(n + 255) / 256, 256, 0, stream>>>(gate, up, out, n);
+}
+
+void geglu_interleaved_f32(const float* gate_up, float* out, int rows, int inter_dim, cudaStream_t stream) {
+    const int total = rows * inter_dim;
+    k_gated_interleaved_f32<true><<<(total + 255) / 256, 256, 0, stream>>>(gate_up, out, rows, inter_dim);
+}
+
+void geglu_interleaved_q8_1(const float* gate_up, void* q8_out, int M, int inter_dim, cudaStream_t stream) {
+    const dim3 grid((inter_dim + 255) / 256, M);
+    k_gated_interleaved_q8_1<true><<<grid, 256, 0, stream>>>(gate_up, static_cast<BlockQ8_1*>(q8_out), inter_dim);
+}
+
 void swiglu_f32(const float* gate, const float* up, float* out, int n, cudaStream_t stream) {
-    k_swiglu_f32<<<(n + 255) / 256, 256, 0, stream>>>(gate, up, out, n);
+    k_gated_f32<false><<<(n + 255) / 256, 256, 0, stream>>>(gate, up, out, n);
 }
 
 void swiglu_interleaved_f32(const float* gate_up, float* out, int rows, int inter_dim, cudaStream_t stream) {
     int total = rows * inter_dim;
-    k_swiglu_interleaved_f32<<<(total + 255) / 256, 256, 0, stream>>>(gate_up, out, rows, inter_dim);
+    k_gated_interleaved_f32<false><<<(total + 255) / 256, 256, 0, stream>>>(gate_up, out, rows, inter_dim);
 }
 
 void quantize_x_q8_1(const float* x, const float* res_b, const float* norm_w, float* res_out,
@@ -662,7 +707,7 @@ void quantize_x_q8_1(const float* x, const float* res_b, const float* norm_w, fl
 
 void swiglu_interleaved_q8_1(const float* gate_up, void* q8_out, int M, int inter_dim, cudaStream_t stream) {
     constexpr int threads = 128;
-    k_swiglu_interleaved_q8_1<<<dim3((inter_dim + threads - 1) / threads, M), threads, 0, stream>>>(
+    k_gated_interleaved_q8_1<false><<<dim3((inter_dim + threads - 1) / threads, M), threads, 0, stream>>>(
         gate_up, static_cast<BlockQ8_1*>(q8_out), inter_dim);
 }
 
@@ -703,16 +748,20 @@ void fused_qk_norm_rope_kv_append_f32(
     void* k_cache, void* v_cache,
     int num_q_heads, int num_kv_heads, int head_dim, int rot_dim,
     const int* pos_dev, int pos_host, int /*max_seq*/,
-    float theta, float eps, bool neox, cudaStream_t stream, const float* rotary_factors, DType kv_dtype, CudaKvView cache)
+    float theta, float eps, bool neox, cudaStream_t stream, const float* rotary_factors, DType kv_dtype, CudaKvView cache, bool v_norm)
 {
     int total_heads = num_q_heads + num_kv_heads;
     int threads = std::min(256, std::max(32, ((head_dim + 31) / 32) * 32));
     size_t smem_bytes = (32 + static_cast<size_t>(head_dim)) * sizeof(float);
     auto launch = [&]<typename Cache>() {
-        k_qk_norm_rope_kv_append<<<total_heads, threads, smem_bytes, stream>>>(
-            q, k, v, q_norm_w, k_norm_w, rotary_factors, static_cast<Cache*>(k_cache), static_cast<Cache*>(v_cache),
-            num_q_heads, num_kv_heads, head_dim, rot_dim, pos_dev, pos_host, theta, eps, neox,
-            num_q_heads * head_dim, num_kv_heads * head_dim, num_kv_heads * head_dim, cache);
+        auto run = [&]<bool ValueNorm>() {
+            k_qk_norm_rope_kv_append<Cache, ValueNorm><<<total_heads, threads, smem_bytes, stream>>>(
+                q, k, v, q_norm_w, k_norm_w, rotary_factors, static_cast<Cache*>(k_cache), static_cast<Cache*>(v_cache),
+                num_q_heads, num_kv_heads, head_dim, rot_dim, pos_dev, pos_host, theta, eps, neox,
+                num_q_heads * head_dim, num_kv_heads * head_dim, num_kv_heads * head_dim, cache);
+        };
+        if (v_norm) run.template operator()<true>();
+        else run.template operator()<false>();
     };
     if (kv_dtype == DType::Q8_0) launch.template operator()<int8_t>();
     else if (kv_dtype == DType::F16) launch.template operator()<half>();
@@ -775,7 +824,7 @@ void batched_qk_norm_rope_kv_append_f32(
     void* k_cache, void* v_cache,
     int M, int num_q_heads, int num_kv_heads, int head_dim, int rot_dim,
     int start_pos, int /*max_seq*/, float theta, float eps, bool neox, cudaStream_t stream,
-    int q_row_stride, int k_row_stride, int v_row_stride, const float* rotary_factors, DType kv_dtype, CudaKvView cache)
+    int q_row_stride, int k_row_stride, int v_row_stride, const float* rotary_factors, DType kv_dtype, CudaKvView cache, bool v_norm)
 {
     int total_heads = num_q_heads + num_kv_heads;
     int threads = std::min(256, std::max(32, ((head_dim + 31) / 32) * 32));
@@ -785,9 +834,13 @@ void batched_qk_norm_rope_kv_append_f32(
     int ks = k_row_stride > 0 ? k_row_stride : num_kv_heads * head_dim;
     int vs = v_row_stride > 0 ? v_row_stride : ks;
     auto launch = [&]<typename Cache>() {
-        k_qk_norm_rope_kv_append<<<grid, threads, smem_bytes, stream>>>(
-            q, k, v, q_norm_w, k_norm_w, rotary_factors, static_cast<Cache*>(k_cache), static_cast<Cache*>(v_cache),
-            num_q_heads, num_kv_heads, head_dim, rot_dim, nullptr, start_pos, theta, eps, neox, qs, ks, vs, cache);
+        auto run = [&]<bool ValueNorm>() {
+            k_qk_norm_rope_kv_append<Cache, ValueNorm><<<grid, threads, smem_bytes, stream>>>(
+                q, k, v, q_norm_w, k_norm_w, rotary_factors, static_cast<Cache*>(k_cache), static_cast<Cache*>(v_cache),
+                num_q_heads, num_kv_heads, head_dim, rot_dim, nullptr, start_pos, theta, eps, neox, qs, ks, vs, cache);
+        };
+        if (v_norm) run.template operator()<true>();
+        else run.template operator()<false>();
     };
     if (kv_dtype == DType::Q8_0) launch.template operator()<int8_t>();
     else if (kv_dtype == DType::F16) launch.template operator()<half>();

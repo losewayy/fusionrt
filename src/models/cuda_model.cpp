@@ -611,16 +611,40 @@ static bool upload_raw_model_to_cuda(CudaContext& ctx, const LoadedModelRaw& raw
             CudaDenseGQALayer L;
             L.cfg = cfg_out.dense;
             L.cfg.gated_q_attn = lr.gated_q_attn;
-            if (!raw.rope_factors.storage.empty()) L.rope_factors = rope_factors;
+            const bool gemma4 = cfg_out.model_architecture == "gemma4";
+            L.kv_source_layer = lr.kv_source_layer;
+            L.sliding_window = lr.sliding_window;
+            L.output_scale = lr.output_scale;
+            L.geglu = L.v_norm = gemma4;
+            if (gemma4) {
+                L.attention_scale = 1.0f;
+                L.cfg.num_attention_heads = lr.query_heads;
+                L.cfg.num_key_value_heads = lr.kv_heads;
+                L.cfg.head_dim = lr.head_dim;
+                L.cfg.rope_theta = lr.rope_theta;
+                L.cfg.partial_rotary_factor = static_cast<float>(lr.rotary_dims) / lr.head_dim;
+                L.cfg.intermediate_size = static_cast<int>(lr.down.desc.shape[1]);
+            }
+            if (L.sliding_window == 0) L.rope_factors = rope_factors;
             L.attn_norm_w = ctx.upload(lr.attn_norm, true);
-            upload_projections(ctx, {&lr.q_proj, &lr.k_proj, &lr.v_proj},
-                               {&L.q_proj, &L.k_proj, &L.v_proj}, L.projection_packs);
+            if (!lr.attn_post_norm.storage.empty()) L.attn_post_norm_w = ctx.upload(lr.attn_post_norm, true);
+            if (!lr.ffn_post_norm.storage.empty()) L.ffn_post_norm_w = ctx.upload(lr.ffn_post_norm, true);
+            if (L.kv_source_layer >= 0) {
+                L.q_proj = upload_cuda_matrix(ctx, lr.q_proj);
+            } else if (lr.v_proj.storage.empty()) {
+                std::array<Tensor, 2> packs;
+                upload_projections(ctx, {&lr.q_proj, &lr.k_proj}, {&L.q_proj, &L.k_proj}, packs);
+                std::move(packs.begin(), packs.end(), L.projection_packs.begin());
+            } else {
+                upload_projections(ctx, {&lr.q_proj, &lr.k_proj, &lr.v_proj},
+                                   {&L.q_proj, &L.k_proj, &L.v_proj}, L.projection_packs);
+            }
             if (!lr.q_bias.storage.empty()) L.q_bias = ctx.upload(lr.q_bias, true);
             if (!lr.k_bias.storage.empty()) L.k_bias = ctx.upload(lr.k_bias, true);
             if (!lr.v_bias.storage.empty()) L.v_bias = ctx.upload(lr.v_bias, true);
             if (L.cfg.qk_norm && !lr.q_norm.storage.empty()) {
                 L.q_norm_w = ctx.upload(lr.q_norm, true);
-                L.k_norm_w = ctx.upload(lr.k_norm, true);
+                if (!lr.k_norm.storage.empty()) L.k_norm_w = ctx.upload(lr.k_norm, true);
             }
             L.o_proj = upload_cuda_matrix(ctx, lr.o_proj);
             if (!lr.router_w.storage.empty()) {
@@ -688,6 +712,7 @@ static size_t gguf_cuda_arena_bytes(const LoadedModelRaw& raw, const CostHardwar
     for (const auto& l : raw.layers) {
         for (const auto* t : {&l.attn_norm, &l.q_proj, &l.k_proj, &l.v_proj, &l.q_norm, &l.k_norm,
                              &l.q_bias, &l.k_bias, &l.v_bias, &l.o_proj, &l.mlp_norm, &l.gate_up,
+                             &l.attn_post_norm, &l.ffn_post_norm,
                              &l.gate, &l.up, &l.down, &l.z_proj, &l.a_proj, &l.b_proj,
                              &l.conv_w, &l.conv_bias, &l.A_log, &l.dt_bias, &l.gdn_norm_w,
                              &l.router_w, &l.experts_gate_up, &l.experts_down, &l.shared_gate_up, &l.shared_down}) {
@@ -753,6 +778,7 @@ std::unique_ptr<FusionModel::CudaSession> FusionModel::make_cuda_session() const
     auto aligned = [](size_t bytes) { return (bytes + 255) & ~size_t{255}; };
     size_t table_bytes = 0;
     for (const auto& layer : dense_layers_) {
+        if (layer.kv_source_layer >= 0) continue;
         table_bytes += aligned((1 + (layer.cfg.max_seq_len - 1) / kKvPageTokens) * sizeof(uint8_t*));
     }
     size_t state_bytes = 0;
@@ -766,8 +792,8 @@ std::unique_ptr<FusionModel::CudaSession> FusionModel::make_cuda_session() const
     slot->storage.init(table_bytes + state_bytes);
     for (const auto& layer : dense_layers_) {
         const auto& d = layer.cfg;
-        slot->kv.push_back(make_cuda_kv_view(slot->storage, cuda_kv_dtype_, d.max_seq_len,
-                                             d.num_key_value_heads, d.head_dim));
+        slot->kv.push_back(layer.kv_source_layer >= 0 ? CudaKvView{} :
+            make_cuda_kv_view(slot->storage, cuda_kv_dtype_, d.max_seq_len, d.num_key_value_heads, d.head_dim));
     }
     if (state_bytes != 0) {
         slot->gdn_data = slot->storage.alloc(state_bytes);
@@ -946,10 +972,12 @@ static OpTiming operator_work(const IRNode& node, int rows, int pos, const CudaC
             work.bytes = 3 * f32 * m * n;
             work.flops = m * n;
             break;
+        case OpKind::GEGLU_INTERLEAVED:
         case OpKind::SWIGLU_INTERLEAVED:
             work.bytes = 3 * f32 * m * n;
             work.flops = 5 * m * n;
             break;
+        case OpKind::GEGLU_Q8_LINEAR:
         case OpKind::SWIGLU_Q8_LINEAR:
             work.bytes = 2 * f32 * m * k;
             work.flops = 5 * m * k;
@@ -1148,8 +1176,10 @@ static void execute_ir_graph_cuda(
             }
             case OpKind::ADD_RESIDUAL: {
                 Tensor& out_t = get_out_buf(node.out, node.output_cols, rows);
+                const int count = rows * node.output_cols;
                 cuda_ops::add_residual_f32(bufs[node.inputs[0]].ptr<float>(), bufs[node.inputs[1]].ptr<float>(),
-                                           out_t.ptr<float>(), rows * node.output_cols, ctx.stream());
+                                           out_t.ptr<float>(), count, ctx.stream());
+                if (node.output_scale != 1.0f) cuda_ops::scale_f32(out_t.ptr<float>(), count, node.output_scale, ctx.stream());
                 break;
             }
             case OpKind::FUSED_ADD_RMSNORM_LINEAR: {
@@ -1179,16 +1209,19 @@ static void execute_ir_graph_cuda(
                 auto run_gqa = [&]() {
                     const auto& L = dense_layers[static_cast<size_t>(node.layer_index)];
                     const auto& cfg = node.attention;
-                    const auto& state = kv_states[node.layer_index];
+                    const bool shared = L.kv_source_layer >= 0;
+                    const auto& state = kv_states[shared ? L.kv_source_layer : node.layer_index];
                     const int nq = cfg.query_heads, nkv = cfg.kv_heads, hd = cfg.head_dim;
                     const int q_dim = nq * hd, q_proj_dim = cfg.gated ? 2 * q_dim : q_dim;
                     const int kv_dim = nkv * hd;
                     float* q_full_p = bufs[node.inputs[0]].ptr<float>() + node.input_offsets[0];
-                    float* k_p = bufs[node.inputs[1]].ptr<float>() + node.input_offsets[1];
-                    float* v_p = bufs[node.inputs[2]].ptr<float>() + node.input_offsets[2];
+                    const bool has_value = node.inputs.size() == 3;
+                    float* k_p = shared ? nullptr : bufs[node.inputs[1]].ptr<float>() + node.input_offsets[1];
+                    float* v_p = has_value ? bufs[node.inputs[2]].ptr<float>() + node.input_offsets[2] : nullptr;
                     int q_stride = g.values[node.inputs[0]].cols;
-                    const int k_stride = g.values[node.inputs[1]].cols;
-                    const int v_stride = g.values[node.inputs[2]].cols;
+                    const int k_stride = shared ? 0 : g.values[node.inputs[1]].cols;
+                    const int v_stride = has_value ? g.values[node.inputs[2]].cols : 0;
+                    const int project_kv_heads = shared ? 0 : nkv;
                     if (L.q_bias.data) cuda_ops::add_bias_f32(q_full_p, L.q_bias.ptr<float>(), rows, q_proj_dim, q_stride, ctx.stream());
                     if (L.k_bias.data) cuda_ops::add_bias_f32(k_p, L.k_bias.ptr<float>(), rows, kv_dim, k_stride, ctx.stream());
                     if (L.v_bias.data) cuda_ops::add_bias_f32(v_p, L.v_bias.ptr<float>(), rows, kv_dim, v_stride, ctx.stream());
@@ -1212,7 +1245,7 @@ static void execute_ir_graph_cuda(
                         non_carry_busy_until = std::max(non_carry_busy_until, last_use[node.out]);
                     }
                     Tensor& attn_out = quantize_output ? bufs[node.out] : get_out_buf(node.out, q_dim, rows);
-                    float scale = 1.0f / std::sqrt(static_cast<float>(hd));
+                    const float scale = L.attention_scale > 0.0f ? L.attention_scale : 1.0f / std::sqrt(static_cast<float>(hd));
                     const float* qnw = cfg.query_norm ? cfg.query_norm->ptr<float>() : nullptr;
                     const float* knw = cfg.key_norm ? cfg.key_norm->ptr<float>() : nullptr;
                     const float* rotary = cfg.rotary_factors ? cfg.rotary_factors->ptr<float>() : nullptr;
@@ -1220,9 +1253,10 @@ static void execute_ir_graph_cuda(
                         cuda_ops::fused_qk_norm_rope_kv_append_f32(
                             q_p, k_p, v_p, qnw, knw,
                             nullptr, nullptr,
-                            nq, nkv, hd, cfg.rotary_dims, pos_dev, pos_host, cfg.max_context,
-                            cfg.rope_theta, node.norm_eps, cfg.rope_neox, ctx.stream(), rotary, state.dtype, state);
-                        const int splits = select_decode_splits(ctx.cost_hardware(), pos_host + 1, nkv, kMaxDecodeSplits);
+                            nq, project_kv_heads, hd, cfg.rotary_dims, pos_dev, pos_host, cfg.max_context,
+                            cfg.rope_theta, node.norm_eps, cfg.rope_neox, ctx.stream(), rotary, state.dtype, state, L.v_norm);
+                        const int split_heads = g.decode_split_kv_heads ? g.decode_split_kv_heads : nkv;
+                        const int splits = select_decode_splits(ctx.cost_hardware(), pos_host + 1, split_heads, kMaxDecodeSplits);
                         Tensor part_out = cuda_scratch(ctx, {nq, splits, hd});
                         Tensor part_ml = cuda_scratch(ctx, {nq, splits, 2});
                         // Use the same reduction order for eager and captured decode.
@@ -1231,21 +1265,21 @@ static void execute_ir_graph_cuda(
                             attn_out.ptr<float>(), part_out.ptr<float>(), part_ml.ptr<float>(),
                             nq, nkv, hd, kv_len_dev, pos_host + 1, cfg.max_context,
                             scale, splits, ctx.stream(), true, state.dtype,
-                            quantize_output ? attn_out.ptr<BlockQ8_1>() : nullptr, gate_p, state);
+                            quantize_output ? attn_out.ptr<BlockQ8_1>() : nullptr, gate_p, state, L.sliding_window);
                     } else {
                         cuda_ops::batched_qk_norm_rope_kv_append_f32(
                             q_p, k_p, v_p, qnw, knw,
                             nullptr, nullptr,
-                            rows, nq, nkv, hd, cfg.rotary_dims, start_pos, cfg.max_context,
+                            rows, nq, project_kv_heads, hd, cfg.rotary_dims, start_pos, cfg.max_context,
                             cfg.rope_theta, node.norm_eps, cfg.rope_neox, ctx.stream(), q_stride, k_stride, v_stride,
-                            rotary, state.dtype, state);
+                            rotary, state.dtype, state, L.v_norm);
                         if ((hd == 64 || hd == 128 || hd == 256) && start_pos + rows >= 512) {
                             cuda_ops::gqa_prefill_online_f32(q_p, q_stride, state, attn_out.ptr<float>(),
-                                rows, nq, nkv, hd, start_pos, scale, ctx.stream());
+                                rows, nq, nkv, hd, start_pos, scale, ctx.stream(), L.sliding_window);
                         } else {
                             cuda_ops::gqa_prefill_causal_f32(q_p, nullptr, nullptr, attn_out.ptr<float>(),
                                 rows, nq, nkv, hd, start_pos, cfg.max_context, scale, ctx.stream(),
-                                q_stride, state.dtype, state);
+                                q_stride, state.dtype, state, L.sliding_window);
                         }
                     }
                     if (node.attention.gated && !quantize_output) {
@@ -1311,35 +1345,40 @@ static void execute_ir_graph_cuda(
                 else run_gdn();
                 break;
             }
+            case OpKind::GEGLU_INTERLEAVED:
             case OpKind::SWIGLU_INTERLEAVED: {
                 Tensor& out_t = get_out_buf(node.out, node.output_cols, rows);
                 const float* gate = bufs[node.inputs[0]].ptr<float>();
+                const bool geglu = node.op == OpKind::GEGLU_INTERLEAVED;
                 if (node.inputs.size() == 1) {
-                    cuda_ops::swiglu_interleaved_f32(gate, out_t.ptr<float>(), rows, node.output_cols, ctx.stream());
+                    (geglu ? cuda_ops::geglu_interleaved_f32 : cuda_ops::swiglu_interleaved_f32)(gate, out_t.ptr<float>(), rows, node.output_cols, ctx.stream());
                 } else {
-                    cuda_ops::swiglu_f32(gate, bufs[node.inputs[1]].ptr<float>(), out_t.ptr<float>(),
+                    (geglu ? cuda_ops::geglu_f32 : cuda_ops::swiglu_f32)(gate, bufs[node.inputs[1]].ptr<float>(), out_t.ptr<float>(),
                                         rows * node.output_cols, ctx.stream());
                 }
                 break;
             }
+            case OpKind::GEGLU_Q8_LINEAR:
             case OpKind::SWIGLU_Q8_LINEAR: {
+                const bool geglu = node.op == OpKind::GEGLU_Q8_LINEAR;
+                const auto quantize = geglu ? cuda_ops::geglu_interleaved_q8_1 : cuda_ops::swiglu_interleaved_q8_1;
                 const float* gate_up = bufs[node.inputs[0]].ptr<float>();
                 float* out = get_out_buf(node.out, node.output_cols, rows).ptr<float>();
                 auto& arena = ctx.scratch_arena();
                 size_t scratch_mark = arena.mark();
                 if (rows == 1) {
                     void* q8 = arena.alloc(row_nbytes(DType::Q8_1, node.input_cols));
-                    cuda_ops::swiglu_interleaved_q8_1(gate_up, q8, rows, node.input_cols, ctx.stream());
+                    quantize(gate_up, q8, rows, node.input_cols, ctx.stream());
                     decode_gemv(node.weight->dtype)(q8, node.weight->ptr(), out, node.output_cols, node.input_cols, ctx.stream(),
                                                ctx.preferred_gemv_geometry());
                 } else if (auto mmq = rows >= ctx.mmq_crossover_m() ? prefill_mmq(node.weight->dtype) : nullptr) {
                     void* q8 = arena.alloc(static_cast<size_t>(rows) * row_nbytes(DType::Q8_1, node.input_cols));
-                    cuda_ops::swiglu_interleaved_q8_1(gate_up, q8, rows, node.input_cols, ctx.stream());
+                    quantize(gate_up, q8, rows, node.input_cols, ctx.stream());
                     mmq(q8, node.weight->ptr(), out, rows, node.output_cols, node.input_cols,
                         ctx.stream(), ctx.cost_hardware());
                 } else {
                     Tensor act = cuda_scratch(ctx, {rows, node.input_cols});
-                    cuda_ops::swiglu_interleaved_f32(gate_up, act.ptr<float>(), rows, node.input_cols, ctx.stream());
+                    (geglu ? cuda_ops::geglu_interleaved_f32 : cuda_ops::swiglu_interleaved_f32)(gate_up, act.ptr<float>(), rows, node.input_cols, ctx.stream());
                     dispatch_linear(ctx, act.ptr<float>(), *node.weight, out, rows, node.output_cols, node.input_cols, use_fused);
                 }
                 arena.reset(scratch_mark);
@@ -1356,6 +1395,9 @@ static void execute_ir_graph_cuda(
                 else L.forward_prefill_cuda(ctx, x_v, rows, use_fused);
                 break;
             }
+        }
+        if (is_lm_head && compute_logits && g.final_logit_softcapping > 0.0f) {
+            cuda_ops::softcap_f32(logits_buf.ptr<float>(), node.output_cols, g.final_logit_softcapping, ctx.stream());
         }
         if constexpr (Observe) {
             if (timer) FUSIONRT_CUDA_CHECK(cudaEventRecord(timer->event(ni, 1), ctx.stream()));
@@ -1410,7 +1452,8 @@ static void execute_ir_graph_cuda(
                         node.out >= 0 && bufs[node.out].dtype == DType::Q8_1,
                         node.op == OpKind::GQA_ATTN_BLOCK ? &dense_layers[node.layer_index] : nullptr,
                         node.op == OpKind::MOE_FFN_BLOCK ? &moe_layers[node.layer_index] : nullptr,
-                        node.op == OpKind::GQA_ATTN_BLOCK ? kv_states[node.layer_index].dtype : DType::F32);
+                        node.op == OpKind::GQA_ATTN_BLOCK ? kv_states[dense_layers[node.layer_index].kv_source_layer >= 0
+                            ? dense_layers[node.layer_index].kv_source_layer : node.layer_index].dtype : DType::F32);
                 }
                 work.total_ms = ms;
                 auto op = std::find_if(op_trace->ops.begin(), op_trace->ops.end(), [&](const OpTiming& entry) {
@@ -1444,6 +1487,13 @@ static bool can_use_cuda_graph(const HybridModelConfig& cfg) {
     return cfg.arch != "moe" || cfg.moe.gpu_resident_experts == cfg.moe.num_experts;
 }
 
+static void embed_tokens(CudaContext& ctx, const Tensor& table, const Tensor& ids, Tensor& hidden,
+                         int rows, int width, float scale) {
+    cuda_ops::embed_lookup_f32(table.ptr(), table.dtype, ids.ptr<int32_t>(), hidden.ptr<float>(),
+                               rows, width, ctx.stream());
+    if (scale != 1.0f) cuda_ops::scale_f32(hidden.ptr<float>(), rows * width, scale, ctx.stream());
+}
+
 static void run_forward_token_step_cuda(
     CudaContext& ctx, const HybridModelConfig& cfg,
     const Tensor& tok_embeddings, const MiniGraph& ir, CudaIRWorkspace& ws,
@@ -1459,8 +1509,7 @@ static void run_forward_token_step_cuda(
     int H = static_cast<int>(hidden_buf.shape[0]);
 
     auto run_body = [&](bool graph_mode) {
-        cuda_ops::embed_lookup_f32(tok_embeddings.ptr(), tok_embeddings.dtype,
-                                   tok_id_dev.ptr<int32_t>(), hidden_buf.ptr<float>(), 1, H, ctx.stream());
+        embed_tokens(ctx, tok_embeddings, tok_id_dev, hidden_buf, 1, H, cfg.embed_scale);
         int* p_dev = graph_mode ? pos_dev.ptr<int>() : nullptr;
         int* kl_dev = graph_mode ? kv_len_dev.ptr<int>() : nullptr;
         if (timer) {
@@ -1522,7 +1571,14 @@ int FusionModel::prefill_batch_limit(CudaContext& ctx) const {
     const auto& g = cfg_.gdn;
     const int q = d.num_attention_heads * d.head_dim;
     const int kv = d.num_key_value_heads * d.head_dim;
-    const int64_t dense_extra = std::max<int64_t>(3LL * d.intermediate_size, 4LL * q + 2LL * kv);
+    int64_t dense_extra = std::max<int64_t>(3LL * d.intermediate_size, 4LL * q + 2LL * kv);
+    if (cfg_.model_architecture == "gemma4") {
+        for (const auto& layer : dense_layers_) {
+            const auto& a = layer.cfg;
+            dense_extra = std::max({dense_extra, int64_t{3} * a.intermediate_size,
+                (int64_t{4} * a.num_attention_heads + int64_t{2} * a.num_key_value_heads) * a.head_dim});
+        }
+    }
     const auto& arena = ctx.scratch_arena();
     const size_t available = arena.capacity() - arena.used();
     int rows = std::min(ctx.prefill_batch(), d.max_seq_len);
@@ -1588,7 +1644,7 @@ ModelMemory FusionModel::inspect_cuda(CudaContext& ctx) {
     for (const auto& l : dense_layers_) {
         count({&l.attn_norm_w, &l.q_proj, &l.k_proj, &l.v_proj, &l.q_bias, &l.k_bias, &l.v_bias,
                &l.q_norm_w, &l.k_norm_w, &l.rope_factors, &l.o_proj, &l.mlp_norm_w,
-               &l.gate_up_proj, &l.gate_proj, &l.up_proj, &l.down_proj});
+               &l.gate_up_proj, &l.gate_proj, &l.up_proj, &l.down_proj, &l.attn_post_norm_w, &l.ffn_post_norm_w});
     }
     for (const auto& l : gdn_layers_) {
         count({&l.attn_norm_w, &l.qkv_proj, &l.z_proj, &l.a_proj, &l.b_proj, &l.conv_w, &l.conv_bias,
@@ -1775,8 +1831,7 @@ void FusionModel::execute_prefill_chunks(CudaContext& ctx, const int32_t* token_
         const bool last = begin + rows == count;
         FUSIONRT_CUDA_CHECK(cudaMemcpyAsync(ids.ptr(), token_ids + begin, rows * sizeof(int32_t),
                                             cudaMemcpyHostToDevice, ctx.stream()));
-        cuda_ops::embed_lookup_f32(tok_embeddings_.ptr(), tok_embeddings_.dtype,
-                                   ids.ptr<int32_t>(), hidden.ptr<float>(), rows, H, ctx.stream());
+        embed_tokens(ctx, tok_embeddings_, ids, hidden, rows, H, cfg_.embed_scale);
         if (pa.enabled) pa.reset();
         if (layer_trace || op_trace) {
             execute_ir_graph_cuda<true>(ir, ws, ctx, hidden, cuda_workspace_.logits, rows, position, position,
@@ -1999,8 +2054,7 @@ std::vector<GenerationStats> FusionModel::bench_model_cuda(CudaContext& ctx, int
         Tensor args = cuda_scratch(ctx, {3}, DType::I32);
         auto decode = [&](int pos) {
             FUSIONRT_CUDA_CHECK(cudaMemcpyAsync(args.ptr(), host_args, args.nbytes(), cudaMemcpyHostToDevice, ctx.stream()));
-            cuda_ops::embed_lookup_f32(tok_embeddings_.ptr(), tok_embeddings_.dtype,
-                                       args.ptr<int32_t>(), cuda_workspace_.hidden.ptr<float>(), 1, H, ctx.stream());
+            embed_tokens(ctx, tok_embeddings_, args, cuda_workspace_.hidden, 1, H, cfg_.embed_scale);
             execute_ir_graph_cuda(ir, ws, ctx, cuda_workspace_.hidden, cuda_workspace_.logits, 1, pos, pos,
                                   use_graph ? args.ptr<int32_t>() + 1 : nullptr,
                                   use_graph ? args.ptr<int32_t>() + 2 : nullptr,

@@ -251,21 +251,23 @@ __device__ __forceinline__ void load_mmq_tile(
         const W& src = w[static_cast<int64_t>(min(n0 + n, N - 1)) * wstride + (kb + slot) / 8];
         constexpr int words = mmq_packed_q4<W> ? 4 : 8;
         auto* dst = reinterpret_cast<uint4*>(ws.qs[n] + slot * words);
-        if constexpr (std::is_same_v<W, BlockQ4_A>) {
-            mmq_copy_async<16>(dst, reinterpret_cast<const uint4*>(src.qs) + sub);
-            const auto* scale = reinterpret_cast<const unsigned*>(src.d) + sub / 2;
-            mmq_copy_async<4>(&ws.scale[slot][n], scale);
+        if constexpr (TileQ4_144<W>) {
+            using Tile = TileQ4Trait<W>;
+            mmq_copy_async<16>(dst, Tile::nibbles(src, sub));
+            if constexpr (Tile::symmetric) {
+                const auto* scale = reinterpret_cast<const unsigned*>(src.d) + sub / 2;
+                mmq_copy_async<4>(&ws.scale[slot][n], scale);
+            } else {
+                const float2 scales = Tile::scales(src, sub);
+                ws.scale[slot][n] = scales.x;
+                ws.other[slot][n] = -scales.y;
+            }
         } else if constexpr (std::is_same_v<W, BlockQ4_K>) {
             // Adjacent slots stage the two aligned halves of a packed Q4_K pair.
             mmq_copy_async<16>(dst, reinterpret_cast<const uint4*>(src.qs) + sub);
             const float2 scales = mmq_k_scales(src, sub);
             ws.scale[slot][n] = scales.x;
             ws.other[slot][n] = scales.y;
-        } else if constexpr (std::is_same_v<W, BlockQ4_KA>) {
-            mmq_copy_async<16>(dst, src.q[sub]);
-            const float2 scales = q4_ka_scales(src, sub);
-            ws.scale[slot][n] = scales.x;
-            ws.other[slot][n] = -scales.y;
         } else if constexpr (std::is_same_v<W, BlockQ6_A>) {
             mmq_copy_async<16>(dst, src.ql[sub]);
             mmq_copy_async<16>(dst + 1, src.qh[sub / 2]);
@@ -365,12 +367,12 @@ __device__ __forceinline__ void mmq_q8_1_tile(const BlockQ8_1* __restrict__ x, c
                 int j = warp_n + ni * 8;
                 int j0 = j + word * 2, j1 = j0 + 1;
                 uint2 bv;
-                if constexpr (std::is_same_v<W, BlockQ4_A>) {
+                if constexpr (TileQ4_144<W>) {
                     const unsigned packed = mmq_load_packed_q4(b.qs[j + lane % 8] + slot * 4);
-                    bv = make_uint2(mmq_signed_q4(packed), mmq_signed_q4(packed >> 4));
-                } else if constexpr (std::is_same_v<W, BlockQ4_KA>) {
-                    const unsigned packed = mmq_load_packed_q4(b.qs[j + lane % 8] + slot * 4);
-                    bv = make_uint2(packed & kNibbleMask, (packed >> 4) & kNibbleMask);
+                    if constexpr (TileQ4Trait<W>::symmetric)
+                        bv = make_uint2(mmq_signed_q4(packed), mmq_signed_q4(packed >> 4));
+                    else
+                        bv = make_uint2(unpack_q4_words(packed, 0), unpack_q4_words(packed, 4));
                 } else if constexpr (std::is_same_v<W, BlockQ6_A>) {
                     const unsigned* row = b.qs[j + lane % 8] + slot * 8;
                     const auto low = mmq_load_packed_q4(row);

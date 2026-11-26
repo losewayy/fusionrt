@@ -222,6 +222,10 @@ void FusionModel::init_synthetic_vulkan(VkContext& ctx, uint64_t seed) {
 bool FusionModel::load_gguf_vulkan(VkContext& ctx, const std::string& path, std::string* err, int max_seq_override) {
     LoadedModelRaw raw;
     if (!parse_gguf_model_raw(path, max_seq_override, raw, err)) return false;
+    if (raw.cfg.model_architecture == "gemma4") {
+        if (err) *err = "Gemma 4 GGUF requires the CUDA backend";
+        return false;
+    }
     if (!raw.rope_factors.storage.empty()) {
         if (err) *err = "Vulkan does not support GGUF RoPE frequency factors";
         return false;

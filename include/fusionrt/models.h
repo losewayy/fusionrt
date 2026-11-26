@@ -70,6 +70,8 @@ struct HybridModelConfig {
     GatedDeltaNetConfig gdn;
     MoEConfig moe;
     std::string model_architecture;
+    float embed_scale = 1.0f;
+    float final_logit_softcapping = 0.0f;
 };
 
 struct GenerationStats {
@@ -124,6 +126,13 @@ struct ModelMemory {
 struct CudaDenseGQALayer {
     DenseGQAConfig cfg;
     int moe_index = -1;
+    int kv_source_layer = -1;
+    int sliding_window = 0;
+    float attention_scale = 0.0f;  // 0 selects 1 / sqrt(head_dim).
+    float output_scale = 1.0f;
+    bool v_norm = false;
+    bool geglu = false;
+    Tensor attn_post_norm_w, ffn_post_norm_w;
     Tensor attn_norm_w;     // [hidden]
     Tensor q_proj;          // [q_dim, hidden]
     Tensor k_proj;          // [kv_dim, hidden]
@@ -186,6 +195,13 @@ struct CudaSparseMoELayer {
 struct VkDenseGQALayer {
     DenseGQAConfig cfg;
     int moe_index = -1;
+    int kv_source_layer = -1;
+    int sliding_window = 0;
+    float attention_scale = 0.0f;  // 0 selects 1 / sqrt(head_dim).
+    float output_scale = 1.0f;
+    bool v_norm = false;
+    bool geglu = false;
+    Tensor attn_post_norm_w, ffn_post_norm_w;
     Tensor attn_norm_w;
     Tensor q_proj;
     Tensor k_proj;

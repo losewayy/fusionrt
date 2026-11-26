@@ -1,5 +1,6 @@
 #include "fusionrt/models.h"
 #include <algorithm>
+#include <span>
 
 namespace fusionrt {
 
@@ -41,7 +42,7 @@ int linear(MiniGraph& graph, int input, const Tensor& weight, const std::string&
 
 template <size_t Count>
 std::vector<int> projections(MiniGraph& graph, int input, const std::array<const Tensor*, Count>& weights,
-                             const std::array<Tensor, Count>& packs, const std::array<std::string, Count>& tags) {
+                             std::span<const Tensor> packs, const std::array<std::string, Count>& tags) {
     std::vector<int> values;
     const Tensor* pack = nullptr;
     int remaining = 0;
@@ -56,10 +57,12 @@ std::vector<int> projections(MiniGraph& graph, int input, const std::array<const
     return values;
 }
 
-int residual(MiniGraph& graph, int input, int update, const std::string& name, const std::string& tag) {
+int residual(MiniGraph& graph, int input, int update, const std::string& name, const std::string& tag,
+             float scale = 1.0f) {
     const int output = graph.new_value(graph.hidden_size, name);
     IRNode node;
     node.op = OpKind::ADD_RESIDUAL;
+    node.output_scale = scale;
     node.inputs = {input, update};
     node.out = output;
     node.output_cols = graph.hidden_size;
@@ -69,13 +72,14 @@ int residual(MiniGraph& graph, int input, int update, const std::string& name, c
 }
 
 template <typename Layer>
-int append_ffn(MiniGraph& graph, int input, const Layer& layer, const std::string& prefix) {
+int append_ffn(MiniGraph& graph, int input, const Layer& layer, const std::string& prefix,
+               const Tensor* post_norm = nullptr, bool geglu = false, float scale = 1.0f) {
     const int normalized = norm(graph, input, layer.mlp_norm_w, graph.hidden_size,
                                 layer.cfg.rms_norm_eps, prefix + "n2", prefix + "mnorm");
     const int width = layer.cfg.intermediate_size;
     const int activated = graph.new_value(width, prefix + "sw");
     IRNode swiglu;
-    swiglu.op = OpKind::SWIGLU_INTERLEAVED;
+    swiglu.op = geglu ? OpKind::GEGLU_INTERLEAVED : OpKind::SWIGLU_INTERLEAVED;
     if (layer.gate_up_proj.data) {
         swiglu.inputs = {linear(graph, normalized, layer.gate_up_proj, prefix + "gu")};
     } else {
@@ -84,10 +88,14 @@ int append_ffn(MiniGraph& graph, int input, const Layer& layer, const std::strin
     }
     swiglu.out = activated;
     swiglu.output_cols = width;
-    swiglu.tag = prefix + "swiglu";
+    swiglu.tag = prefix + (geglu ? "geglu" : "swiglu");
     graph.add_node(std::move(swiglu));
-    const int down = linear(graph, activated, layer.down_proj, prefix + "down");
-    return residual(graph, input, down, prefix + "h2", prefix + "add2");
+    int down = linear(graph, activated, layer.down_proj, prefix + "down");
+    if (post_norm && post_norm->data) {
+        down = norm(graph, down, *post_norm, graph.hidden_size, layer.cfg.rms_norm_eps,
+                    prefix + "ffn_post_norm", prefix + "ffn_post_norm");
+    }
+    return residual(graph, input, down, prefix + "h2", prefix + "add2", scale);
 }
 
 int append_moe(MiniGraph& graph, int input, int index, const std::string& prefix) {
@@ -111,8 +119,15 @@ int append_dense(MiniGraph& graph, int input, int index, const CudaDenseGQALayer
     const int output = graph.new_value(cfg.num_attention_heads * cfg.head_dim, prefix + "attn");
     IRNode node;
     node.op = OpKind::GQA_ATTN_BLOCK;
-    node.inputs = projections(graph, normalized, {&layer.q_proj, &layer.k_proj, &layer.v_proj},
-                              layer.projection_packs, {prefix + "qkv", prefix + "k", prefix + "v"});
+    if (layer.kv_source_layer >= 0) {
+        node.inputs = {linear(graph, normalized, layer.q_proj, prefix + "q")};
+    } else if (!layer.v_proj.data) {
+        node.inputs = projections<2>(graph, normalized, {&layer.q_proj, &layer.k_proj}, layer.projection_packs,
+                                  {prefix + "qk", prefix + "k"});
+    } else {
+        node.inputs = projections<3>(graph, normalized, {&layer.q_proj, &layer.k_proj, &layer.v_proj},
+                                  layer.projection_packs, {prefix + "qkv", prefix + "k", prefix + "v"});
+    }
     node.out = output;
     node.layer_index = index;
     node.attention = {cfg.num_attention_heads, cfg.num_key_value_heads, cfg.head_dim,
@@ -124,10 +139,15 @@ int append_dense(MiniGraph& graph, int input, int index, const CudaDenseGQALayer
     node.norm_eps = cfg.rms_norm_eps;
     node.tag = prefix + "gqa";
     graph.add_node(std::move(node));
-    const int projected = linear(graph, output, layer.o_proj, prefix + "o");
+    int projected = linear(graph, output, layer.o_proj, prefix + "o");
+    if (layer.attn_post_norm_w.data) {
+        projected = norm(graph, projected, layer.attn_post_norm_w, graph.hidden_size, cfg.rms_norm_eps,
+                         prefix + "attn_post_norm", prefix + "attn_post_norm");
+    }
     const int next = residual(graph, input, projected, prefix + "h1", prefix + "add1");
     return layer.moe_index >= 0 ? append_moe(graph, next, layer.moe_index, prefix)
-                                : append_ffn(graph, next, layer, prefix);
+                                : append_ffn(graph, next, layer, prefix, &layer.ffn_post_norm_w,
+                                             layer.geglu, layer.output_scale);
 }
 
 int append_recurrent(MiniGraph& graph, int input, int index, const CudaGatedDeltaNetLayer& layer,
@@ -138,7 +158,7 @@ int append_recurrent(MiniGraph& graph, int input, int index, const CudaGatedDelt
     const int output = graph.new_value(cfg.num_v_heads * cfg.head_v_dim, prefix + "gdn");
     IRNode node;
     node.op = OpKind::GDN_RECURRENT_BLOCK;
-    node.inputs = projections(graph, normalized, {&layer.qkv_proj, &layer.z_proj, &layer.a_proj, &layer.b_proj},
+    node.inputs = projections<4>(graph, normalized, {&layer.qkv_proj, &layer.z_proj, &layer.a_proj, &layer.b_proj},
                               layer.projection_packs, {prefix + "qkvzab", prefix + "z", prefix + "a", prefix + "b"});
     node.out = output;
     node.layer_index = index;
@@ -156,6 +176,8 @@ int append_recurrent(MiniGraph& graph, int input, int index, const CudaGatedDelt
 void FusionModel::rebuild_cuda_ir() {
     MiniGraph graph;
     graph.hidden_size = static_cast<int>(lm_head_w_.shape[1]);
+    graph.final_logit_softcapping = cfg_.final_logit_softcapping;
+    if (cfg_.model_architecture == "gemma4") graph.decode_split_kv_heads = cfg_.dense.num_key_value_heads;
     graph.input_value = graph.new_value(graph.hidden_size, "hidden_in");
     int hidden = graph.input_value;
     for (size_t i = 0; i < layer_kinds_.size(); ++i) {

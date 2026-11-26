@@ -8,17 +8,45 @@ namespace fusionrt::cuda_ops {
 
 namespace {
 
-__device__ __forceinline__ float2 q4_ka_scales(const BlockQ4_KA& b, int sub) {
-    const float2 base = __half22float2(*reinterpret_cast<const half2*>(&b.d));
-    const unsigned factor = unpack_q4_ka_scales(b, sub);
-    return make_float2(base.x * (factor & 63), base.y * (factor >> 6));
-}
+template <typename W>
+inline constexpr bool TileQ4_144 = std::is_same_v<W, BlockQ4_A> || std::is_same_v<W, BlockQ4_KA>;
 
-__device__ __forceinline__ float repacked_k_value(const BlockQ4_KA& b, int i) {
+template <typename W>
+struct TileQ4Trait {
+    static_assert(TileQ4_144<W> && sizeof(W) == 9 * 16);
+    static_assert(offsetof(BlockQ4_A, qs) % 16 == 0 && offsetof(BlockQ4_KA, q) % 16 == 0);
+    static constexpr bool symmetric = std::is_same_v<W, BlockQ4_A>;
+
+    __device__ static __forceinline__ const uint4* nibbles(const W& w, int sub) {
+        if constexpr (symmetric) return reinterpret_cast<const uint4*>(w.qs) + sub;
+        else return reinterpret_cast<const uint4*>(w.q[sub]);
+    }
+
+    __device__ static __forceinline__ uint4 load_nibbles(const W& w, int sub) {
+        return __ldg(nibbles(w, sub));
+    }
+
+    __device__ static __forceinline__ float2 scales(const W& w, int sub) {
+        if constexpr (symmetric) {
+            const float d = half_bits_to_f32(__ldg(&w.d[sub]));
+            return make_float2(d, 8.0f * d);
+        } else {
+            const float2 base = __half22float2(*reinterpret_cast<const half2*>(&w.d));
+            const unsigned factor = unpack_q4_ka_scales(w, sub);
+            return make_float2(base.x * (factor & 63), base.y * (factor >> 6));
+        }
+    }
+};
+
+template <typename W>
+    requires TileQ4_144<W>
+__device__ __forceinline__ float repacked_k_value(const W& w, int i) {
+    using Tile = TileQ4Trait<W>;
     const int sub = i / 32;
-    const int q = (b.q[sub][i % 16] >> ((i / 16 % 2) * 4)) & 15;
-    const float2 scales = q4_ka_scales(b, sub);
-    return scales.x * q - scales.y;
+    const int q = (reinterpret_cast<const uint8_t*>(Tile::nibbles(w, sub))[i % 16] >> ((i / 16 % 2) * 4)) & 15;
+    const float2 sc = Tile::scales(w, sub);
+    if constexpr (Tile::symmetric) return sc.x * (q - 8);
+    else return sc.x * q - sc.y;
 }
 
 __device__ __forceinline__ float repacked_k_value(const BlockQ6_A& b, int i) {
@@ -100,9 +128,13 @@ __device__ __forceinline__ int dot_q8_words(uint4 w, uint4 x) {
     return __dp4a(static_cast<int>(w.w), static_cast<int>(x.w), dot);
 }
 
+__device__ __forceinline__ unsigned unpack_q4_words(unsigned v, int shift) {
+    return (v >> shift) & kNibbleMask;
+}
+
 __device__ __forceinline__ uint4 unpack_q4_words(uint4 v, int shift) {
-    return make_uint4((v.x >> shift) & kNibbleMask, (v.y >> shift) & kNibbleMask,
-                      (v.z >> shift) & kNibbleMask, (v.w >> shift) & kNibbleMask);
+    return make_uint4(unpack_q4_words(v.x, shift), unpack_q4_words(v.y, shift),
+                      unpack_q4_words(v.z, shift), unpack_q4_words(v.w, shift));
 }
 
 __device__ __forceinline__ uint4 load_q6_words(const uint8_t* p) {
@@ -143,19 +175,17 @@ __device__ __forceinline__ uint4 unpack_q6_a(uint4 low, uint4 high, int half, in
 
 template <typename W>
 __device__ __forceinline__ float dot_q8_1(const W& w, int sub, uint4 lo, uint4 hi, float4 x) {
-    if constexpr (std::is_same_v<W, BlockQ4_A>) {
-        uint4 qs = __ldg(reinterpret_cast<const uint4*>(&w.qs[4 * sub]));
-        int dot = dot_q8_words(unpack_q4_words(qs, 0), lo) + dot_q8_words(unpack_q4_words(qs, 4), hi);
-        return half_bits_to_f32(__ldg(&w.d[sub])) * (x.x * dot - 8.0f * x.w);
+    if constexpr (TileQ4_144<W>) {
+        using Tile = TileQ4Trait<W>;
+        const uint4 qs = Tile::load_nibbles(w, sub);
+        const int dot = dot_q8_words(unpack_q4_words(qs, 0), lo) + dot_q8_words(unpack_q4_words(qs, 4), hi);
+        const float2 scales = Tile::scales(w, sub);
+        if constexpr (Tile::symmetric) return scales.x * (x.x * dot - 8.0f * x.w);
+        else return scales.x * x.x * dot - scales.y * x.w;
     } else if constexpr (std::is_same_v<W, BlockQ8_A>) {
         const auto* qs = reinterpret_cast<const uint4*>(&w.qs[8 * sub]);
         int dot = dot_q8_words(__ldg(qs), lo) + dot_q8_words(__ldg(qs + 1), hi);
         return half_bits_to_f32(__ldg(&w.d[sub])) * x.x * dot;
-    } else if constexpr (std::is_same_v<W, BlockQ4_KA>) {
-        const uint4 q = __ldg(reinterpret_cast<const uint4*>(w.q[sub]));
-        int dot = dot_q8_words(unpack_q4_words(q, 0), lo) + dot_q8_words(unpack_q4_words(q, 4), hi);
-        const float2 scales = q4_ka_scales(w, sub);
-        return scales.x * x.x * dot - scales.y * x.w;
     } else if constexpr (std::is_same_v<W, BlockQ6_A>) {
         const uint4 low = __ldg(reinterpret_cast<const uint4*>(w.ql[sub]));
         const uint4 high = __ldg(reinterpret_cast<const uint4*>(w.qh[sub / 2]));
