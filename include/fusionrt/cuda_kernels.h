@@ -241,7 +241,8 @@ void rmsnorm_or_copy_to_f16(const float* x, const float* norm_w, uint16_t* out_f
 void cublas_linear_f16_f32(cublasHandle_t handle, const uint16_t* x_f16, const uint16_t* w_f16,
                            float* y, int M, int N, int K);
 
-// GQA Flash / Split-K Decode (supports up to 64K seq_len)
+// GQA Flash / Split-K Decode (supports up to 64K seq_len).
+// A Q8_1 output uses at least two splits and a head_dim divisible by 32.
 void gqa_splitk_decode_f32(
     const float* q,
     const void* k_cache,
@@ -252,7 +253,7 @@ void gqa_splitk_decode_f32(
     int num_q_heads, int num_kv_heads, int head_dim,
     const int* kv_len_dev, int kv_len_host, int max_seq,
     float scale, int max_splits, cudaStream_t stream, bool fixed_splits = false,
-    DType kv_dtype = DType::F32);
+    DType kv_dtype = DType::F32, BlockQ8_1* q8_out = nullptr, const float* gate = nullptr);
 
 // Batched Causal GQA Prefill Attention (M queries at start_pos .. start_pos + M - 1)
 void gqa_prefill_causal_f32(

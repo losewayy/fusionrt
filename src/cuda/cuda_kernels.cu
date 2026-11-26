@@ -1157,10 +1157,17 @@ __global__ void k_fused_qk_norm_rope_kv_append(
 // =============================================================================
 // Weight kind enum for unified WMMA prefill kernel:
 // 0=F16, 1=BF16, 2=Q8_0, 3=Q4_0, 4=Q4_1, 5=Q4_K, 6=Q6_K, 7=Q5_K, 8=Q4_KA, 9=Q6_A
+__device__ __forceinline__ float2 q4_ka_scales(const BlockQ4_KA& b, int sub) {
+    const float2 base = __half22float2(*reinterpret_cast<const half2*>(&b.d));
+    const unsigned factor = unpack_q4_ka_scales(b, sub);
+    return make_float2(base.x * (factor & 63), base.y * (factor >> 6));
+}
+
 __device__ __forceinline__ float repacked_k_value(const BlockQ4_KA& b, int i) {
     const int sub = i / 32;
     const int q = (b.q[sub][i % 16] >> ((i / 16 % 2) * 4)) & 15;
-    return half_bits_to_f32(b.d) * b.scale[sub] * q - half_bits_to_f32(b.dmin) * b.min[sub];
+    const float2 scales = q4_ka_scales(b, sub);
+    return scales.x * q - scales.y;
 }
 
 __device__ __forceinline__ float repacked_k_value(const BlockQ6_A& b, int i) {
@@ -1405,10 +1412,14 @@ __global__ void k_gqa_splitk_part1(
     }
 }
 
+__device__ __forceinline__ void store_q8_1(float v, BlockQ8_1* out);
+
+template <bool Quantized>
 __global__ void k_gqa_splitk_reduce(
     const float* __restrict__ partial_out,
     const float* __restrict__ partial_ml,
     float* __restrict__ out,
+    BlockQ8_1* __restrict__ q8_out, const float* __restrict__ gate,
     int num_q_heads, int head_dim, int num_splits)
 {
     int qh = blockIdx.x;
@@ -1437,7 +1448,14 @@ __global__ void k_gqa_splitk_reduce(
             o_acc += partial_out[o_off] * w;
         }
     }
-    out[qh * head_dim + j] = (l_global > 0.0f) ? (o_acc / l_global) : 0.0f;
+    const int col = qh * head_dim + j;
+    float value = (l_global > 0.0f) ? (o_acc / l_global) : 0.0f;
+    if constexpr (Quantized) {
+        if (gate) value *= 1.0f / (1.0f + expf(-gate[col]));
+        store_q8_1(value, q8_out + col / 32);
+    } else {
+        out[col] = value;
+    }
 }
 
 // =============================================================================
@@ -1852,7 +1870,7 @@ __global__ void k_gqa_prefill_causal(
     }
 }
 
-template <int HD, typename Cache, bool Decode = false>
+template <int HD, typename Cache, bool Decode = false, int Warps = 8>
 __global__ void k_gqa_prefill_tiled(
     const float* __restrict__ q, int q_stride,
     const Cache* __restrict__ k_cache, const Cache* __restrict__ v_cache,
@@ -1860,9 +1878,12 @@ __global__ void k_gqa_prefill_tiled(
     int start_pos, float scale, const int* kv_len_dev = nullptr, int splits = 1,
     float* partial_ml = nullptr)
 {
-    constexpr int BKV = std::is_same_v<Cache, half> ? 16 : 8, Warps = 8, DP = HD / 32;
-    __shared__ float keys[BKV][HD];
-    __shared__ float values[BKV][HD];
+    constexpr int BKV = std::is_same_v<Cache, half> ? 16 : 8, DP = HD / 32;
+    constexpr int TokensPerWarp = Decode ? 4 : 1;
+    constexpr int ScoreLanes = 32 / TokensPerWarp;
+    // Separate the four token rows' shared-memory banks.
+    alignas(16) __shared__ float keys[BKV][HD + (Decode ? ScoreLanes : 0)];
+    alignas(16) __shared__ float values[BKV][HD];
 
     int kvh = blockIdx.x;
     int group = num_q_heads / num_kv_heads;
@@ -1878,30 +1899,67 @@ __global__ void k_gqa_prefill_tiled(
     const bool valid = Decode ? query < group : m < M;
     const float* qr = q + static_cast<int64_t>(min(m, M - 1)) * q_stride + qh * HD;
 
-    float q_reg[DP], o_reg[DP] = {};
+    float q_reg[DP][TokensPerWarp], o_reg[DP] = {};
     #pragma unroll
-    for (int d = 0; d < DP; ++d) q_reg[d] = qr[d * 32 + lane] * scale;
+    for (int d = 0; d < DP; ++d) {
+        #pragma unroll
+        for (int j = 0; j < TokensPerWarp; ++j) {
+            q_reg[d][j] = qr[d * 32 + j * ScoreLanes + lane % ScoreLanes] * scale;
+        }
+    }
 
     float max_score = -INFINITY, sum = 0.0f;
     for (int base = tile_start; base < tile_end; base += BKV) {
-        for (int i = threadIdx.x; i < BKV * HD; i += Warps * 32) {
-            int t = base + i / HD;
-            int64_t src = (static_cast<int64_t>(min(t, tile_end - 1)) * num_kv_heads + kvh) * HD + i % HD;
-            keys[i / HD][i % HD] = static_cast<float>(k_cache[src]);
-            values[i / HD][i % HD] = static_cast<float>(v_cache[src]);
+        if constexpr (Decode) {
+            constexpr int V = 8;
+            for (int i = threadIdx.x; i < BKV * HD / V; i += Warps * 32) {
+                const int t = (V * i) / HD, d = (V * i) % HD;
+                const int64_t src = (static_cast<int64_t>(min(base + t, tile_end - 1)) * num_kv_heads + kvh) * HD + d;
+                const uint4 k = *reinterpret_cast<const uint4*>(k_cache + src);
+                const uint4 v = *reinterpret_cast<const uint4*>(v_cache + src);
+                const auto* k2 = reinterpret_cast<const half2*>(&k);
+                const auto* v2 = reinterpret_cast<const half2*>(&v);
+                #pragma unroll
+                for (int j = 0; j < V / 2; ++j) {
+                    reinterpret_cast<float2*>(keys[t] + d)[j] = __half22float2(k2[j]);
+                    reinterpret_cast<float2*>(values[t] + d)[j] = __half22float2(v2[j]);
+                }
+            }
+        } else {
+            for (int i = threadIdx.x; i < BKV * HD; i += Warps * 32) {
+                const int t = base + i / HD;
+                const int64_t src = (static_cast<int64_t>(min(t, tile_end - 1)) * num_kv_heads + kvh) * HD + i % HD;
+                keys[i / HD][i % HD] = static_cast<float>(k_cache[src]);
+                values[i / HD][i % HD] = static_cast<float>(v_cache[src]);
+            }
         }
         __syncthreads();
         if (valid && base < kv_end) {
             float scores[BKV];
             float next_max = max_score;
             #pragma unroll
-            for (int t = 0; t < BKV; ++t) {
-                float dot = 0.0f;
+            for (int t = 0; t < BKV; t += TokensPerWarp) {
+                const int key_t = t + lane / ScoreLanes;
+                float parts[TokensPerWarp] = {};
                 #pragma unroll
-                for (int d = 0; d < DP; ++d) dot = fmaf(q_reg[d], keys[t][d * 32 + lane], dot);
-                for (int off = 16; off > 0; off >>= 1) dot += __shfl_xor_sync(0xffffffffu, dot, off);
-                scores[t] = base + t < kv_end ? dot : -INFINITY;
-                next_max = fmaxf(next_max, scores[t]);
+                for (int d = 0; d < DP; ++d) {
+                    #pragma unroll
+                    for (int j = 0; j < TokensPerWarp; ++j) {
+                        const int col = d * 32 + j * ScoreLanes + lane % ScoreLanes;
+                        parts[j] = fmaf(q_reg[d][j], keys[key_t][col], parts[j]);
+                    }
+                }
+                float dot = parts[0];
+                if constexpr (Decode) dot = (dot + parts[2]) + (parts[1] + parts[3]);
+                for (int off = ScoreLanes / 2; off > 0; off >>= 1) {
+                    dot += __shfl_xor_sync(0xffffffffu, dot, off);
+                }
+                #pragma unroll
+                for (int j = 0; j < TokensPerWarp; ++j) {
+                    const float score = Decode ? __shfl_sync(0xffffffffu, dot, j * ScoreLanes) : dot;
+                    scores[t + j] = base + t + j < kv_end ? score : -INFINITY;
+                    next_max = fmaxf(next_max, scores[t + j]);
+                }
             }
             float rescale = __expf(max_score - next_max);
             max_score = next_max;
@@ -2094,6 +2152,11 @@ __global__ void k_swiglu_interleaved_q8_1(const float* gate_up, BlockQ8_1* out, 
                out + (static_cast<int64_t>(row) * inter_dim + col) / 32);
 }
 
+__global__ void k_quantize_vector_q8_1(const float* x, BlockQ8_1* out, int K) {
+    const int col = blockIdx.x * blockDim.x + threadIdx.x;
+    if (col < K) store_q8_1(x[col], out + col / 32);
+}
+
 constexpr unsigned kNibbleMask = 0x0f0f0f0fu;
 
 __device__ __forceinline__ int dot_q8_words(uint4 w, uint4 x) {
@@ -2157,7 +2220,8 @@ __device__ __forceinline__ float dot_q8_1(const W& w, int sub, uint4 lo, uint4 h
     } else if constexpr (std::is_same_v<W, BlockQ4_KA>) {
         const uint4 q = __ldg(reinterpret_cast<const uint4*>(w.q[sub]));
         int dot = dot_q8_words(unpack_q4_words(q, 0), lo) + dot_q8_words(unpack_q4_words(q, 4), hi);
-        return half_bits_to_f32(w.d) * w.scale[sub] * x.x * dot - half_bits_to_f32(w.dmin) * w.min[sub] * x.w;
+        const float2 scales = q4_ka_scales(w, sub);
+        return scales.x * x.x * dot - scales.y * x.w;
     } else if constexpr (std::is_same_v<W, BlockQ6_A>) {
         const uint4 low = __ldg(reinterpret_cast<const uint4*>(w.ql[sub]));
         const uint4 high = __ldg(reinterpret_cast<const uint4*>(w.qh[sub / 2]));
@@ -2223,16 +2287,9 @@ constexpr bool mmq_has_min =
 
 template <typename W>
 __device__ __forceinline__ float2 mmq_k_scales(const W& w, int sub) {
-    int sc, mn;
-    if (sub < 4) {
-        sc = w.scales[sub] & 63;
-        mn = w.scales[sub + 4] & 63;
-    } else {
-        const unsigned packed = w.scales[sub + 4];
-        sc = (packed & 15) | ((w.scales[sub - 4] >> 6) << 4);
-        mn = (packed >> 4) | ((w.scales[sub] >> 6) << 4);
-    }
-    return make_float2(half_bits_to_f32(w.d) * sc, -half_bits_to_f32(w.dmin) * mn);
+    const unsigned scale_min = unpack_k_scale_min(w.scales, sub);
+    return make_float2(half_bits_to_f32(w.d) * (scale_min & 255),
+                      -half_bits_to_f32(w.dmin) * (scale_min >> 8));
 }
 
 __device__ __forceinline__ unsigned load_word_unaligned(const uint8_t* p) {
@@ -2341,8 +2398,9 @@ __device__ __forceinline__ void load_mmq_tile(
             ws.other[slot][n] = scales.y;
         } else if constexpr (std::is_same_v<W, BlockQ4_KA>) {
             mmq_copy_async<16>(dst, src.q[sub]);
-            ws.scale[slot][n] = half_bits_to_f32(src.d) * src.scale[sub];
-            ws.other[slot][n] = -half_bits_to_f32(src.dmin) * src.min[sub];
+            const float2 scales = q4_ka_scales(src, sub);
+            ws.scale[slot][n] = scales.x;
+            ws.other[slot][n] = -scales.y;
         } else if constexpr (std::is_same_v<W, BlockQ6_A>) {
             mmq_copy_async<16>(dst, src.ql[sub]);
             mmq_copy_async<16>(dst + 1, src.qh[sub / 2]);
@@ -4000,6 +4058,10 @@ void swiglu_interleaved_f32(const float* gate_up, float* out, int rows, int inte
 void quantize_x_q8_1(const float* x, const float* res_b, const float* norm_w, float* res_out,
                      void* q8_out, int M, int K, float eps, cudaStream_t stream) {
     auto* out = static_cast<BlockQ8_1*>(q8_out);
+    if (M == 1 && !res_b && !norm_w && !res_out && K >= 1024) {
+        k_quantize_vector_q8_1<<<(K + 127) / 128, 128, 0, stream>>>(x, out, K);
+        return;
+    }
     if (K == 1024) k_quantize_x_q8_1<1024><<<M, 256, 0, stream>>>(x, res_b, norm_w, res_out, out, K, eps);
     else if (K == 2048) k_quantize_x_q8_1<2048><<<M, 256, 0, stream>>>(x, res_b, norm_w, res_out, out, K, eps);
     else k_quantize_x_q8_1<<<M, 256, 0, stream>>>(x, res_b, norm_w, res_out, out, K, eps);
@@ -4036,6 +4098,8 @@ void gemv_q4_k_q8_1(const void* x, const void* w, float* y, int N, int K, cudaSt
 
 void gemv_q4_ka_q8_1(const void* x, const void* w, float* y, int N, int K, cudaStream_t stream,
                      GemvGeometry geometry) {
+    // Fewer rows per warp expose more parallel loads on wide projections.
+    if (N >= 4096 && N < 100000 && K >= 4096) geometry.rows_per_warp = 1;
     launch_gemv_q8_1<BlockQ4_KA>(x, w, y, N, K, stream, geometry);
 }
 
@@ -4620,10 +4684,11 @@ void gqa_splitk_decode_f32(
     float* out, float* partial_out, float* partial_ml,
     int num_q_heads, int num_kv_heads, int head_dim,
     const int* kv_len_dev, int kv_len_host, int /*max_seq*/,
-    float scale, int max_splits, cudaStream_t stream, bool fixed_splits, DType kv_dtype)
+    float scale, int max_splits, cudaStream_t stream, bool fixed_splits, DType kv_dtype,
+    BlockQ8_1* q8_out, const float* gate)
 {
     int num_splits = max_splits;
-    if (!kv_len_dev && !fixed_splits) {
+    if (!kv_len_dev && !fixed_splits && !q8_out) {
         if (kv_len_host <= 128) num_splits = 1;
         else num_splits = std::min(max_splits, std::max(1, (kv_len_host + 127) / 128));
     }
@@ -4638,9 +4703,13 @@ void gqa_splitk_decode_f32(
                 (head_dim == 64 || head_dim == 128 || head_dim == 256)) {
                 const dim3 grid(num_kv_heads, num_splits);
                 auto grouped = [&]<int HD>() {
-                    k_gqa_prefill_tiled<HD, Cache, true><<<grid, 256, 0, stream>>>(
-                        q, 0, keys, values, partial_out, 1, num_q_heads, num_kv_heads,
-                        kv_len_host, scale, kv_len_dev, num_splits, partial_ml);
+                    auto run = [&]<int Warps>() {
+                        k_gqa_prefill_tiled<HD, Cache, true, Warps><<<grid, Warps * 32, 0, stream>>>(
+                            q, 0, keys, values, partial_out, 1, num_q_heads, num_kv_heads,
+                            kv_len_host, scale, kv_len_dev, num_splits, partial_ml);
+                    };
+                    if (num_q_heads / num_kv_heads <= 4) run.template operator()<4>();
+                    else run.template operator()<8>();
                 };
                 if (head_dim == 64) grouped.template operator()<64>();
                 else if (head_dim == 128) grouped.template operator()<128>();
@@ -4655,9 +4724,12 @@ void gqa_splitk_decode_f32(
     };
     if (kv_dtype == DType::F16) launch.template operator()<half>();
     else launch.template operator()<float>();
-    if (num_splits > 1) {
-        k_gqa_splitk_reduce<<<num_q_heads, threads, 0, stream>>>(
-            partial_out, partial_ml, out, num_q_heads, head_dim, num_splits);
+    if (q8_out) {
+        k_gqa_splitk_reduce<true><<<num_q_heads, threads, 0, stream>>>(
+            partial_out, partial_ml, nullptr, q8_out, gate, num_q_heads, head_dim, num_splits);
+    } else if (num_splits > 1) {
+        k_gqa_splitk_reduce<false><<<num_q_heads, threads, 0, stream>>>(
+            partial_out, partial_ml, out, nullptr, nullptr, num_q_heads, head_dim, num_splits);
     }
 }
 

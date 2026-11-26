@@ -215,10 +215,15 @@ void repack_q4_k_to_q4_ka(const BlockQ4_K* src, BlockQ4_KA* dst, int64_t cols) {
         auto& out = dst[b];
         out.d = in.d;
         out.dmin = in.dmin;
+        for (int pair = 0; pair < 4; ++pair) {
+            const unsigned lo = unpack_k_scale_min(in.scales, 2 * pair);
+            const unsigned hi = unpack_k_scale_min(in.scales, 2 * pair + 1);
+            const unsigned packed = (lo & 63) | ((lo >> 8) << 6) | ((hi & 63) << 12) | ((hi >> 8) << 18);
+            for (int byte = 0; byte < 3; ++byte) {
+                out.scales[3 * pair + byte] = static_cast<uint8_t>(packed >> (8 * byte));
+            }
+        }
         for (int sub = 0; sub < 8; ++sub) {
-            const auto* s = in.scales;
-            out.scale[sub] = sub < 4 ? s[sub] & 63 : (s[sub + 4] & 15) | ((s[sub - 4] >> 6) << 4);
-            out.min[sub] = sub < 4 ? s[sub + 4] & 63 : (s[sub + 4] >> 4) | ((s[sub] >> 6) << 4);
             const auto* q = in.qs + (sub / 2) * 32;
             const int shift = (sub % 2) * 4;
             for (int i = 0; i < 16; ++i) {
@@ -257,8 +262,9 @@ void dequantize_row_q4_ka(const BlockQ4_KA* src, float* dst, int64_t cols) {
     for (int64_t b = 0; b < cols / 256; ++b) {
         const auto& block = src[b];
         for (int sub = 0; sub < 8; ++sub) {
-            const float d = fp16_to_fp32(block.d) * block.scale[sub];
-            const float m = fp16_to_fp32(block.dmin) * block.min[sub];
+            const unsigned scale_min = unpack_q4_ka_scales(block, sub);
+            const float d = fp16_to_fp32(block.d) * (scale_min & 63);
+            const float m = fp16_to_fp32(block.dmin) * (scale_min >> 6);
             for (int i = 0; i < 32; ++i) {
                 const int q = (block.q[sub][i % 16] >> ((i / 16) * 4)) & 15;
                 dst[b * 256 + sub * 32 + i] = d * q - m;

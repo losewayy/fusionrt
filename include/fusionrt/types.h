@@ -24,7 +24,7 @@ enum class DType : uint8_t {
     Q4_A = 11, // block size 256: 16B-aligned repacked Q4_0 x8 (144 bytes)
     Q8_A = 12, // block size 256: 16B-aligned repacked Q8_0 x8 (272 bytes)
     Q8_1 = 13, // block size 32: packed activation quants, scale and sums (48 bytes)
-    Q4_KA = 14, // CUDA: 256 weights in 160 aligned bytes
+    Q4_KA = 14, // CUDA: 256 weights in 144 aligned bytes
     Q6_A = 15,  // CUDA: 256 weights in 224 aligned bytes
 };
 
@@ -102,11 +102,32 @@ static_assert(sizeof(BlockQ8_1) == 48);
 
 struct alignas(16) BlockQ4_KA {
     uint8_t q[8][16];
-    // Keep the products exact: the base FP16 values and expanded integer factors are lossless.
     uint16_t d, dmin;
-    uint8_t scale[8], min[8];
+    // Consecutive 12-bit pairs, each with a six-bit scale and minimum.
+    uint8_t scales[12];
 };
-static_assert(sizeof(BlockQ4_KA) == 160);
+static_assert(sizeof(BlockQ4_KA) == 144);
+
+// The low and high bytes hold the six-bit scale and minimum, respectively.
+#if defined(__CUDACC__)
+__host__ __device__
+#endif
+inline constexpr unsigned unpack_k_scale_min(const uint8_t* s, int sub) {
+    if (sub < 4) return (s[sub] & 63) | ((s[sub + 4] & 63) << 8);
+    const unsigned low = s[sub + 4];
+    const unsigned scale = (low & 15) | ((s[sub - 4] >> 6) << 4);
+    const unsigned min = (low >> 4) | ((s[sub] >> 6) << 4);
+    return scale | (min << 8);
+}
+
+#if defined(__CUDACC__)
+__host__ __device__
+#endif
+inline constexpr unsigned unpack_q4_ka_scales(const BlockQ4_KA& b, int sub) {
+    const int byte = sub + sub / 2;
+    const unsigned pair = b.scales[byte] | (static_cast<unsigned>(b.scales[byte + 1]) << 8);
+    return (pair >> ((sub & 1) * 4)) & 4095;
+}
 
 struct alignas(16) BlockQ6_A {
     uint8_t ql[8][16];

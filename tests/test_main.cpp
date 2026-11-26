@@ -1013,6 +1013,18 @@ void test_cuda_wave2_prefill(CudaContext& ctx) {
                     nullptr, start + M, start + M, scale, splits, ctx.stream(), true, DType::F16);
                 expect_close(read(step), {expected.end() - qcols, expected.end()}, 4e-4, 1e-3,
                     "Grouped decode after FP16 KV prefill");
+                const auto reference = arena.alloc_tensor({1, qcols}, DType::Q8_1);
+                const auto packed = arena.alloc_tensor({1, qcols}, DType::Q8_1);
+                cuda_ops::apply_sigmoid_gate_f32(step.ptr<float>(), q.ptr<float>(), qcols, ctx.stream());
+                cuda_ops::quantize_x_q8_1(step.ptr<float>(), nullptr, nullptr, nullptr, reference.ptr(),
+                                          1, qcols, 0, ctx.stream());
+                cuda_ops::gqa_splitk_decode_f32(q.ptr<float>() + (M - 1) * stride, kh.ptr(), vh.ptr(),
+                    nullptr, partial.ptr<float>(), stats.ptr<float>(), nq, nkv, hd,
+                    nullptr, start + M, start + M, scale, splits, ctx.stream(), true, DType::F16,
+                    packed.ptr<BlockQ8_1>(), q.ptr<float>());
+                if (ctx.download(reference).storage != ctx.download(packed).storage) {
+                    throw std::runtime_error("Fused attention and gate must produce the same Q8_1 blocks");
+                }
             }
         }
         arena.reset(mark);

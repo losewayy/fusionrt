@@ -362,7 +362,8 @@ DType cuda_matrix_dtype(const HostTensor& t) {
     const auto dtype = t.desc.dtype;
     if (t.desc.ndim != 2 || t.desc.shape[1] % 256 != 0) return dtype;
     if (dtype == DType::Q4_K) return DType::Q4_KA;
-    if (dtype == DType::Q6_K) return DType::Q6_A;
+    // Large vocabulary projections already saturate HBM with the smaller raw blocks.
+    if (dtype == DType::Q6_K && t.desc.shape[0] < 100000) return DType::Q6_A;
     if (t.desc.shape[0] < 32) return dtype;
     if (dtype == DType::Q4_0) return DType::Q4_A;
     if (dtype == DType::Q8_0) return DType::Q8_A;
@@ -1131,7 +1132,15 @@ static void execute_ir_graph_cuda(
                         cuda_ops::split_q_gate_f32(q_full_p, q_p, gate_p, rows, nq, hd, ctx.stream(), q_stride);
                         q_stride = q_dim;
                     }
-                    Tensor& attn_out = get_out_buf(node.out, q_dim, rows);
+                    const auto* next = ni + 1 < num_nodes ? &g.nodes[ni + 1] : nullptr;
+                    const bool quantize_output = use_fused && rows == 1 && hd % 32 == 0 && hd <= 256 &&
+                        next && next->alive && next->op == OpKind::LINEAR && next->inputs[0] == node.out &&
+                        last_use[node.out] == ni + 1 && decode_gemv(next->weight->dtype);
+                    if (quantize_output) {
+                        bufs[node.out] = cuda_scratch(ctx, {q_dim}, DType::Q8_1);
+                        non_carry_busy_until = std::max(non_carry_busy_until, last_use[node.out]);
+                    }
+                    Tensor& attn_out = quantize_output ? bufs[node.out] : get_out_buf(node.out, q_dim, rows);
                     float scale = 1.0f / std::sqrt(static_cast<float>(hd));
                     const float* qnw = cfg.query_norm ? cfg.query_norm->ptr<float>() : nullptr;
                     const float* knw = cfg.key_norm ? cfg.key_norm->ptr<float>() : nullptr;
@@ -1150,7 +1159,8 @@ static void execute_ir_graph_cuda(
                             q_p, state.keys.ptr(), state.values.ptr(),
                             attn_out.ptr<float>(), part_out.ptr<float>(), part_ml.ptr<float>(),
                             nq, nkv, hd, kv_len_dev, pos_host + 1, cfg.max_context,
-                            scale, kMaxSplits, ctx.stream(), true, state.keys.dtype);
+                            scale, kMaxSplits, ctx.stream(), true, state.keys.dtype,
+                            quantize_output ? attn_out.ptr<BlockQ8_1>() : nullptr, gate_p);
                     } else {
                         cuda_ops::batched_qk_norm_rope_kv_append_f32(
                             q_p, k_p, v_p, qnw, knw,
@@ -1182,7 +1192,7 @@ static void execute_ir_graph_cuda(
                             }
                         }
                     }
-                    if (node.attention.gated) {
+                    if (node.attention.gated && !quantize_output) {
                         cuda_ops::apply_sigmoid_gate_f32(attn_out.ptr<float>(), gate_p, rows * q_dim, ctx.stream());
                     }
                 };
