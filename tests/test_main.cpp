@@ -1,4 +1,5 @@
 #include "fusionrt/bench.h"
+#include "fusionrt/cost_model.h"
 #include "fusionrt/gguf.h"
 #include "fusionrt/models.h"
 #include "fusionrt/safetensors.h"
@@ -13,6 +14,7 @@
 #include "fusionrt/vulkan_kernels.h"
 #endif
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
@@ -25,6 +27,78 @@
 using namespace fusionrt;
 
 namespace {
+
+void test_device_profile_and_cost_model() {
+    auto check = [](bool ok, const char* label) {
+        if (!ok) throw std::runtime_error(std::string("Device cost model: ") + label);
+    };
+    struct Fixture {
+        std::filesystem::path path = "test-device-cost-profile.json";
+        ~Fixture() {
+            std::error_code ignored;
+            std::filesystem::remove(path, ignored);
+        }
+    } fixture;
+    auto load = [&](const char* json) {
+        std::ofstream(fixture.path) << json;
+        return DeviceProfile::load(fixture.path.string());
+    };
+    const auto wave1 = load(R"({"schema_version":"device_profile.v1","mmq_crossover_m":7,
+        "recommend_cuda_graph":true,"empirical_l2_bytes":33554432,"measured_dp4a_gemv_gbps":430.5,
+        "empirical_l1_kb":48,"graph_replay_us":3.125})");
+    check(wave1.mmq_crossover_m == 7 && wave1.recommend_cuda_graph && wave1.empirical_l2_bytes == 33554432 &&
+          wave1.measured_dp4a_gemv_gbps == 430.5 && wave1.empirical_l1_kb == 48 && wave1.graph_replay_us == 3.125 &&
+          wave1.sm_count == 0 && wave1.cpu_q4_gemv_gbps == 0, "Wave 1 measurements and defaults");
+    const auto wave2 = load(R"({"schema_version":"device_profile.v1","mmq_crossover_m":0,
+        "sm_count":46,"vram_total_mb":12199.75,"measured_hbm_bw_gbps":548.5,"measured_l2_bw_gbps":2100,
+        "reported_l2_bytes":37748736,"measured_fp16_tc_tflops":50.125,"measured_int8_tc_tflops":162.625,
+        "launch_floor_us":4.125,"host_ram_mb":31965.8125,"cpu_ddr_bw_gbps":39.875,"cpu_q4_gemv_gbps":51.375,
+        "pcie_h2d_gbps":14.25,"pcie_d2h_gbps":14.5,"pcie_latency_us":12.0625})");
+    check(wave2.mmq_crossover_m == DeviceProfile{}.mmq_crossover_m && wave2.sm_count == 46 &&
+          wave2.vram_total_mb == 12199.75 && wave2.measured_hbm_bw_gbps == 548.5 &&
+          wave2.measured_l2_bw_gbps == 2100 && wave2.reported_l2_bytes == 37748736 &&
+          wave2.measured_fp16_tc_tflops == 50.125 && wave2.measured_int8_tc_tflops == 162.625 &&
+          wave2.launch_floor_us == 4.125 && wave2.host_ram_mb == 31965.8125 &&
+          wave2.cpu_ddr_bw_gbps == 39.875 && wave2.cpu_q4_gemv_gbps == 51.375 &&
+          wave2.pcie_h2d_gbps == 14.25 && wave2.pcie_d2h_gbps == 14.5 &&
+          wave2.pcie_latency_us == 12.0625, "Wave 2 measurements and unmeasured crossover");
+    if (const char* path = std::getenv("FUSIONRT_TEST_WAVE2_PROFILE"); path && *path) {
+        const auto measured = DeviceProfile::load(path);
+        check(measured.sm_count > 0 && measured.vram_total_mb > 0 && measured.measured_hbm_bw_gbps > 0 &&
+              measured.measured_fp16_tc_tflops > 0 && measured.measured_int8_tc_tflops > 0 &&
+              measured.cpu_ddr_bw_gbps > 0 && measured.cpu_q4_gemv_gbps > 0 &&
+              measured.pcie_h2d_gbps > 0 && measured.pcie_d2h_gbps > 0 && measured.pcie_latency_us > 0,
+              "inferpeak Wave 2 fixture");
+        std::cout << "inferpeak Wave 2 device profile loaded\n";
+    }
+
+    CostHardware hw{.sm_count = 46, .hbm_bw_gbps = 549, .int8_tc_tflops = 160, .l2_bytes = 36 * 1024 * 1024,
+                    .cpu_q4_gemv_gbps = 51.38, .pcie_h2d_gbps = 14.24, .pcie_latency_us = 12, .l2_bw_gbps = 2400};
+    auto tile_for = [&](int sms, int rows) {
+        hw.sm_count = sms;
+        return cost_detail::mmq_tiles[static_cast<unsigned>(
+            select_mmq_tile(hw, rows, 4096, 4096, sizeof(BlockQ4_KA), true, true))];
+    };
+    const auto small_gpu = tile_for(28, 128);
+    const auto mid_gpu = tile_for(46, 128);
+    const auto large_gpu = tile_for(128, 128);
+    check(small_gpu.m >= tile_for(28, 16).m && mid_gpu.m > tile_for(46, 16).m &&
+          large_gpu.m >= tile_for(128, 16).m, "MMQ tile scales with prompt rows");
+    check(large_gpu.m * large_gpu.n < mid_gpu.m * mid_gpu.n, "MMQ tiles expose more CTAs on a larger GPU");
+    hw.sm_count = 46;
+    check(!should_repack_q6_a(hw, 151936, 4096, true) && should_repack_q6_a(hw, 4096, 4096, false),
+          "Q6 decode head and prefill projection");
+    check(select_decode_splits(hw, 64, 8, 128) == select_decode_splits(hw, 128, 8, 128) &&
+          select_decode_splits(hw, 64, 4, 128) > select_decode_splits(hw, 64, 8, 128) &&
+          select_decode_splits(hw, 8192, 8, 128) > select_decode_splits(hw, 128, 8, 128) &&
+          select_decode_splits(hw, 8192, 8, 8) == 8, "Decode split buckets and cap");
+    check(select_cold_expert_path(hw, 8 * 1024 * 1024) == ColdExpertPath::CpuInPlace,
+          "5070 Ti cold expert");
+    hw.cpu_q4_gemv_gbps = 10;
+    hw.pcie_h2d_gbps = 64;
+    check(select_cold_expert_path(hw, 8 * 1024 * 1024) == ColdExpertPath::PcieStream &&
+          select_cold_expert_path(hw, 4096) == ColdExpertPath::CpuInPlace, "Fast PCIe and transfer startup cost");
+}
 
 void test_agent_protocols() {
     using namespace agent;
@@ -882,7 +956,7 @@ void test_repacked_k_quants(CudaContext& ctx) {
         auto got = ctx.download(y);
         expect_close({got.data<float>(), got.data<float>() + N}, {expected.begin(), expected.begin() + N},
                      3e-5, 1e-5, label + " GEMV");
-        mmq(qx.ptr(), w.ptr(), y.ptr<float>(), M, N, K, ctx.stream());
+        mmq(qx.ptr(), w.ptr(), y.ptr<float>(), M, N, K, ctx.stream(), ctx.cost_hardware());
         got = ctx.download(y);
         expect_close({got.data<float>(), got.data<float>() + M * N}, expected, 3e-5, 1e-5, label + " MMQ");
     };
@@ -936,7 +1010,7 @@ void test_cuda_wave2_prefill(CudaContext& ctx) {
         for (int n = 0; n < N; ++n) dequantize(w.data<W>() + n * blocks, weights.data() + n * K, K);
         for (int rows : {4, 17, 64, M}) {
             auto dy = arena.alloc_tensor({rows, N}, DType::F32);
-            mmq(qx.ptr(), dw.ptr(), dy.ptr<float>(), rows, N, K, ctx.stream());
+            mmq(qx.ptr(), dw.ptr(), dy.ptr<float>(), rows, N, K, ctx.stream(), ctx.cost_hardware());
             std::vector<double> ref(rows * N), ref_quantized(rows * N);
             for (int m = 0; m < rows; ++m) {
                 for (int n = 0; n < N; ++n) {
@@ -2007,8 +2081,15 @@ int main() {
     try {
         test_quant_and_io();
         test_agent_protocols();
+        test_device_profile_and_cost_model();
 #ifdef FUSIONRT_ENABLE_CUDA
         CudaContext cuda_ctx(0, 256, 512);
+        if (cuda_ctx.device_profile().sm_count != cuda_ctx.info().multi_processor_count ||
+            cuda_ctx.device_profile().vram_total_mb !=
+                static_cast<double>(cuda_ctx.info().total_vram_bytes) / (1024.0 * 1024.0) ||
+            cuda_ctx.cost_hardware().hbm_bw_gbps != cuda_ctx.info().peak_bandwidth_gbps) {
+            throw std::runtime_error("CUDA device profile runtime defaults");
+        }
         test_cuda_fused_rmsnorm_linear(cuda_ctx);
         test_cuda_step1_fast_paths(cuda_ctx);
         test_cuda_gated_deltanet_fused_vs_unfused_and_fp64(cuda_ctx);

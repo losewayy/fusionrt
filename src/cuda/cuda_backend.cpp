@@ -272,6 +272,7 @@ std::vector<CudaDeviceInfo> CudaContext::enumerate_devices() {
         info.l2_cache_bytes = static_cast<size_t>(prop.l2CacheSize);
         info.multi_processor_count = prop.multiProcessorCount;
         info.shared_mem_per_block = static_cast<int>(prop.sharedMemPerBlock);
+        info.shared_mem_per_block_optin = static_cast<int>(prop.sharedMemPerBlockOptin);
         info.shared_mem_per_sm = static_cast<int>(prop.sharedMemPerMultiprocessor);
         info.warp_size = prop.warpSize;
         info.max_threads_per_block = prop.maxThreadsPerBlock;
@@ -298,6 +299,7 @@ CudaContext::CudaContext(int device_id, size_t weight_arena_mb, size_t scratch_a
         throw std::runtime_error("Invalid CUDA device_id");
     }
     info_ = devs[device_id];
+    set_device_profile({});
     FUSIONRT_CUDA_CHECK(cudaSetDevice(device_id));
     FUSIONRT_CUDA_CHECK(cudaStreamCreateWithFlags(&stream_, cudaStreamNonBlocking));
     FUSIONRT_CUBLAS_CHECK(cublasCreate(&cublas_));
@@ -326,6 +328,35 @@ CudaContext::CudaContext(int device_id, size_t weight_arena_mb, size_t scratch_a
     FUSIONRT_CUDA_CHECK(cudaMalloc(&l2_flush_buf_, l2_flush_bytes_));
     FUSIONRT_CUDA_CHECK(cudaMemsetAsync(l2_flush_buf_, 0xA5, l2_flush_bytes_, stream_));
     FUSIONRT_CUDA_CHECK(cudaStreamSynchronize(stream_));
+}
+
+void CudaContext::set_device_profile(const DeviceProfile& profile) {
+    device_profile_ = profile;
+    auto& p = device_profile_;
+    if (p.sm_count == 0) p.sm_count = info_.multi_processor_count;
+    if (p.vram_total_mb == 0) p.vram_total_mb = static_cast<double>(info_.total_vram_bytes) / (1024 * 1024);
+    if (p.reported_l2_bytes == 0) p.reported_l2_bytes = info_.l2_cache_bytes;
+
+    // Dense FP16 FMA throughput per SM cycle. INT8 issues twice as many MACs.
+    const int cc = 10 * info_.sm_major + info_.sm_minor;
+    int fp16_fmas = 512;
+    if (cc == 80) fp16_fmas = 1024;
+    if (cc == 90 || cc == 100 || cc == 103) fp16_fmas = 2048;
+    const double peak_fp16 = 2.0 * fp16_fmas * p.sm_count * info_.sm_clock_khz / 1e9;
+    cost_hardware_ = {
+        .sm_count = p.sm_count,
+        .hbm_bw_gbps = p.measured_hbm_bw_gbps > 0 ? p.measured_hbm_bw_gbps : info_.peak_bandwidth_gbps,
+        .int8_tc_tflops = p.measured_int8_tc_tflops > 0 ? p.measured_int8_tc_tflops : 2 * peak_fp16,
+        .fp16_tc_tflops = p.measured_fp16_tc_tflops > 0 ? p.measured_fp16_tc_tflops : peak_fp16,
+        .l2_bytes = static_cast<size_t>(p.empirical_l2_bytes > 0 ? p.empirical_l2_bytes : p.reported_l2_bytes),
+        .cpu_q4_gemv_gbps = p.cpu_q4_gemv_gbps,
+        .pcie_h2d_gbps = p.pcie_h2d_gbps,
+        .pcie_latency_us = p.pcie_latency_us,
+        .l2_bw_gbps = p.measured_l2_bw_gbps,
+        .sm_clock_ghz = info_.sm_clock_khz / 1e6,
+        .shared_bytes_per_sm = info_.shared_mem_per_sm,
+        .shared_bytes_per_block = std::max(info_.shared_mem_per_block_optin, info_.shared_mem_per_block),
+    };
 }
 
 CudaContext::~CudaContext() {

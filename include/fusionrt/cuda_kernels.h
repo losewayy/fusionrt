@@ -59,13 +59,20 @@ void gemv_q5_k_q8_1(const void* x_q8, const void* w_q5_k, float* y, int N, int K
 bool project_q4_a_and_q8_a(const void* x, const void* q4, const void* q8, float* y4, float* y8,
                           int M, int N4, int N8, int K, cudaStream_t stream, GemvGeometry geometry);
 
-void mmq_q4_a_q8_1(const void* x_q8, const void* w, float* y, int M, int N, int K, cudaStream_t stream);
-void mmq_q8_a_q8_1(const void* x_q8, const void* w, float* y, int M, int N, int K, cudaStream_t stream);
-void mmq_q6_k_q8_1(const void* x_q8, const void* w, float* y, int M, int N, int K, cudaStream_t stream);
-void mmq_q4_k_q8_1(const void* x_q8, const void* w, float* y, int M, int N, int K, cudaStream_t stream);
-void mmq_q4_ka_q8_1(const void* x, const void* w, float* y, int M, int N, int K, cudaStream_t stream);
-void mmq_q6_a_q8_1(const void* x, const void* w, float* y, int M, int N, int K, cudaStream_t stream);
-void mmq_q5_k_q8_1(const void* x_q8, const void* w, float* y, int M, int N, int K, cudaStream_t stream);
+void mmq_q4_a_q8_1(const void* x_q8, const void* w, float* y, int M, int N, int K, cudaStream_t stream,
+                     const CostHardware& hw = {});
+void mmq_q8_a_q8_1(const void* x_q8, const void* w, float* y, int M, int N, int K, cudaStream_t stream,
+                     const CostHardware& hw = {});
+void mmq_q6_k_q8_1(const void* x_q8, const void* w, float* y, int M, int N, int K, cudaStream_t stream,
+                     const CostHardware& hw = {});
+void mmq_q4_k_q8_1(const void* x_q8, const void* w, float* y, int M, int N, int K, cudaStream_t stream,
+                     const CostHardware& hw = {});
+void mmq_q4_ka_q8_1(const void* x, const void* w, float* y, int M, int N, int K, cudaStream_t stream,
+                     const CostHardware& hw = {});
+void mmq_q6_a_q8_1(const void* x, const void* w, float* y, int M, int N, int K, cudaStream_t stream,
+                     const CostHardware& hw = {});
+void mmq_q5_k_q8_1(const void* x_q8, const void* w, float* y, int M, int N, int K, cudaStream_t stream,
+                     const CostHardware& hw = {});
 void add_residual_f32(const float* a, const float* b, float* out, int n, cudaStream_t stream);
 void add_bias_f32(float* out, const float* bias, int rows, int cols, int stride, cudaStream_t stream);
 void add_rmsnorm_f32(const float* a, const float* b, const float* norm_w,

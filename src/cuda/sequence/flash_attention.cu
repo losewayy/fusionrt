@@ -675,8 +675,7 @@ void gqa_splitk_decode_f32(
 {
     int num_splits = max_splits;
     if (!kv_len_dev && !fixed_splits && !q8_out) {
-        if (kv_len_host <= 128) num_splits = 1;
-        else num_splits = std::min(max_splits, std::max(1, (kv_len_host + 127) / 128));
+        num_splits = select_decode_splits({}, kv_len_host, num_kv_heads, max_splits);
     }
     int threads = std::min(256, std::max(32, ((head_dim + 31) / 32) * 32));
     size_t smem_bytes = (32 + static_cast<size_t>(head_dim)) * sizeof(float);

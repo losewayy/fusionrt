@@ -135,12 +135,11 @@ bool load_tokenizer(BpeTokenizer& tok, const std::string& model_path) {
 #ifdef FUSIONRT_ENABLE_CUDA
 void load_cuda_model(CudaContext& ctx, FusionModel& model, const std::string& path, int max_seq,
                      const std::string& profile) {
-    const auto device = DeviceProfile::load(profile);
+    model.set_device_profile(ctx, DeviceProfile::load(profile));
     std::string err;
     bool ok = is_gguf(path) ? model.load_gguf(ctx, path, &err, max_seq)
                            : model.load_safetensors(ctx, path, &err, max_seq);
     if (!ok) throw std::runtime_error("Error loading model: " + err);
-    model.set_device_profile(ctx, device);
 }
 
 int interactive_chat(CudaContext& ctx, FusionModel& model, const BpeTokenizer& tok,

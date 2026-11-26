@@ -1,5 +1,7 @@
 #pragma once
 
+#include "fusionrt/cost_model.h"
+#include "fusionrt/device_profile.h"
 #include "fusionrt/tensor.h"
 #include <cuda_runtime.h>
 #include <cuda.h>
@@ -22,6 +24,7 @@ struct CudaDeviceInfo {
     size_t l2_cache_bytes = 0;
     int multi_processor_count = 0;
     int shared_mem_per_block = 0;
+    int shared_mem_per_block_optin = 0;
     int shared_mem_per_sm = 0;
     int warp_size = 32;
     int max_threads_per_block = 1024;
@@ -97,12 +100,23 @@ public:
     cublasHandle_t cublas() const { return cublas_; }
     int prefill_batch() const { return prefill_batch_; }
     void set_prefill_batch(int rows) { prefill_batch_ = rows; }
-    int mmq_crossover_m() const { return mmq_crossover_m_; }
-    void set_mmq_crossover_m(int rows) { mmq_crossover_m_ = rows; }
-    GemvGeometry preferred_gemv_geometry() const { return preferred_gemv_geometry_; }
-    void set_preferred_gemv_geometry(GemvGeometry geometry) { preferred_gemv_geometry_ = geometry; }
-    uint64_t empirical_l2_bytes() const { return empirical_l2_bytes_; }
-    void set_empirical_l2_bytes(uint64_t bytes) { empirical_l2_bytes_ = bytes; }
+    const DeviceProfile& device_profile() const { return device_profile_; }
+    const CostHardware& cost_hardware() const { return cost_hardware_; }
+    void set_device_profile(const DeviceProfile& profile);
+    int mmq_crossover_m() const { return device_profile_.mmq_crossover_m; }
+    void set_mmq_crossover_m(int rows) { device_profile_.mmq_crossover_m = rows; }
+    GemvGeometry preferred_gemv_geometry() const {
+        return {device_profile_.preferred_gemv_warps, device_profile_.preferred_gemv_rows_per_warp};
+    }
+    void set_preferred_gemv_geometry(GemvGeometry geometry) {
+        device_profile_.preferred_gemv_warps = geometry.warps;
+        device_profile_.preferred_gemv_rows_per_warp = geometry.rows_per_warp;
+    }
+    uint64_t empirical_l2_bytes() const { return device_profile_.empirical_l2_bytes; }
+    void set_empirical_l2_bytes(uint64_t bytes) {
+        device_profile_.empirical_l2_bytes = bytes;
+        set_device_profile(device_profile_);
+    }
     DType kv_dtype() const { return kv_dtype_; }
     void set_kv_dtype(DType dtype);
 
@@ -122,16 +136,15 @@ public:
 
 private:
     CudaDeviceInfo info_;
+    DeviceProfile device_profile_;
+    CostHardware cost_hardware_;
     cudaStream_t stream_ = nullptr;
     cublasHandle_t cublas_ = nullptr;
     CudaArena weight_arena_;
     CudaArena scratch_arena_;
     void* l2_flush_buf_ = nullptr;
     size_t l2_flush_bytes_ = 0;
-    int mmq_crossover_m_ = 4;
     int prefill_batch_ = 512;
-    GemvGeometry preferred_gemv_geometry_;
-    uint64_t empirical_l2_bytes_ = 0;
     DType kv_dtype_ = DType::F32;
 };
 

@@ -1,6 +1,7 @@
 cmake_minimum_required(VERSION 3.24)
 if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
-    set(CMAKE_CUDA_ARCHITECTURES 120)
+    # For multi-architecture releases, pass -DCMAKE_CUDA_ARCHITECTURES="80;86;89;90;120".
+    set(CMAKE_CUDA_ARCHITECTURES native)
 endif()
 project(fusionrt VERSION 0.2.0 LANGUAGES CXX)
 

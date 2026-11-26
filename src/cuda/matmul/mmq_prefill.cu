@@ -3,6 +3,8 @@
 #include <mma.h>
 
 #include <algorithm>
+#include <iterator>
+#include <utility>
 
 namespace fusionrt::cuda_ops {
 
@@ -526,70 +528,64 @@ void launch_mmq_tile(const BlockQ8_1* x, const W* w, float* y, int M, int N, int
     k_mmq_q8_1<W, BM, BN, WN, BK, WM><<<grid, threads, dynamic_bytes, stream>>>(x, w, y, M, N, K);
 }
 
+template <typename W, MmqTileConfig Config>
+constexpr bool mmq_tile_compiled() {
+    using enum MmqTileConfig;
+    constexpr bool scaled = std::is_same_v<W, BlockQ4_KA> || std::is_same_v<W, BlockQ5_K>;
+    switch (Config) {
+        case M128N96: case M128N128: return scaled;
+        case M128N64: case M64N64: return scaled || std::is_same_v<W, BlockQ6_A>;
+        case M64N128: return std::is_same_v<W, BlockQ4_A>;
+        case M64N64K256: return std::is_same_v<W, BlockQ8_A>;
+        case M64N64W1: return std::is_same_v<W, BlockQ4_K>;
+        default: return true;
+    }
+}
+
+template <typename W, size_t... I>
+constexpr auto mmq_tile_menu(std::index_sequence<I...>) {
+    struct Menu {
+        unsigned mask;
+        int shared[sizeof...(I)];
+    };
+    constexpr auto& tiles = cost_detail::mmq_tiles;
+    return Menu{
+        (0u | ... | (mmq_tile_compiled<W, static_cast<MmqTileConfig>(I)>() ? 1u << I : 0u)),
+        {sizeof(MmqBuffers<W, tiles[I].m, tiles[I].n, tiles[I].k_groups>)...},
+    };
+}
+
 template <typename W>
-void launch_mmq(const void* x, const void* w, float* y, int M, int N, int K, cudaStream_t stream) {
-    if (M <= 0 || N <= 0) return;
+void launch_mmq(const void* x, const void* w, float* y, int M, int N, int K, cudaStream_t stream,
+                const CostHardware& hw) {
+    if (M <= 0 || N <= 0 || K <= 0) return;
     auto* qx = static_cast<const BlockQ8_1*>(x);
     auto* qw = static_cast<const W*>(w);
-    if (M <= 16) {
-        launch_mmq_tile<W, 16, 32, 1, 8>(qx, qw, y, M, N, K, stream);
-        return;
-    }
-    if (M <= 32) {
-        launch_mmq_tile<W, 32, 32, 1, 8>(qx, qw, y, M, N, K, stream);
-        return;
-    }
-    if constexpr (std::is_same_v<W, BlockQ4_A>) {
-        if (M >= 64 && N >= 4096) {
-            launch_mmq_tile<W, 64, 128, 2>(qx, qw, y, M, N, K, stream);
-            return;
+    constexpr auto menu = mmq_tile_menu<W>(std::make_index_sequence<std::size(cost_detail::mmq_tiles)>{});
+    constexpr bool wide = mmq_tile_compiled<W, MmqTileConfig::M128N64>() ||
+                          mmq_tile_compiled<W, MmqTileConfig::M64N128>();
+    const auto tile = select_mmq_tile(hw, M, N, K, sizeof(W), wide, mmq_async<W>, menu.mask, menu.shared);
+
+    auto launch = [&]<MmqTileConfig Config> {
+        if constexpr (mmq_tile_compiled<W, Config>()) {
+            constexpr auto t = cost_detail::mmq_tiles[static_cast<unsigned>(Config)];
+            launch_mmq_tile<W, t.m, t.n, t.warp_n, t.k_groups, t.warp_m>(qx, qw, y, M, N, K, stream);
         }
+    };
+    using enum MmqTileConfig;
+    switch (tile) {
+        case M16N32:   return launch.template operator()<M16N32>();
+        case M32N32:   return launch.template operator()<M32N32>();
+        case M32N64:   return launch.template operator()<M32N64>();
+        case M64N32:   return launch.template operator()<M64N32>();
+        case M64N64:   return launch.template operator()<M64N64>();
+        case M64N64K256: return launch.template operator()<M64N64K256>();
+        case M64N64W1: return launch.template operator()<M64N64W1>();
+        case M64N128:  return launch.template operator()<M64N128>();
+        case M128N64:  return launch.template operator()<M128N64>();
+        case M128N96:  return launch.template operator()<M128N96>();
+        case M128N128: return launch.template operator()<M128N128>();
     }
-    if constexpr (std::is_same_v<W, BlockQ4_KA> || std::is_same_v<W, BlockQ5_K>) {
-        // A narrower output tile gives short wide projections more CTAs.
-        if (M >= 128 && M < 256 && N >= 4096 && N <= 8192) {
-            launch_mmq_tile<W, 128, 96, 2, 4, 4>(qx, qw, y, M, N, K, stream);
-            return;
-        }
-        if ((std::is_same_v<W, BlockQ4_KA> && M >= 128 && N >= 4096) || (M >= 256 && N >= 1024)) {
-            launch_mmq_tile<W, 128, 128, 2, 4, 4>(qx, qw, y, M, N, K, stream);
-            return;
-        }
-        if (M >= 128 && N >= 2048) {
-            launch_mmq_tile<W, 128, 64, 2, 4, 2>(qx, qw, y, M, N, K, stream);
-            return;
-        }
-    }
-    if constexpr (std::is_same_v<W, BlockQ6_A>) {
-        if (M >= 256 && N >= 4096) {
-            launch_mmq_tile<W, 128, 64, 2, 4, 2>(qx, qw, y, M, N, K, stream);
-            return;
-        }
-    }
-    if constexpr (std::is_same_v<W, BlockQ4_KA> || std::is_same_v<W, BlockQ5_K> ||
-                  std::is_same_v<W, BlockQ6_A>) {
-        if (M >= 64 && N >= 1024) {
-            launch_mmq_tile<W, 64, 64, 2, 4, 2>(qx, qw, y, M, N, K, stream);
-            return;
-        }
-    }
-    if constexpr (std::is_same_v<W, BlockQ8_A>) {
-        if (M >= 64 && N <= 128) {
-            launch_mmq_tile<W, 64, 64, 2, 8, 2>(qx, qw, y, M, N, K, stream);
-            return;
-        }
-    }
-    if constexpr (std::is_same_v<W, BlockQ4_K>) {
-        if (M >= 64 && N >= 1024) {
-            launch_mmq_tile<W, 64, 64, 1>(qx, qw, y, M, N, K, stream);
-            return;
-        }
-    }
-    if (M >= 64 && K >= 4096) {
-        launch_mmq_tile<W, 64, 32, 1>(qx, qw, y, M, N, K, stream);
-        return;
-    }
-    launch_mmq_tile<W, 32, 64, 2>(qx, qw, y, M, N, K, stream);
 }
 
 __global__ void k_dequant_q8_a_to_f16(const BlockQ8_A* __restrict__ w, half* __restrict__ out, int N, int K) {
@@ -742,32 +738,39 @@ void launch_mmq_q4_a_and_q8_a(const BlockQ8_1* x, const BlockQ4_A* w4, const Blo
 
 }  // namespace matmul
 
-void mmq_q4_a_q8_1(const void* x, const void* w, float* y, int M, int N, int K, cudaStream_t stream) {
-    launch_mmq<BlockQ4_A>(x, w, y, M, N, K, stream);
+void mmq_q4_a_q8_1(const void* x, const void* w, float* y, int M, int N, int K, cudaStream_t stream,
+                     const CostHardware& hw) {
+    launch_mmq<BlockQ4_A>(x, w, y, M, N, K, stream, hw);
 }
 
-void mmq_q8_a_q8_1(const void* x, const void* w, float* y, int M, int N, int K, cudaStream_t stream) {
-    launch_mmq<BlockQ8_A>(x, w, y, M, N, K, stream);
+void mmq_q8_a_q8_1(const void* x, const void* w, float* y, int M, int N, int K, cudaStream_t stream,
+                     const CostHardware& hw) {
+    launch_mmq<BlockQ8_A>(x, w, y, M, N, K, stream, hw);
 }
 
-void mmq_q6_k_q8_1(const void* x, const void* w, float* y, int M, int N, int K, cudaStream_t stream) {
-    launch_mmq<BlockQ6_K>(x, w, y, M, N, K, stream);
+void mmq_q6_k_q8_1(const void* x, const void* w, float* y, int M, int N, int K, cudaStream_t stream,
+                     const CostHardware& hw) {
+    launch_mmq<BlockQ6_K>(x, w, y, M, N, K, stream, hw);
 }
 
-void mmq_q4_k_q8_1(const void* x, const void* w, float* y, int M, int N, int K, cudaStream_t stream) {
-    launch_mmq<BlockQ4_K>(x, w, y, M, N, K, stream);
+void mmq_q4_k_q8_1(const void* x, const void* w, float* y, int M, int N, int K, cudaStream_t stream,
+                     const CostHardware& hw) {
+    launch_mmq<BlockQ4_K>(x, w, y, M, N, K, stream, hw);
 }
 
-void mmq_q4_ka_q8_1(const void* x, const void* w, float* y, int M, int N, int K, cudaStream_t stream) {
-    launch_mmq<BlockQ4_KA>(x, w, y, M, N, K, stream);
+void mmq_q4_ka_q8_1(const void* x, const void* w, float* y, int M, int N, int K, cudaStream_t stream,
+                     const CostHardware& hw) {
+    launch_mmq<BlockQ4_KA>(x, w, y, M, N, K, stream, hw);
 }
 
-void mmq_q6_a_q8_1(const void* x, const void* w, float* y, int M, int N, int K, cudaStream_t stream) {
-    launch_mmq<BlockQ6_A>(x, w, y, M, N, K, stream);
+void mmq_q6_a_q8_1(const void* x, const void* w, float* y, int M, int N, int K, cudaStream_t stream,
+                     const CostHardware& hw) {
+    launch_mmq<BlockQ6_A>(x, w, y, M, N, K, stream, hw);
 }
 
-void mmq_q5_k_q8_1(const void* x, const void* w, float* y, int M, int N, int K, cudaStream_t stream) {
-    launch_mmq<BlockQ5_K>(x, w, y, M, N, K, stream);
+void mmq_q5_k_q8_1(const void* x, const void* w, float* y, int M, int N, int K, cudaStream_t stream,
+                     const CostHardware& hw) {
+    launch_mmq<BlockQ5_K>(x, w, y, M, N, K, stream, hw);
 }
 
 void dequantize_to_f16(const void* w, DType dt, uint16_t* out_f16, int N, int K, cudaStream_t stream) {
