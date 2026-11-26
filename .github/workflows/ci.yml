@@ -21,3 +21,24 @@ jobs:
         run: ctest --test-dir build --output-on-failure
       - name: Check Python script syntax
         run: python3 -m py_compile scripts/verify_pytorch_and_llamacpp.py
+
+  cuda-compile-multiarch:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install CUDA 12.8 compile toolchain
+        run: |
+          wget -q https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64/cuda-keyring_1.1-1_all.deb
+          sudo dpkg -i cuda-keyring_1.1-1_all.deb
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends ninja-build cmake cuda-nvcc-12-8 cuda-cudart-dev-12-8 libcublas-dev-12-8 cuda-driver-dev-12-8
+          echo "/usr/local/cuda-12.8/bin" >> "$GITHUB_PATH"
+      - name: Configure multi-arch CUDA compile check
+        run: >
+          cmake -S . -B build-cuda -G Ninja
+          -DCMAKE_BUILD_TYPE=Release
+          -DFUSIONRT_ENABLE_CUDA=ON
+          -DFUSIONRT_ENABLE_VULKAN=OFF
+          -DCMAKE_CUDA_ARCHITECTURES="80;86;89;90;120"
+      - name: Build CUDA targets (sm_80..sm_120)
+        run: cmake --build build-cuda -j 4
