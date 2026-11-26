@@ -192,7 +192,7 @@ __global__ void k_gqa_prefill_tiled(
     int start_pos, float scale, const int* kv_len_dev = nullptr, int splits = 1,
     float* partial_ml = nullptr, CudaKvView cache = {}, int sliding_window = 0)
 {
-    constexpr int BKV = std::is_same_v<Cache, float> ? 8 : 16, DP = HD / 32;
+    constexpr int BKV = HD == 512 || std::is_same_v<Cache, float> ? 8 : 16, DP = HD / 32;
     constexpr int TokensPerWarp = Decode ? 4 : 1;
     constexpr int ScoreLanes = 32 / TokensPerWarp;
     // Separate the four token rows' shared-memory banks.
@@ -769,7 +769,7 @@ void gqa_prefill_causal_f32(
     auto launch = [&]<typename Cache>() {
         const auto* keys = static_cast<const Cache*>(k_cache);
         const auto* values = static_cast<const Cache*>(v_cache);
-        if (head_dim == 64 || head_dim == 128 || head_dim == 256) {
+        if (head_dim == 64 || head_dim == 128 || head_dim == 256 || head_dim == 512) {
             const int group = num_q_heads / num_kv_heads;
             const dim3 grid(num_kv_heads, (M * group + 7) / 8);
             auto tiled = [&]<int HD>() {
@@ -792,7 +792,8 @@ void gqa_prefill_causal_f32(
             };
             if (head_dim == 64) tiled.template operator()<64>();
             else if (head_dim == 128) tiled.template operator()<128>();
-            else tiled.template operator()<256>();
+            else if (head_dim == 256) tiled.template operator()<256>();
+            else tiled.template operator()<512>();
             return;
         }
         const int threads = std::min(1024, std::max(32, ((head_dim + 31) / 32) * 32));

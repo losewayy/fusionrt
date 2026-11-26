@@ -157,6 +157,7 @@ struct CudaDenseGQALayer {
     Tensor gate_up_proj;    // [2*inter, hidden]
     Tensor gate_proj, up_proj;  // Separate when the gate and up weights use different formats.
     Tensor down_proj;       // [hidden, inter]
+    Tensor ple_gate, ple_projection, ple_post_norm;
 
 
 };
@@ -329,6 +330,7 @@ private:
     Tensor tok_embeddings_;
     Tensor final_norm_w_;
     Tensor lm_head_w_;
+    GemmaLayerInputWeights<Tensor> gemma_inputs_;
     struct CudaWorkspace {
         Tensor hidden, logits, token_ids, position, kv_length;
         CudaGraphExec decode_graph;

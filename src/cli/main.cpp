@@ -318,6 +318,18 @@ int cmd_daily(const std::string& cmd, int argc, char** argv) {
                       << " norm_topk_prob=" << (header.get_bool(prefix + "expert_weights_norm",
                              header.get_bool(prefix + "norm_topk_prob", true)) ? "true" : "false") << '\n';
         }
+        if (arch == "gemma4") {
+            const auto pattern = header.metadata().find(prefix + "attention.sliding_window_pattern");
+            const auto* swa = pattern == header.metadata().end() ? nullptr :
+                std::get_if<std::vector<bool>>(&pattern->second);
+            const auto sliding_layers = swa ? std::count(swa->begin(), swa->end(), true) : 0;
+            std::cout << "global_layers=" << header.get_int(prefix + "block_count") - sliding_layers
+                      << " sliding_layers=" << sliding_layers
+                      << " sliding_head_dim=" << header.get_int(prefix + "attention.key_length_swa")
+                      << " sliding_window=" << header.get_int(prefix + "attention.sliding_window")
+                      << " shared_kv_layers=" << header.get_int(prefix + "attention.shared_kv_layers")
+                      << " ple_width=" << header.get_int(prefix + "embedding_length_per_layer_input") << '\n';
+        }
         WeightSummary sizes;
         for (const auto& tensor : header.tensors()) sizes.add(tensor.dtype, tensor.shape, tensor.nbytes);
         sizes.print();

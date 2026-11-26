@@ -23,6 +23,7 @@ enum class OpKind : uint8_t {
     SHARED_Q8_PROJECTIONS = 11,
     GEGLU_INTERLEAVED = 12,
     GEGLU_Q8_LINEAR = 13,
+    GEMMA_PLE_GATE = 14,
 };
 
 inline const char* op_kind_name(OpKind op) {
@@ -41,6 +42,7 @@ inline const char* op_kind_name(OpKind op) {
         case OpKind::GEGLU_INTERLEAVED:        return "GEGLU_INTERLEAVED";
         case OpKind::GEGLU_Q8_LINEAR:          return "GEGLU_Q8_LINEAR";
         case OpKind::MOE_FFN_BLOCK:            return "MOE_FFN_BLOCK";
+        case OpKind::GEMMA_PLE_GATE:           return "GEMMA_PLE_GATE";
     }
     return "UNKNOWN";
 }
@@ -109,12 +111,19 @@ struct FusionPassStats {
     int add_norm_linear_fusions = 0;
 };
 
+template <typename T>
+struct GemmaLayerInputWeights {
+    T token_embeddings{}, projection{}, norm{};
+};
+
 struct MiniGraph {
     int input_value = -1;
     int output_value = -1;
     int hidden_size = 0;
     float final_logit_softcapping = 0.0f;
     int decode_split_kv_heads = 0;
+    GemmaLayerInputWeights<const Tensor*> gemma_inputs;
+    float gemma_input_eps = 0.0f;
     std::vector<ValueMeta> values;
     std::vector<IRNode> nodes;
     FusionPassStats stats;

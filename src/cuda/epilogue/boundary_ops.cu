@@ -682,6 +682,23 @@ void geglu_f32(const float* gate, const float* up, float* out, int n, cudaStream
     k_gated_f32<true><<<(n + 255) / 256, 256, 0, stream>>>(gate, up, out, n);
 }
 
+__global__ void k_gemma_ple_gate(const float* gate, const float* inputs, float* out,
+                                 int count, int width, int stride, int offset) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < count) {
+        const float x = gate[i];
+        const float gelu = (0.5f * x) * (1.0f + tanhf(0.7978845608028654f * x * (1.0f + 0.044715f * x * x)));
+        out[i] = gelu * inputs[(i / width) * stride + offset + i % width];
+    }
+}
+
+void gemma_ple_gate_f32(const float* gate, const float* inputs, float* out,
+                       int rows, int width, int input_stride, int input_offset, cudaStream_t stream) {
+    const int count = rows * width;
+    k_gemma_ple_gate<<<(count + 255) / 256, 256, 0, stream>>>(
+        gate, inputs, out, count, width, input_stride, input_offset);
+}
+
 void geglu_interleaved_f32(const float* gate_up, float* out, int rows, int inter_dim, cudaStream_t stream) {
     const int total = rows * inter_dim;
     k_gated_interleaved_f32<true><<<(total + 255) / 256, 256, 0, stream>>>(gate_up, out, rows, inter_dim);

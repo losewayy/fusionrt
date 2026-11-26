@@ -271,6 +271,32 @@ void test_quant_and_io() {
     if (!tok.load_from_gguf(gf)) throw std::runtime_error("Tokenizer load from GGUF failed");
     auto ids = tok.encode("hello", true);
     if (ids.empty() || ids[0] != 1) throw std::runtime_error("Tokenizer BOS check failed");
+    {
+        const auto path = (tmp_dir / "fusionrt_gemma4_vocab.gguf").string();
+        const std::string space = "\xe2\x96\x81";
+        const std::map<std::string, GgufMetaValue> gemma{
+            {"tokenizer.ggml.model", std::string("gemma4")},
+            {"tokenizer.ggml.tokens", std::vector<std::string>{
+                "<pad>", "<bos>", "<unk>", "<|turn>", "<turn|>", "\n", "\n\n", "a", "b", space, space + "b", "<0x09>"}},
+            {"tokenizer.ggml.merges", std::vector<std::string>{space + " b"}},
+            {"tokenizer.ggml.bos_token_id", uint32_t{1}},
+            {"tokenizer.ggml.eos_token_id", uint32_t{4}},
+            {"tokenizer.ggml.unknown_token_id", uint32_t{2}},
+            {"tokenizer.ggml.add_bos_token", true}
+        };
+        GgufFile file;
+        BpeTokenizer tokenizer;
+        if (!GgufFile::write_v3(path, gemma, {{"test.weight", src}}, &err) ||
+            !file.load(path, &err) || !tokenizer.load_from_gguf(file)) throw std::runtime_error(err);
+        file = {};
+        std::filesystem::remove(path);
+        const std::vector<int32_t> expected{1, 7, 10, 6, 11};
+        if (tokenizer.encode("a b\n\n\t") != expected || tokenizer.decode(expected) != "a b\n\n\t" ||
+            !tokenizer.is_end_of_generation(4) ||
+            tokenizer.format_chat_messages({{"user", " a "}}) != "<|turn>user\na<turn|>\n<|turn>model\n") {
+            throw std::runtime_error("Gemma 4 metaspace BPE and turn format");
+        }
+    }
 
     // GPT-2 / Qwen byte-level BPE + special token regression test
     {
@@ -1128,7 +1154,7 @@ void test_cuda_gemma_epilogues(CudaContext& ctx) {
 }
 
 void test_cuda_gemma4_gguf() {
-    constexpr int layers = 4, hidden = 64, vocab = 64, nq = 4, window = 32, seq = 136;
+    constexpr int layers = 4, hidden = 64, vocab = 64, nq = 4, window = 32, seq = 136, ple = 64;
     constexpr float cap = 0.5f;
     struct Fixture {
         std::filesystem::path path = "test-gemma4.gguf";
@@ -1140,25 +1166,40 @@ void test_cuda_gemma4_gguf() {
         {"general.architecture", std::string("gemma4")}, {"gemma4.block_count", uint32_t{layers}},
         {"gemma4.embedding_length", uint32_t{hidden}}, {"gemma4.attention.head_count", uint32_t{nq}},
         {"gemma4.attention.head_count_kv", std::vector<uint32_t>{2, 1, 0, 0}},
-        {"gemma4.attention.key_length", uint32_t{512}}, {"gemma4.attention.key_length_swa", uint32_t{64}},
+        {"gemma4.attention.key_length", uint32_t{512}}, {"gemma4.attention.key_length_swa", uint32_t{256}},
         {"gemma4.attention.sliding_window", uint32_t{window}},
         {"gemma4.attention.sliding_window_pattern", swa}, {"gemma4.attention.shared_kv_layers", uint32_t{2}},
         {"gemma4.rope.freq_base", 1000000.0f}, {"gemma4.rope.freq_base_swa", 10000.0f},
         {"gemma4.feed_forward_length", ff}, {"gemma4.final_logit_softcapping", cap},
-        {"gemma4.embedding_length_per_layer_input", uint32_t{0}}
+        {"gemma4.embedding_length_per_layer_input", uint32_t{ple}}
     };
 
     std::mt19937_64 rng(391);
     auto output_factors = make_ones_f32({256});
     output_factors.data<float>()[255] = 1.0e9f;
+    HostTensor ple_tokens({vocab, layers * ple}, DType::Q5_K);
+    for (int id = 0; id < vocab; ++id) {
+        auto& block = ple_tokens.data<BlockQ5_K>()[id];
+        block.d = fp32_to_fp16(0.00004f);
+        block.dmin = fp32_to_fp16(0.0003f);
+        for (auto& x : block.scales) x = static_cast<uint8_t>(rng());
+        for (auto& x : block.qh) x = static_cast<uint8_t>(rng());
+        for (auto& x : block.qs) x = static_cast<uint8_t>(rng());
+    }
+    HostTensor ple_model({layers * ple, hidden}, DType::BF16);
+    const auto source = rand_f32({layers * ple, hidden}, rng, 0.035f);
+    convert_f32_to_bf16(source.data<float>(), ple_model.data<uint16_t>(), source.desc.numel());
     std::vector<std::pair<std::string, HostTensor>> weights{
         {"token_embd.weight", rand_f32({vocab, hidden}, rng, 0.1f)},
         {"output_norm.weight", make_ones_f32({hidden})},
-        {"rope_freqs.weight", std::move(output_factors)}
+        {"rope_freqs.weight", std::move(output_factors)},
+        {"per_layer_token_embd.weight", std::move(ple_tokens)},
+        {"per_layer_model_proj.weight", std::move(ple_model)},
+        {"per_layer_proj_norm.weight", make_ones_f32({ple})}
     };
     for (int i = 0; i < layers; ++i) {
         const std::string p = "blk." + std::to_string(i) + ".";
-        const int hd = swa[i] ? 64 : 512, kv_heads = swa[i] ? 2 : 1;
+        const int hd = swa[i] ? 256 : 512, kv_heads = swa[i] ? 2 : 1;
         const int width = static_cast<int>(ff[i]);
         auto matrix = [&](const char* name, int r, int c) {
             weights.emplace_back(p + name, rand_f32({r, c}, rng, 0.035f));
@@ -1183,6 +1224,9 @@ void test_cuda_gemma4_gguf() {
         matrix("ffn_up.weight", width, hidden);
         matrix("ffn_down.weight", hidden, width);
         norm("post_ffw_norm.weight", hidden, 0.25f);
+        matrix("inp_gate.weight", ple, hidden);
+        matrix("proj.weight", hidden, ple);
+        norm("post_norm.weight", hidden, 0.13f);
         norm("layer_output_scale.weight", 1, 0.9f);
     }
     CudaContext ctx(0, 0, 64);
@@ -1194,23 +1238,29 @@ void test_cuda_gemma4_gguf() {
     }
     const auto& loaded = model.dense_layers();
     if (model.config().embed_scale != 8.0f || model.config().final_logit_softcapping != cap ||
-        loaded.size() != layers || loaded[0].sliding_window != window || loaded[0].rope_factors.data ||
+        loaded.size() != layers || loaded[0].cfg.head_dim != 256 ||
+        loaded[0].sliding_window != window || loaded[0].rope_factors.data ||
         loaded[1].cfg.head_dim != 512 || loaded[1].v_proj.data || !loaded[1].rope_factors.data ||
         loaded[2].kv_source_layer != 0 || loaded[3].kv_source_layer != 1 ||
-        loaded[2].k_proj.data || loaded[3].v_proj.data || !loaded[3].ffn_post_norm_w.data) {
+        loaded[2].k_proj.data || loaded[3].v_proj.data || !loaded[3].ffn_post_norm_w.data ||
+        !loaded[3].ple_gate.data || !loaded[3].ple_post_norm.data || loaded[3].output_scale != 0.9f) {
         throw std::runtime_error("Gemma 4 GGUF layer wiring");
     }
 
     std::vector<int32_t> prompt(seq);
     for (auto& token : prompt) token = static_cast<int32_t>(rng() % vocab);
-    const auto batched = model.forward_prefill_cuda(ctx, prompt, 0);
-    const size_t expected_kv_bytes = 2 * 2 * kKvPageTokens * (2 * 64 + 512) * sizeof(float);
+    const int prefill_batch = ctx.prefill_batch();
+    // Small chunks keep the BF16 projection on the FP32-input GEMV path.
+    ctx.set_prefill_batch(8);
+    const auto batched = model.forward_prefill_cuda(ctx, prompt, 0, false);
+    ctx.set_prefill_batch(prefill_batch);
+    const size_t expected_kv_bytes = 2 * 2 * kKvPageTokens * (2 * 256 + 512) * sizeof(float);
     if (model.cuda_cache_memory().kv_bytes != expected_kv_bytes) {
         throw std::runtime_error("Gemma 4 shared layers allocated their own KV pages");
     }
     model.reset_kv_and_state(ctx);
     std::vector<float> sequential;
-    for (int i = 0; i < seq; ++i) sequential = model.forward_token_cuda(ctx, prompt[i], i);
+    for (int i = 0; i < seq; ++i) sequential = model.forward_token_cuda(ctx, prompt[i], i, false);
     double squared_error = 0.0, squared_ref = 0.0;
     for (int i = 0; i < vocab; ++i) {
         const double diff = batched[i] - sequential[i];
@@ -1220,6 +1270,10 @@ void test_cuda_gemma4_gguf() {
     }
     const double rel_l2 = std::sqrt(squared_error / squared_ref);
     if (!(rel_l2 < 1e-5)) throw std::runtime_error("Gemma 4 batched/sequential rel_l2: " + std::to_string(rel_l2));
+    model.reset_kv_and_state(ctx);
+    const auto optimized = model.forward_prefill_cuda(ctx, prompt, 0);
+    // Batched cuBLAS uses FP16 activations for the BF16 PLE projection.
+    expect_close(optimized, {batched.begin(), batched.end()}, 3e-4, 3e-4, "Gemma 4 optimized prefill");
 
     const auto eager = model.generate_cuda(ctx, prompt, 16, true, false);
     const auto graph = model.generate_cuda(ctx, prompt, 16, true, true);

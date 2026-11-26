@@ -285,7 +285,7 @@ bool BpeTokenizer::load_from_gguf(const GgufFile& gguf) {
         token_to_id_[t] = static_cast<int32_t>(i);
         if ((t.size() >= 5 && t.rfind("<|", 0) == 0 && t.substr(t.size() - 2) == "|>") ||
             t == "<think>" || t == "</think>" || t == "<bos>" || t == "<eos>" || t == "<s>" || t == "</s>" ||
-            t == "<start_of_turn>" || t == "<end_of_turn>" ||
+            t == "<start_of_turn>" || t == "<end_of_turn>" || t == "<|turn>" || t == "<turn|>" ||
             (i < token_types_.size() && (token_types_[i] == 3 || token_types_[i] == 4) && !t.empty())) {
             special_tokens_.push_back(t);
         }
@@ -294,6 +294,7 @@ bool BpeTokenizer::load_from_gguf(const GgufFile& gguf) {
               [](const std::string& a, const std::string& b) { return a.size() > b.size(); });
 
     std::string tok_model = gguf.get_string("tokenizer.ggml.model", "");
+    if (tok_model == "gemma4") pretokenizer_ = "gemma4";
     gpt2_byte_bpe_ = (tok_model == "gpt2");
     sentencepiece_ = tok_model == "llama" || tok_model == "spm";
     add_space_prefix_ = gguf.get_bool("tokenizer.ggml.add_space_prefix", sentencepiece_);
@@ -305,7 +306,7 @@ bool BpeTokenizer::load_from_gguf(const GgufFile& gguf) {
         const auto id = gguf.get_int(std::string("tokenizer.ggml.") + key, -1);
         if (id >= 0 && id < vocab_size()) end_ids_.push_back(static_cast<int32_t>(id));
     }
-    for (const char* marker : {"<|im_end|>", "<|eot_id|>", "<|eom_id|>", "<end_of_turn>", "<|end|>"}) {
+    for (const char* marker : {"<|im_end|>", "<|eot_id|>", "<|eom_id|>", "<end_of_turn>", "<turn|>", "<|end|>"}) {
         if (auto it = token_to_id_.find(marker); it != token_to_id_.end()) end_ids_.push_back(it->second);
     }
     add_bos_default_ = gguf.get_bool("tokenizer.ggml.add_bos_token", !gpt2_byte_bpe_ || pretokenizer_ == "llama-bpe");
@@ -421,6 +422,14 @@ std::vector<int32_t> BpeTokenizer::encode(const std::string& text, bool add_bos)
         return ids;
     }
 
+    auto encode_bytes = [&](std::string_view text_bytes) {
+        for (unsigned char ch : text_bytes) {
+            char hex[7];
+            std::snprintf(hex, sizeof(hex), "<0x%02X>", static_cast<unsigned>(ch));
+            const auto it = token_to_id_.find(hex);
+            ids.push_back(it == token_to_id_.end() ? unk_id_ : it->second);
+        }
+    };
     auto bpe_encode_symbols = [&](std::vector<std::string> syms) {
         while (syms.size() >= 2) {
             int best_rank = std::numeric_limits<int>::max();
@@ -441,6 +450,8 @@ std::vector<int32_t> BpeTokenizer::encode(const std::string& text, bool add_bos)
             auto it = token_to_id_.find(s);
             if (it != token_to_id_.end()) {
                 ids.push_back(it->second);
+            } else if (pretokenizer_ == "gemma4") {
+                encode_bytes(s);
             } else {
                 for (const auto& ch : split_utf8_chars(s)) {
                     auto bit = token_to_id_.find(ch);
@@ -475,6 +486,25 @@ std::vector<int32_t> BpeTokenizer::encode(const std::string& text, bool add_bos)
                 }
                 bpe_encode_symbols(std::move(syms));
             }
+        } else if (pretokenizer_ == "gemma4") {
+            for (size_t start = 0; start < seg.size();) {
+                const bool newline = seg[start] == '\n';
+                size_t end = start + 1;
+                while (end < seg.size() && (seg[end] == '\n') == newline) ++end;
+                const auto chunk = seg.substr(start, end - start);
+                const auto whole = newline ? token_to_id_.find(chunk) : token_to_id_.end();
+                if (whole != token_to_id_.end()) {
+                    ids.push_back(whole->second);
+                } else {
+                    std::string normalized;
+                    for (char c : chunk) {
+                        if (c == ' ') normalized += "\xe2\x96\x81";
+                        else normalized += c;
+                    }
+                    bpe_encode_symbols(split_utf8_chars(normalized));
+                }
+                start = end;
+            }
         } else if (sentencepiece_) {
             std::string normalized;
             if (add_space_prefix_ && (ids.empty() || (ids.size() == 1 && ids[0] == bos_id_))) {
@@ -505,12 +535,7 @@ std::vector<int32_t> BpeTokenizer::encode(const std::string& text, bool add_bos)
                     ids.push_back(it->second);
                     continue;
                 }
-                for (unsigned char ch : sym) {
-                    char hex[7];
-                    std::snprintf(hex, sizeof(hex), "<0x%02X>", static_cast<unsigned int>(ch));
-                    auto it = token_to_id_.find(hex);
-                    ids.push_back(it == token_to_id_.end() ? unk_id_ : it->second);
-                }
+                encode_bytes(sym);
             }
         } else {
             std::vector<std::string> syms;
@@ -551,7 +576,7 @@ std::string BpeTokenizer::decode_token(int32_t id) const {
     if (id < 0 || id >= vocab_size()) return "";
     if (id == bos_id_ || is_end_of_generation(id)) return "";
     const std::string& tok = id_to_token_[static_cast<size_t>(id)];
-    if (sentencepiece_) {
+    if (sentencepiece_ || pretokenizer_ == "gemma4") {
         if (tok.size() == 6 && tok.starts_with("<0x") && tok.back() == '>') {
             const int hi = hex_digit(tok[3]), lo = hex_digit(tok[4]);
             if (hi >= 0 && lo >= 0) return std::string(1, static_cast<char>(hi * 16 + lo));
@@ -592,6 +617,8 @@ bool BpeTokenizer::is_end_of_generation(int32_t id) const {
 }
 
 ChatFormat BpeTokenizer::chat_format() const {
+    if (pretokenizer_ == "gemma4" && token_to_id_.contains("<|turn>") && token_to_id_.contains("<turn|>"))
+        return ChatFormat::turn;
     const bool has_known_template = chat_template_.find("<|im_start|>") != std::string::npos ||
                                     chat_template_.find("<|start_header_id|>") != std::string::npos ||
                                     chat_template_.find("<start_of_turn>") != std::string::npos;
@@ -638,6 +665,14 @@ std::string BpeTokenizer::format_chat_messages(const std::vector<ChatMessage>& m
         }
         if (add_generation_prompt) out += header("assistant");
     } else if (format == ChatFormat::turn) {
+        if (pretokenizer_ == "gemma4") {
+            for (const auto& msg : msgs) {
+                out += std::string("<|turn>") + (msg.role == "assistant" ? "model" : msg.role) +
+                       "\n" + trim_chat(msg.content) + "<turn|>\n";
+            }
+            if (add_generation_prompt) out += "<|turn>model\n";
+            return out;
+        }
         std::string system;
         for (const auto& msg : msgs) {
             if (msg.role == "system") {

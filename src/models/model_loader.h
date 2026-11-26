@@ -14,6 +14,7 @@ struct LoadedLayerRaw {
     float rope_theta = 0.0f;
     float output_scale = 1.0f;
     HostTensor attn_post_norm, ffn_post_norm;
+    HostTensor ple_gate, ple_projection, ple_post_norm;
     // Dense
     HostTensor attn_norm, q_proj, k_proj, v_proj, qkv_proj, q_norm, k_norm, o_proj, mlp_norm, gate_up, gate, up, down;
     HostTensor q_bias, k_bias, v_bias;
@@ -30,6 +31,7 @@ struct LoadedModelRaw {
     HostTensor final_norm_w;
     HostTensor lm_head_w;
     HostTensor rope_factors;
+    GemmaLayerInputWeights<HostTensor> gemma_inputs;
     std::vector<LoadedLayerRaw> layers;
 };
 

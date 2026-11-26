@@ -7,6 +7,7 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <limits>
 #include <sstream>
 #include <stdexcept>
 #include <string_view>
@@ -205,15 +206,6 @@ bool parse_gguf_model_raw(const std::string& path, int max_seq_override, LoadedM
             if (err) *err = "Gemma 4 expert layers are unsupported";
             return false;
         }
-        const bool has_ple = get_arch_int("embedding_length_per_layer_input", 0) > 0 ||
-            std::any_of(gf.tensors().begin(), gf.tensors().end(), [](const GgufTensorInfo& t) {
-                return t.name.starts_with("per_layer_") || t.name.find(".per_layer_") != std::string::npos ||
-                    t.name.ends_with(".inp_gate.weight");
-            });
-        if (has_ple) {
-            if (err) *err = "Gemma 4 per-layer inputs (PLE) are unsupported";
-            return false;
-        }
         const bool multimodal = std::any_of(gf.tensors().begin(), gf.tensors().end(), [](const GgufTensorInfo& t) {
             return t.name.starts_with("v.") || t.name.starts_with("a.") || t.name.starts_with("mm.") ||
                 t.name.starts_with("vision.") || t.name.starts_with("vision_") || t.name.starts_with("audio.");
@@ -357,6 +349,19 @@ bool parse_gguf_model_raw(const std::string& path, int max_seq_override, LoadedM
     };
 
     try {
+        const int64_t ple = gemma4 ? get_arch_int("embedding_length_per_layer_input", 0) : 0;
+        if (ple < 0 || ple > std::numeric_limits<int>::max() / num_layers)
+            throw std::runtime_error("Invalid Gemma 4 per-layer input width");
+        if (ple > 0) {
+            auto& weights = out.gemma_inputs;
+            weights.token_embeddings = req("per_layer_token_embd.weight");
+            weights.projection = req("per_layer_model_proj.weight");
+            weights.norm = to_f32_host(req("per_layer_proj_norm.weight"));
+            const int64_t width = ple * num_layers;
+            if (!matrix(weights.token_embeddings, emb_vocab, width) || !matrix(weights.projection, width, H) ||
+                weights.norm.desc.ndim != 1 || weights.norm.desc.shape[0] != ple)
+                throw std::runtime_error("Invalid Gemma 4 per-layer input weights");
+        }
         const int window = gemma4 ? static_cast<int>(get_arch_int("attention.sliding_window", 0)) : 0;
         const int shared_kv = gemma4 ? static_cast<int>(get_arch_int("attention.shared_kv_layers", 0)) : 0;
         const int swa_hd = gemma4 ? static_cast<int>(get_arch_int("attention.key_length_swa", hd)) : hd;
@@ -557,6 +562,13 @@ bool parse_gguf_model_raw(const std::string& path, int max_seq_override, LoadedM
                     if (gf.find_tensor(p + "layer_output_scale.weight")) {
                         L.output_scale = norm("layer_output_scale.weight", 1).data<float>()[0];
                         if (!std::isfinite(L.output_scale)) throw std::runtime_error("Invalid Gemma 4 output scale: " + p);
+                    }
+                    if (ple > 0) {
+                        L.ple_gate = req(p + "inp_gate.weight");
+                        L.ple_projection = req(p + "proj.weight");
+                        L.ple_post_norm = norm("post_norm.weight", H);
+                        if (!matrix(L.ple_gate, ple, H) || !matrix(L.ple_projection, H, ple))
+                            throw std::runtime_error("Invalid Gemma 4 per-layer projection shapes: " + p);
                     }
                 }
                 const bool owns_kv = L.kv_source_layer < 0;

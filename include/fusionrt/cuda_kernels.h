@@ -36,6 +36,8 @@ void kv_append_f32(const float* k_in, const float* v_in,
                    cudaStream_t stream);
 
 void scale_f32(float* x, int n, float scale, cudaStream_t stream);
+void gemma_ple_gate_f32(const float* gate, const float* inputs, float* out,
+                       int rows, int width, int input_stride, int input_offset, cudaStream_t stream);
 void softcap_f32(float* x, int n, float cap, cudaStream_t stream);
 void geglu_f32(const float* gate, const float* up, float* out, int n, cudaStream_t stream);
 void geglu_interleaved_f32(const float* gate_up, float* out, int rows, int inter_dim, cudaStream_t stream);

@@ -429,6 +429,7 @@ void upload_projections(CudaContext& ctx, CudaArena& arena, const std::array<con
 }  // namespace
 
 void FusionModel::init_synthetic(CudaContext& ctx, uint64_t seed) {
+    gemma_inputs_ = {};
     release_cuda_sessions();
     std::mt19937_64 rng(seed);
     int H = (cfg_.arch == "hybrid") ? cfg_.gdn.hidden_size
@@ -558,6 +559,7 @@ void FusionModel::init_synthetic(CudaContext& ctx, uint64_t seed) {
 static bool upload_raw_model_to_cuda(CudaContext& ctx, CudaArena& arena, LoadedModelRaw& raw, int resident_experts,
                                      HybridModelConfig& cfg_out,
                                      Tensor& tok_emb, Tensor& final_norm, Tensor& lm_head,
+                                     GemmaLayerInputWeights<Tensor>& gemma_inputs,
                                      Tensor& hidden_buf, Tensor& logits_buf,
                                      Tensor& tok_id_dev, Tensor& pos_dev, Tensor& kv_len_dev,
                                      std::vector<int>& layer_kinds, std::vector<size_t>& layer_indices,
@@ -572,6 +574,12 @@ static bool upload_raw_model_to_cuda(CudaContext& ctx, CudaArena& arena, LoadedM
                     upload_cuda_weight(ctx, arena, raw.tok_embeddings);
     final_norm = upload_cuda_weight(ctx, arena, raw.final_norm_w);
     lm_head = tied ? tok_emb : upload_cuda_matrix(ctx, arena, raw.lm_head_w, true);
+    gemma_inputs = {};
+    if (!raw.gemma_inputs.token_embeddings.bytes().empty()) {
+        gemma_inputs.token_embeddings = upload_cuda_weight(ctx, arena, raw.gemma_inputs.token_embeddings);
+        gemma_inputs.projection = upload_cuda_matrix(ctx, arena, raw.gemma_inputs.projection);
+        gemma_inputs.norm = upload_cuda_weight(ctx, arena, raw.gemma_inputs.norm);
+    }
     cfg_out.dense.weight_dtype = lm_head.dtype;
     hidden_buf = arena.alloc_tensor({H}, DType::F32, "hidden_buf");
     logits_buf = arena.alloc_tensor({cfg_out.vocab_size}, DType::F32, "logits_buf");
@@ -647,6 +655,11 @@ static bool upload_raw_model_to_cuda(CudaContext& ctx, CudaArena& arena, LoadedM
             L.attn_norm_w = upload_cuda_weight(ctx, arena, lr.attn_norm);
             if (!lr.attn_post_norm.bytes().empty()) L.attn_post_norm_w = upload_cuda_weight(ctx, arena, lr.attn_post_norm);
             if (!lr.ffn_post_norm.bytes().empty()) L.ffn_post_norm_w = upload_cuda_weight(ctx, arena, lr.ffn_post_norm);
+            if (!lr.ple_gate.bytes().empty()) {
+                L.ple_gate = upload_cuda_matrix(ctx, arena, lr.ple_gate);
+                L.ple_projection = upload_cuda_matrix(ctx, arena, lr.ple_projection);
+                L.ple_post_norm = upload_cuda_weight(ctx, arena, lr.ple_post_norm);
+            }
             if (L.kv_source_layer >= 0) {
                 L.q_proj = upload_cuda_matrix(ctx, arena, lr.q_proj);
             } else if (lr.v_proj.bytes().empty()) {
@@ -719,7 +732,8 @@ static size_t cuda_model_arena_bytes(const LoadedModelRaw& raw, const CostHardwa
     };
     if (raw.lm_head_w.bytes().empty()) weight(raw.tok_embeddings, true);
     else reserve(raw.tok_embeddings.bytes().size());
-    for (const auto* t : {&raw.final_norm_w, &raw.rope_factors}) weight(*t);
+    reserve(raw.gemma_inputs.token_embeddings.bytes().size());
+    for (const auto* t : {&raw.final_norm_w, &raw.rope_factors, &raw.gemma_inputs.projection, &raw.gemma_inputs.norm}) weight(*t);
     weight(raw.lm_head_w, true);
     const auto& d = raw.cfg.dense;
     reserve(sizeof(float) * static_cast<size_t>(d.hidden_size));
@@ -731,6 +745,7 @@ static size_t cuda_model_arena_bytes(const LoadedModelRaw& raw, const CostHardwa
         for (const auto* t : {&l.attn_norm, &l.q_proj, &l.k_proj, &l.v_proj, &l.q_norm, &l.k_norm,
                              &l.q_bias, &l.k_bias, &l.v_bias, &l.o_proj, &l.mlp_norm, &l.gate_up,
                              &l.attn_post_norm, &l.ffn_post_norm,
+                             &l.ple_gate, &l.ple_projection, &l.ple_post_norm,
                              &l.gate, &l.up, &l.down, &l.z_proj, &l.a_proj, &l.b_proj,
                              &l.conv_w, &l.conv_bias, &l.A_log, &l.dt_bias, &l.gdn_norm_w,
                              &l.router_w, &l.shared_gate_up, &l.shared_down}) {
@@ -860,7 +875,7 @@ bool FusionModel::load_gguf(CudaContext& ctx, const std::string& path, std::stri
         else weights.reset();
         if (!own_weights) owned_gguf_arena_ = &ctx;
     }
-    if (!upload_raw_model_to_cuda(ctx, weights, raw, resident, cfg_, tok_embeddings_, final_norm_w_, lm_head_w_,
+    if (!upload_raw_model_to_cuda(ctx, weights, raw, resident, cfg_, tok_embeddings_, final_norm_w_, lm_head_w_, gemma_inputs_,
                                     cuda_workspace_.hidden, cuda_workspace_.logits, cuda_workspace_.token_ids, cuda_workspace_.position, cuda_workspace_.kv_length,
                                     layer_kinds_, layer_indices_, dense_layers_, gdn_layers_, moe_layers_)) {
         return false;
@@ -877,7 +892,7 @@ bool FusionModel::load_safetensors(CudaContext& ctx, const std::string& path, st
     release_cuda_sessions();
     const int resident = place_cuda_experts(ctx, raw, moe_gpu_experts_override_,
                                            cuda_kv_pool_.vram_budget_bytes(), num_slots(), false);
-    if (!upload_raw_model_to_cuda(ctx, ctx.weight_arena(), raw, resident, cfg_, tok_embeddings_, final_norm_w_, lm_head_w_,
+    if (!upload_raw_model_to_cuda(ctx, ctx.weight_arena(), raw, resident, cfg_, tok_embeddings_, final_norm_w_, lm_head_w_, gemma_inputs_,
                                     cuda_workspace_.hidden, cuda_workspace_.logits, cuda_workspace_.token_ids, cuda_workspace_.position, cuda_workspace_.kv_length,
                                     layer_kinds_, layer_indices_, dense_layers_, gdn_layers_, moe_layers_)) {
         return false;
@@ -1115,6 +1130,7 @@ static OpTiming operator_work(const IRNode& node, int rows, int pos, const CudaC
             work.bytes = 3 * f32 * m * n;
             work.flops = m * n;
             break;
+        case OpKind::GEMMA_PLE_GATE:
         case OpKind::GEGLU_INTERLEAVED:
         case OpKind::SWIGLU_INTERLEAVED:
             work.bytes = 3 * f32 * m * n;
@@ -1185,7 +1201,7 @@ static OpTiming operator_work(const IRNode& node, int rows, int pos, const CudaC
 template<bool Observe = false>
 static void execute_ir_graph_cuda(
     const MiniGraph& g, CudaIRWorkspace& ws, CudaContext& ctx,
-    const Tensor& x_input, Tensor& logits_buf,
+    const Tensor& x_input, const Tensor& token_ids, Tensor& logits_buf,
     int M, int pos_host, int start_pos,
     const int* pos_dev, const int* kv_len_dev,
     const std::vector<CudaDenseGQALayer>& dense_layers,
@@ -1198,6 +1214,26 @@ static void execute_ir_graph_cuda(
     int H = g.hidden_size;
     int num_nodes = static_cast<int>(g.nodes.size());
     const auto& last_use = ws.last_use;
+
+    Tensor ple;
+    if (const auto* embedding = g.gemma_inputs.token_embeddings) {
+        const int width = static_cast<int>(g.gemma_inputs.norm->shape[0]);
+        const int cols = static_cast<int>(embedding->shape[1]);
+        ple = cuda_scratch(ctx, {M, cols});
+        const auto ple_mark = ctx.scratch_arena().mark();
+        auto projected = cuda_scratch(ctx, {M, cols});
+        auto normalized = cuda_scratch(ctx, {M, cols});
+        dispatch_linear(ctx, x_input.ptr<float>(), *g.gemma_inputs.projection, projected.ptr<float>(), M, cols, H, use_fused);
+        // Absorb the 1/sqrt(H) projection scale into the RMSNorm epsilon.
+        cuda_ops::rmsnorm_f32(projected.ptr<float>(), g.gemma_inputs.norm->ptr<float>(), normalized.ptr<float>(),
+                              M * cols / width, width, g.gemma_input_eps * H, ctx.stream());
+        cuda_ops::embed_lookup_f32(embedding->ptr(), embedding->dtype, token_ids.ptr<int32_t>(),
+                                  ple.ptr<float>(), M, cols, ctx.stream());
+        cuda_ops::scale_f32(ple.ptr<float>(), M * cols, std::sqrt(static_cast<float>(width)), ctx.stream());
+        cuda_ops::add_residual_f32(ple.ptr<float>(), normalized.ptr<float>(), ple.ptr<float>(), M * cols, ctx.stream());
+        cuda_ops::scale_f32(ple.ptr<float>(), M * cols, 0.7071067811865475f, ctx.stream());
+        ctx.scratch_arena().reset(ple_mark);
+    }
 
     std::array<Tensor, kPrefillCarrySlots> carry_bufs;
     std::array<int, kPrefillCarrySlots> carry_busy_until;
@@ -1489,6 +1525,14 @@ static void execute_ir_graph_cuda(
                 else run_gdn();
                 break;
             }
+            case OpKind::GEMMA_PLE_GATE: {
+                const int width = node.output_cols;
+                auto& out = get_out_buf(node.out, width, rows);
+                cuda_ops::gemma_ple_gate_f32(bufs[node.inputs[0]].ptr<float>(), ple.ptr<float>(),
+                    out.template ptr<float>(), rows, width, static_cast<int>(ple.shape[1]),
+                    node.layer_index * width, ctx.stream());
+                break;
+            }
             case OpKind::GEGLU_INTERLEAVED:
             case OpKind::SWIGLU_INTERLEAVED: {
                 Tensor& out_t = get_out_buf(node.out, node.output_cols, rows);
@@ -1659,10 +1703,10 @@ static void run_forward_token_step_cuda(
         int* p_dev = graph_mode ? pos_dev.ptr<int>() : nullptr;
         int* kl_dev = graph_mode ? kv_len_dev.ptr<int>() : nullptr;
         if (timer) {
-            execute_ir_graph_cuda<true>(ir, ws, ctx, hidden_buf, logits_buf, 1, pos, pos, p_dev, kl_dev,
+            execute_ir_graph_cuda<true>(ir, ws, ctx, hidden_buf, tok_id_dev, logits_buf, 1, pos, pos, p_dev, kl_dev,
                                         dense_layers, gdn_layers, kv_states, gdn_states, moe_layers, use_fused, trace, timer);
         } else {
-            execute_ir_graph_cuda(ir, ws, ctx, hidden_buf, logits_buf, 1, pos, pos, p_dev, kl_dev,
+            execute_ir_graph_cuda(ir, ws, ctx, hidden_buf, tok_id_dev, logits_buf, 1, pos, pos, p_dev, kl_dev,
                                   dense_layers, gdn_layers, kv_states, gdn_states, moe_layers, use_fused);
         }
         if (with_argmax) {
@@ -1740,7 +1784,10 @@ int FusionModel::prefill_batch_limit(CudaContext& ctx) const {
                                                               g.head_k_dim, g.head_v_dim));
         }
         const auto layer = std::max({dense, recurrent, 3 * cfg_.moe.intermediate_size * layer_rows});
-        const size_t live = ((kPrefillCarrySlots + 2) * d.hidden_size * layer_rows + layer) * sizeof(float);
+        const size_t ple = gemma_inputs_.token_embeddings.data ?
+            static_cast<size_t>(gemma_inputs_.token_embeddings.shape[1]) * layer_rows : 0;
+        const size_t live = std::max((kPrefillCarrySlots + 2) * d.hidden_size * layer_rows + layer + ple,
+                                    d.hidden_size * layer_rows + 3 * ple) * sizeof(float);
         if (live + 64 * 1024 <= available) break;
     }
     return rows;
@@ -1788,11 +1835,13 @@ ModelMemory FusionModel::inspect_cuda(CudaContext& ctx) {
             if (w->data && counted.insert(w->ptr()).second) result.weight_bytes[w->dtype] += w->nbytes();
         }
     };
-    count({&tok_embeddings_, &lm_head_w_, &final_norm_w_});
+    count({&tok_embeddings_, &lm_head_w_, &final_norm_w_, &gemma_inputs_.token_embeddings,
+           &gemma_inputs_.projection, &gemma_inputs_.norm});
     for (const auto& l : dense_layers_) {
         count({&l.attn_norm_w, &l.q_proj, &l.k_proj, &l.v_proj, &l.q_bias, &l.k_bias, &l.v_bias,
                &l.q_norm_w, &l.k_norm_w, &l.rope_factors, &l.o_proj, &l.mlp_norm_w,
-               &l.gate_up_proj, &l.gate_proj, &l.up_proj, &l.down_proj, &l.attn_post_norm_w, &l.ffn_post_norm_w});
+               &l.gate_up_proj, &l.gate_proj, &l.up_proj, &l.down_proj, &l.attn_post_norm_w, &l.ffn_post_norm_w,
+               &l.ple_gate, &l.ple_projection, &l.ple_post_norm});
     }
     for (const auto& l : gdn_layers_) {
         count({&l.attn_norm_w, &l.qkv_proj, &l.z_proj, &l.a_proj, &l.b_proj, &l.conv_w, &l.conv_bias,
@@ -1983,11 +2032,11 @@ void FusionModel::execute_prefill_chunks(CudaContext& ctx, const int32_t* token_
         embed_tokens(ctx, tok_embeddings_, ids, hidden, rows, H, cfg_.embed_scale);
         if (pa.enabled) pa.reset();
         if (layer_trace || op_trace) {
-            execute_ir_graph_cuda<true>(ir, ws, ctx, hidden, cuda_workspace_.logits, rows, position, position,
+            execute_ir_graph_cuda<true>(ir, ws, ctx, hidden, ids, cuda_workspace_.logits, rows, position, position,
                 nullptr, nullptr, dense_layers_, gdn_layers_, cuda_session().kv, cuda_session().gdn,
                 moe_layers_, use_fused, op_trace, timer.get(), last ? layer_trace : nullptr, last && compute_logits);
         } else {
-            execute_ir_graph_cuda(ir, ws, ctx, hidden, cuda_workspace_.logits, rows, position, position,
+            execute_ir_graph_cuda(ir, ws, ctx, hidden, ids, cuda_workspace_.logits, rows, position, position,
                 nullptr, nullptr, dense_layers_, gdn_layers_, cuda_session().kv, cuda_session().gdn,
                 moe_layers_, use_fused, nullptr, nullptr, nullptr, last && compute_logits);
         }
@@ -2044,7 +2093,7 @@ void FusionModel::verify_cuda(CudaContext& ctx, const std::vector<int32_t>& inpu
         ~RestoreCrossover() { ctx.set_mmq_crossover_m(rows); }
     } crossover{ctx, ctx.mmq_crossover_m()};
     ctx.set_mmq_crossover_m(2);
-    execute_ir_graph_cuda(ir, ws, ctx, hidden, batch_logits, rows, pos, pos, nullptr, nullptr,
+    execute_ir_graph_cuda(ir, ws, ctx, hidden, ids, batch_logits, rows, pos, pos, nullptr, nullptr,
                           dense_layers_, gdn_layers_, cuda_session().kv, cuda_session().gdn, moe_layers_,
                           use_fused, nullptr, nullptr, nullptr, true, true);
     if (retain_last_logits) {
@@ -2460,7 +2509,7 @@ std::vector<GenerationStats> FusionModel::bench_model_cuda(CudaContext& ctx, int
         auto decode = [&](int pos) {
             FUSIONRT_CUDA_CHECK(cudaMemcpyAsync(args.ptr(), host_args, args.nbytes(), cudaMemcpyHostToDevice, ctx.stream()));
             embed_tokens(ctx, tok_embeddings_, args, cuda_workspace_.hidden, 1, H, cfg_.embed_scale);
-            execute_ir_graph_cuda(ir, ws, ctx, cuda_workspace_.hidden, cuda_workspace_.logits, 1, pos, pos,
+            execute_ir_graph_cuda(ir, ws, ctx, cuda_workspace_.hidden, args, cuda_workspace_.logits, 1, pos, pos,
                                   use_graph ? args.ptr<int32_t>() + 1 : nullptr,
                                   use_graph ? args.ptr<int32_t>() + 2 : nullptr,
                                   dense_layers_, gdn_layers_, cuda_session().kv, cuda_session().gdn, moe_layers_, true);

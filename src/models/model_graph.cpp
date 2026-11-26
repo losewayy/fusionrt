@@ -145,9 +145,25 @@ int append_dense(MiniGraph& graph, int input, int index, const CudaDenseGQALayer
                          prefix + "attn_post_norm", prefix + "attn_post_norm");
     }
     const int next = residual(graph, input, projected, prefix + "h1", prefix + "add1");
-    return layer.moe_index >= 0 ? append_moe(graph, next, layer.moe_index, prefix)
-                                : append_ffn(graph, next, layer, prefix, &layer.ffn_post_norm_w,
-                                             layer.geglu, layer.output_scale);
+    if (layer.moe_index >= 0) return append_moe(graph, next, layer.moe_index, prefix);
+    if (!layer.ple_gate.data)
+        return append_ffn(graph, next, layer, prefix, &layer.ffn_post_norm_w, layer.geglu, layer.output_scale);
+
+    const int ffn = append_ffn(graph, next, layer, prefix, &layer.ffn_post_norm_w, layer.geglu);
+    const int gate = linear(graph, ffn, layer.ple_gate, prefix + "ple_gate");
+    IRNode gated;
+    gated.op = OpKind::GEMMA_PLE_GATE;
+    gated.inputs = {gate};
+    gated.output_cols = static_cast<int>(layer.ple_gate.shape[0]);
+    gated.out = graph.new_value(gated.output_cols, prefix + "ple_gate_out");
+    gated.layer_index = index;
+    gated.tag = prefix + "ple_gelu_mul";
+    const int activated = gated.out;
+    graph.add_node(std::move(gated));
+    int update = linear(graph, activated, layer.ple_projection, prefix + "ple_proj");
+    update = norm(graph, update, layer.ple_post_norm, graph.hidden_size, cfg.rms_norm_eps,
+                  prefix + "ple_post_norm", prefix + "ple_post_norm");
+    return residual(graph, ffn, update, prefix + "h2_ple", prefix + "ple_add", layer.output_scale);
 }
 
 int append_recurrent(MiniGraph& graph, int input, int index, const CudaGatedDeltaNetLayer& layer,
@@ -178,6 +194,10 @@ void FusionModel::rebuild_cuda_ir() {
     graph.hidden_size = static_cast<int>(lm_head_w_.shape[1]);
     graph.final_logit_softcapping = cfg_.final_logit_softcapping;
     if (cfg_.model_architecture == "gemma4") graph.decode_split_kv_heads = cfg_.dense.num_key_value_heads;
+    if (gemma_inputs_.token_embeddings.data) {
+        graph.gemma_inputs = {&gemma_inputs_.token_embeddings, &gemma_inputs_.projection, &gemma_inputs_.norm};
+        graph.gemma_input_eps = cfg_.dense.rms_norm_eps;
+    }
     graph.input_value = graph.new_value(graph.hidden_size, "hidden_in");
     int hidden = graph.input_value;
     for (size_t i = 0; i < layer_kinds_.size(); ++i) {
