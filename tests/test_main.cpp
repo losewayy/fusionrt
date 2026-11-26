@@ -681,6 +681,27 @@ void test_cuda_wave1_decode(CudaContext& ctx) {
     auto quantized = check_q8(qx, activation, "residual + RMSNorm + Q8_1");
     check_q8(qsw, swiglu, "SwiGLU + Q8_1");
 
+    {
+        constexpr int wide = 4096;
+        const auto wide_x = ctx.upload(rand_f32({2, wide}, rng), false);
+        const auto wide_res = ctx.upload(rand_f32({2, wide}, rng), false);
+        const auto wide_norm = ctx.upload(rand_f32({wide}, rng), false);
+        const auto output = arena.alloc_tensor({1, wide}, DType::Q8_1);
+        const auto reference = arena.alloc_tensor({2, wide}, DType::Q8_1);
+        const auto out_res = arena.alloc_tensor({1, wide}, DType::F32);
+        const auto ref_res = arena.alloc_tensor({2, wide}, DType::F32);
+        for (const float* add : std::array<const float*, 2>{nullptr, wide_res.ptr<float>()}) {
+            cuda_ops::quantize_x_q8_1(wide_x.ptr<float>(), add, wide_norm.ptr<float>(),
+                                     ref_res.ptr<float>(), reference.ptr(), 2, wide, eps, ctx.stream());
+            cuda_ops::quantize_x_q8_1(wide_x.ptr<float>(), add, wide_norm.ptr<float>(),
+                                     out_res.ptr<float>(), output.ptr(), 1, wide, eps, ctx.stream());
+            if (std::memcmp(ctx.download(output).storage.data(), ctx.download(reference).storage.data(), output.nbytes()) ||
+                std::memcmp(ctx.download(out_res).storage.data(), ctx.download(ref_res).storage.data(), out_res.nbytes())) {
+                throw std::runtime_error("Single-row Q8_1 RMSNorm changed quantized or residual values");
+            }
+        }
+    }
+
     auto check_gemv = [&]<typename W>(DType dtype, auto gemv, auto dequantize) {
         HostTensor w = HostTensor::create({N, K}, dtype);
         for (uint8_t& byte : w.storage) byte = static_cast<uint8_t>(rng());
@@ -808,7 +829,7 @@ void test_cuda_wave1_decode(CudaContext& ctx) {
 }
 
 void test_repacked_k_quants(CudaContext& ctx) {
-    constexpr int M = 64, N = 1025, K = 256;
+    constexpr int M = 129, N = 4097, K = 256;
     std::mt19937_64 rng(91);
     auto& arena = ctx.scratch_arena();
     const auto mark = arena.mark();

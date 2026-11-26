@@ -2079,6 +2079,64 @@ __device__ __forceinline__ void store_q8_1(float v, BlockQ8_1* out) {
     }
 }
 
+__device__ __forceinline__ void store_q8_1x4(float4 v, BlockQ8_1* out) {
+    const int lane = threadIdx.x & 31;
+    const unsigned group = 0xffu << (lane & ~7);
+    const int local = max(max(__float_as_int(fabsf(v.x)), __float_as_int(fabsf(v.y))),
+                          max(__float_as_int(fabsf(v.z)), __float_as_int(fabsf(v.w))));
+    const float amax = __int_as_float(__reduce_max_sync(group, local));
+    const float mul = amax > 0.0f ? __fdividef(127.0f, amax) : 0.0f;
+    const int x = __float2int_rn(v.x * mul), y = __float2int_rn(v.y * mul);
+    const int z = __float2int_rn(v.z * mul), w = __float2int_rn(v.w * mul);
+    out->qs[lane & 7] = (x & 255u) | ((y & 255u) << 8) | ((z & 255u) << 16) | ((w & 255u) << 24);
+    const int sum = __reduce_add_sync(0xfu << (lane & ~3), x + y + z + w);
+    const int hi = __shfl_sync(group, sum, (lane & ~7) + 4);
+    if ((lane & 7) == 0) {
+        const float d = amax * (1.0f / 127.0f);
+        *reinterpret_cast<float4*>(&out->d) = make_float4(d, d * sum, d * hi, d * (sum + hi));
+    }
+}
+
+template <int K, bool Add>
+__global__ void k_quantize_x_q8_1_decode(const float4* x, const float4* res_b, const float4* norm,
+                                        float4* res_out, BlockQ8_1* out, float eps) {
+    constexpr int threads = 256;
+    constexpr int vectors = K / (4 * threads);
+    __shared__ float reduce[32];
+    float4 residual[vectors];
+    float squares = 0.0f;
+    #pragma unroll
+    for (int i = 0; i < vectors; ++i) {
+        const int col = threadIdx.x + i * threads;
+        float4 v = x[col];
+        if constexpr (Add) {
+            const float4 r = res_b[col];
+            v.x += r.x;
+            v.y += r.y;
+            v.z += r.z;
+            v.w += r.w;
+        }
+        squares += v.x * v.x + v.y * v.y + v.z * v.z + v.w * v.w;
+        residual[i] = v;
+    }
+    const float inv_rms = rsqrtf(block_reduce_sum(squares, reduce) / K + eps);
+    #pragma unroll
+    for (int i = 0; i < vectors; ++i) {
+        const int col = threadIdx.x + i * threads;
+        float4 v = residual[i];
+        if constexpr (!Add) {
+            v.x += 0.0f;
+            v.y += 0.0f;
+            v.z += 0.0f;
+            v.w += 0.0f;
+        }
+        if (res_out) res_out[col] = v;
+        const float4 w = norm[col];
+        store_q8_1x4(make_float4(v.x * inv_rms * w.x, v.y * inv_rms * w.y,
+                                 v.z * inv_rms * w.z, v.w * inv_rms * w.w), out + col / 8);
+    }
+}
+
 template <int StaticK = 0>
 __global__ void k_quantize_x_q8_1(const float* x, const float* res_b, const float* norm_w,
                                   float* res_out, BlockQ8_1* out, int K, float eps) {
@@ -2466,15 +2524,17 @@ struct MmqBuffers {
     MmqTile<BN, BK, weight_words, split_scale || min_scale> ws[2];
 };
 
-template <typename W, int BM, int BN, int WN, int BK>
+template <typename W, int BM, int BN, int WN, int BK, int WM = BM / 16>
 __device__ __forceinline__ void mmq_q8_1_tile(const BlockQ8_1* __restrict__ x, const W* __restrict__ w,
     float* __restrict__ y, int M, int N, int K, int m0, int n0, MmqBuffers<W, BM, BN, BK>& storage) {
-    constexpr int WM = BM / 16;
+    constexpr int warps_n = BN / (WN * 8);
     constexpr bool split_scale = MmqBuffers<W, BM, BN, BK>::split_scale;
     constexpr bool min_scale = MmqBuffers<W, BM, BN, BK>::min_scale;
     auto& xs = storage.xs;
     auto& ws = storage.ws;
-    int warp_n = (threadIdx.x / 32) * (WN * 8);
+    int warp = threadIdx.x / 32;
+    int warp_n = (warp % warps_n) * (WN * 8);
+    int warp_m = (warp / warps_n) * (WM * 16);
     int lane = threadIdx.x % 32, group = lane / 4, word = lane % 4;
     float4 acc[WM][WN] = {};
 
@@ -2491,6 +2551,8 @@ __device__ __forceinline__ void mmq_q8_1_tile(const BlockQ8_1* __restrict__ x, c
 
         #pragma unroll
         for (int slot = 0; slot < BK; ++slot) {
+            uint2 weights[WN];
+            float2 scales[WN], other[WN];
             #pragma unroll
             for (int ni = 0; ni < WN; ++ni) {
                 int j = warp_n + ni * 8;
@@ -2524,20 +2586,34 @@ __device__ __forceinline__ void mmq_q8_1_tile(const BlockQ8_1* __restrict__ x, c
                 } else {
                     bv = mmq_load_b(b.qs[j + lane % 8] + slot * 8 + ((lane / 8) % 2) * 4);
                 }
-                float bx, by;
+                weights[ni] = bv;
                 if constexpr (std::is_same_v<W, BlockQ4_A>) {
                     int shift = (slot % 2) * 16;
-                    bx = half_bits_to_f32(static_cast<uint16_t>(__float_as_uint(b.scale[slot][j0]) >> shift));
-                    by = half_bits_to_f32(static_cast<uint16_t>(__float_as_uint(b.scale[slot][j1]) >> shift));
+                    scales[ni] = make_float2(
+                        half_bits_to_f32(static_cast<uint16_t>(__float_as_uint(b.scale[slot][j0]) >> shift)),
+                        half_bits_to_f32(static_cast<uint16_t>(__float_as_uint(b.scale[slot][j1]) >> shift)));
                 } else {
-                    bx = b.scale[slot][j0];
-                    by = b.scale[slot][j1];
+                    scales[ni] = make_float2(b.scale[slot][j0], b.scale[slot][j1]);
+                }
+                if constexpr (split_scale || min_scale) {
+                    other[ni] = make_float2(b.other[slot][j0], b.other[slot][j1]);
+                }
+            }
+            #pragma unroll
+            for (int mi = 0; mi < WM; ++mi) {
+                const int row = warp_m + mi * 16;
+                const int i0 = row + group, i1 = i0 + 8;
+                const uint4 av = mmq_load_a(a.qs[row + lane % 16] + slot * 8 + (lane / 16) * 4);
+                const float ax = a.scale[slot][i0], ay = a.scale[slot][i1];
+                float sx, sy;
+                if constexpr (min_scale) {
+                    sx = a.other[slot][i0];
+                    sy = a.other[slot][i1];
                 }
                 #pragma unroll
-                for (int mi = 0; mi < WM; ++mi) {
-                    int i0 = mi * 16 + group, i1 = i0 + 8;
-                    uint4 av = mmq_load_a(a.qs[mi * 16 + lane % 16] + slot * 8 + (lane / 16) * 4);
-                    float ax = a.scale[slot][i0], ay = a.scale[slot][i1];
+                for (int ni = 0; ni < WN; ++ni) {
+                    const uint2 bv = weights[ni];
+                    const float bx = scales[ni].x, by = scales[ni].y;
                     int4 c;
                     if constexpr (std::is_same_v<W, BlockQ6_A>) c = mma_s8_k16(av.x, av.y, bv.x);
                     else c = mma_s8(av.x, av.y, av.z, av.w, bv.x, split_scale ? 0u : bv.y);
@@ -2546,7 +2622,7 @@ __device__ __forceinline__ void mmq_q8_1_tile(const BlockQ8_1* __restrict__ x, c
                         int4 hi;
                         if constexpr (std::is_same_v<W, BlockQ6_A>) hi = mma_s8_k16(av.z, av.w, bv.y);
                         else hi = mma_s8(0, 0, av.z, av.w, 0, bv.y);
-                        float hx = b.other[slot][j0], hy = b.other[slot][j1];
+                        float hx = other[ni].x, hy = other[ni].y;
                         f.x = fmaf(ax, fmaf(hx, hi.x, bx * c.x), f.x);
                         f.y = fmaf(ax, fmaf(hy, hi.y, by * c.y), f.y);
                         f.z = fmaf(ay, fmaf(hx, hi.z, bx * c.z), f.z);
@@ -2557,8 +2633,7 @@ __device__ __forceinline__ void mmq_q8_1_tile(const BlockQ8_1* __restrict__ x, c
                         f.z = fmaf(ay * bx, c.z, f.z);
                         f.w = fmaf(ay * by, c.w, f.w);
                         if constexpr (min_scale) {
-                            float sx = a.other[slot][i0], sy = a.other[slot][i1];
-                            float dx = b.other[slot][j0], dy = b.other[slot][j1];
+                            float dx = other[ni].x, dy = other[ni].y;
                             f.x = fmaf(sx, dx, f.x);
                             f.y = fmaf(sx, dy, f.y);
                             f.z = fmaf(sy, dx, f.z);
@@ -2573,7 +2648,7 @@ __device__ __forceinline__ void mmq_q8_1_tile(const BlockQ8_1* __restrict__ x, c
     }
     #pragma unroll
     for (int mi = 0; mi < WM; ++mi) {
-        int i0 = m0 + mi * 16 + group, i1 = i0 + 8;
+        int i0 = m0 + warp_m + mi * 16 + group, i1 = i0 + 8;
         #pragma unroll
         for (int ni = 0; ni < WN; ++ni) {
             int j0 = n0 + warp_n + ni * 8 + word * 2, j1 = j0 + 1;
@@ -2586,16 +2661,16 @@ __device__ __forceinline__ void mmq_q8_1_tile(const BlockQ8_1* __restrict__ x, c
     }
 }
 
-template <typename W, int BM, int BN, int WN, int BK = 4>
+template <typename W, int BM, int BN, int WN, int BK = 4, int WM = BM / 16>
 __global__ void k_mmq_q8_1(const BlockQ8_1* x, const W* w, float* y, int M, int N, int K) {
     using Buffers = MmqBuffers<W, BM, BN, BK>;
     if constexpr (sizeof(Buffers) > 48 * 1024) {
         extern __shared__ __align__(16) unsigned char mmq_smem[];
         auto& storage = *reinterpret_cast<Buffers*>(mmq_smem);
-        mmq_q8_1_tile<W, BM, BN, WN, BK>(x, w, y, M, N, K, blockIdx.y * BM, blockIdx.x * BN, storage);
+        mmq_q8_1_tile<W, BM, BN, WN, BK, WM>(x, w, y, M, N, K, blockIdx.y * BM, blockIdx.x * BN, storage);
     } else {
         __shared__ Buffers storage;
-        mmq_q8_1_tile<W, BM, BN, WN, BK>(x, w, y, M, N, K, blockIdx.y * BM, blockIdx.x * BN, storage);
+        mmq_q8_1_tile<W, BM, BN, WN, BK, WM>(x, w, y, M, N, K, blockIdx.y * BM, blockIdx.x * BN, storage);
     }
 }
 
@@ -2617,23 +2692,33 @@ __global__ void k_mmq_q4_a_and_q8_a(const BlockQ8_1* x, const BlockQ4_A* w4, con
     }
 }
 
-template <typename W, int BM, int BN, int WN, int BK = 4>
+template <typename W, int BM, int BN, int WN, int BK = 4, int WM = BM / 16>
 void launch_mmq_tile(const BlockQ8_1* x, const W* w, float* y, int M, int N, int K, cudaStream_t stream) {
-    constexpr int threads = BN / (WN * 8) * 32;
+    constexpr int threads = (BM / (WM * 16)) * (BN / (WN * 8)) * 32;
     dim3 grid((N + BN - 1) / BN, (M + BM - 1) / BM);
     constexpr int bytes = sizeof(MmqBuffers<W, BM, BN, BK>);
     constexpr int dynamic_bytes = bytes > 48 * 1024 ? bytes : 0;
     if constexpr (dynamic_bytes > 0) {
         static thread_local int configured_device = -1;
+        static thread_local bool fits = false;
         int device = 0;
         FUSIONRT_CUDA_CHECK(cudaGetDevice(&device));
         if (configured_device != device) {
-            FUSIONRT_CUDA_CHECK(cudaFuncSetAttribute(k_mmq_q8_1<W, BM, BN, WN, BK>,
-                                                     cudaFuncAttributeMaxDynamicSharedMemorySize, dynamic_bytes));
+            int limit = 0;
+            FUSIONRT_CUDA_CHECK(cudaDeviceGetAttribute(&limit, cudaDevAttrMaxSharedMemoryPerBlockOptin, device));
+            fits = dynamic_bytes <= limit;
+            if (fits) {
+                FUSIONRT_CUDA_CHECK(cudaFuncSetAttribute(k_mmq_q8_1<W, BM, BN, WN, BK, WM>,
+                                                         cudaFuncAttributeMaxDynamicSharedMemorySize, dynamic_bytes));
+            }
             configured_device = device;
         }
+        if (!fits) {
+            launch_mmq_tile<W, 64, 64, 2, 4, 2>(x, w, y, M, N, K, stream);
+            return;
+        }
     }
-    k_mmq_q8_1<W, BM, BN, WN, BK><<<grid, threads, dynamic_bytes, stream>>>(x, w, y, M, N, K);
+    k_mmq_q8_1<W, BM, BN, WN, BK, WM><<<grid, threads, dynamic_bytes, stream>>>(x, w, y, M, N, K);
 }
 
 template <typename W>
@@ -2655,15 +2740,37 @@ void launch_mmq(const void* x, const void* w, float* y, int M, int N, int K, cud
             return;
         }
     }
-    if constexpr (std::is_same_v<W, BlockQ4_KA>) {
-        if (M >= 64 && (N >= 8192 || (M >= 256 && N >= 4096))) {
-            launch_mmq_tile<W, 64, 128, 2>(qx, qw, y, M, N, K, stream);
+    if constexpr (std::is_same_v<W, BlockQ4_KA> || std::is_same_v<W, BlockQ5_K>) {
+        // A narrower output tile gives short wide projections more CTAs.
+        if (M >= 128 && M < 256 && N >= 4096 && N <= 8192) {
+            launch_mmq_tile<W, 128, 96, 2, 4, 4>(qx, qw, y, M, N, K, stream);
+            return;
+        }
+        if ((std::is_same_v<W, BlockQ4_KA> && M >= 128 && N >= 4096) || (M >= 256 && N >= 1024)) {
+            launch_mmq_tile<W, 128, 128, 2, 4, 4>(qx, qw, y, M, N, K, stream);
+            return;
+        }
+        if (M >= 128 && N >= 2048) {
+            launch_mmq_tile<W, 128, 64, 2, 4, 2>(qx, qw, y, M, N, K, stream);
             return;
         }
     }
-    if constexpr (std::is_same_v<W, BlockQ4_KA> || std::is_same_v<W, BlockQ6_A>) {
+    if constexpr (std::is_same_v<W, BlockQ6_A>) {
+        if (M >= 256 && N >= 4096) {
+            launch_mmq_tile<W, 128, 64, 2, 4, 2>(qx, qw, y, M, N, K, stream);
+            return;
+        }
+    }
+    if constexpr (std::is_same_v<W, BlockQ4_KA> || std::is_same_v<W, BlockQ5_K> ||
+                  std::is_same_v<W, BlockQ6_A>) {
         if (M >= 64 && N >= 1024) {
-            launch_mmq_tile<W, 64, 64, 1>(qx, qw, y, M, N, K, stream);
+            launch_mmq_tile<W, 64, 64, 2, 4, 2>(qx, qw, y, M, N, K, stream);
+            return;
+        }
+    }
+    if constexpr (std::is_same_v<W, BlockQ8_A>) {
+        if (M >= 64 && N <= 128) {
+            launch_mmq_tile<W, 64, 64, 2, 8, 2>(qx, qw, y, M, N, K, stream);
             return;
         }
     }
@@ -4060,6 +4167,17 @@ void quantize_x_q8_1(const float* x, const float* res_b, const float* norm_w, fl
     auto* out = static_cast<BlockQ8_1*>(q8_out);
     if (M == 1 && !res_b && !norm_w && !res_out && K >= 1024) {
         k_quantize_vector_q8_1<<<(K + 127) / 128, 128, 0, stream>>>(x, out, K);
+        return;
+    }
+    const auto alignment = reinterpret_cast<uintptr_t>(x) | reinterpret_cast<uintptr_t>(res_b) |
+                           reinterpret_cast<uintptr_t>(norm_w) | reinterpret_cast<uintptr_t>(res_out);
+    if (M == 1 && K == 4096 && norm_w && (alignment & 15) == 0) {
+        const auto* x4 = reinterpret_cast<const float4*>(x);
+        const auto* n4 = reinterpret_cast<const float4*>(norm_w);
+        auto* r4 = reinterpret_cast<float4*>(res_out);
+        if (res_b) k_quantize_x_q8_1_decode<4096, true><<<1, 256, 0, stream>>>(
+            x4, reinterpret_cast<const float4*>(res_b), n4, r4, out, eps);
+        else k_quantize_x_q8_1_decode<4096, false><<<1, 256, 0, stream>>>(x4, nullptr, n4, r4, out, eps);
         return;
     }
     if (K == 1024) k_quantize_x_q8_1<1024><<<M, 256, 0, stream>>>(x, res_b, norm_w, res_out, out, K, eps);
