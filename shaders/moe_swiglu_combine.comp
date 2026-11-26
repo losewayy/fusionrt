@@ -1,0 +1,71 @@
+#version 450
+#extension GL_KHR_shader_subgroup_arithmetic : enable
+
+// Sparse MoE indexed gate_up SwiGLU + weighted down combine (mode=0: gate_up_swiglu, mode=1: down_combine)
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+
+layout(std430, binding = 0) readonly buffer InBuf { float in_buf[]; };
+layout(std430, binding = 1) readonly buffer IdxBuf { int topk_idx[]; };
+layout(std430, binding = 2) readonly buffer WeightBuf { float w_buf[]; };
+layout(std430, binding = 3) readonly buffer TopkWBuf { float topk_w[]; };
+layout(std430, binding = 4) writeonly buffer OutBuf { float out_buf[]; };
+
+layout(push_constant) uniform Params {
+    int hidden;
+    int inter;
+    int top_k;
+    int mode;  // 0 = gate_up+swiglu (gx = top_k*inter), 1 = down_combine (gx = hidden)
+};
+
+shared float smem[16];
+
+float block_sum(float v) {
+    float sg = subgroupAdd(v);
+    if (subgroupElect()) smem[gl_SubgroupID] = sg;
+    barrier();
+    if (gl_SubgroupID == 0) {
+        float x = (gl_SubgroupInvocationID < gl_NumSubgroups) ? smem[gl_SubgroupInvocationID] : 0.0;
+        float tot = subgroupAdd(x);
+        if (subgroupElect()) smem[0] = tot;
+    }
+    barrier();
+    return smem[0];
+}
+
+void main() {
+    int wid = int(gl_WorkGroupID.x);
+    int tid = int(gl_LocalInvocationID.x);
+
+    if (mode == 0) {
+        if (wid >= top_k * inter) return;
+        int slot = wid / inter;
+        int c = wid % inter;
+        int e = topk_idx[slot];
+        int g_off = (e * 2 * inter + c) * hidden;
+        int u_off = (e * 2 * inter + inter + c) * hidden;
+        float ga = 0.0, ua = 0.0;
+        for (int i = tid; i < hidden; i += 128) {
+            float xv = in_buf[i];
+            ga += xv * w_buf[g_off + i];
+            ua += xv * w_buf[u_off + i];
+        }
+        float g_tot = block_sum(ga);
+        float u_tot = block_sum(ua);
+        if (tid == 0) {
+            out_buf[wid] = (g_tot / (1.0 + exp(-g_tot))) * u_tot;
+        }
+    } else {
+        if (wid >= hidden) return;
+        float total = 0.0;
+        for (int slot = 0; slot < top_k; ++slot) {
+            int e = topk_idx[slot];
+            int d_off = (e * hidden + wid) * inter;
+            float acc = 0.0;
+            for (int i = tid; i < inter; i += 128) {
+                acc += in_buf[slot * inter + i] * w_buf[d_off + i];
+            }
+            total += block_sum(acc) * topk_w[slot];
+        }
+        if (tid == 0) out_buf[wid] = total;
+    }
+}

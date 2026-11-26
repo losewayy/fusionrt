@@ -1,0 +1,135 @@
+#version 450
+#extension GL_KHR_shader_subgroup_arithmetic : enable
+
+// Single-dispatch GatedDeltaNet step in Vulkan (1 workgroup per k-head group)
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+
+layout(std430, binding = 0) readonly buffer QkvProjBuf { float qkv_proj[]; };
+layout(std430, binding = 1) readonly buffer ZBuf { float z[]; };
+layout(std430, binding = 2) readonly buffer ABuf { float a[]; };
+layout(std430, binding = 3) readonly buffer BBuf { float b[]; };
+layout(std430, binding = 4) readonly buffer ConvWBuf { float conv_w[]; };
+layout(std430, binding = 5) readonly buffer ConvBiasBuf { float conv_bias[]; };
+layout(std430, binding = 6) readonly buffer ALogBuf { float A_log[]; };
+layout(std430, binding = 7) readonly buffer DtBiasBuf { float dt_bias[]; };
+layout(std430, binding = 8) readonly buffer NormWBuf { float norm_w[]; };
+layout(std430, binding = 9) buffer ConvStateBuf { float conv_state[]; };
+layout(std430, binding = 10) buffer SsmStateBuf { float ssm_state[]; };
+layout(std430, binding = 11) writeonly buffer OutBuf { float out_buf[]; };
+
+layout(push_constant) uniform Params {
+    int num_k_heads;
+    int num_v_heads;
+    int dk;
+    int dv;
+    float eps;
+    float q_scale;
+    int has_conv_bias;
+    int tiled_value_heads;
+};
+
+shared float smem[16];
+shared float q_sh[128];
+shared float k_sh[128];
+shared float v_sh[128];
+
+float silu(float x) {
+    return x / (1.0 + exp(-x));
+}
+
+float softplus(float x) {
+    return (x > 20.0) ? x : log(1.0 + exp(x));
+}
+
+float apply_conv_silu(int ch) {
+    int cs_off = ch * 3;
+    int cw_off = ch * 4;
+    float c0 = conv_state[cs_off + 0];
+    float c1 = conv_state[cs_off + 1];
+    float c2 = conv_state[cs_off + 2];
+    float cur = qkv_proj[ch];
+    float acc = c0 * conv_w[cw_off + 0] + c1 * conv_w[cw_off + 1] + c2 * conv_w[cw_off + 2] + cur * conv_w[cw_off + 3];
+    if (has_conv_bias != 0) acc += conv_bias[ch];
+    conv_state[cs_off + 0] = c1;
+    conv_state[cs_off + 1] = c2;
+    conv_state[cs_off + 2] = cur;
+    return silu(acc);
+}
+
+float block_sum(float v) {
+    float sg = subgroupAdd(v);
+    if (subgroupElect()) smem[gl_SubgroupID] = sg;
+    barrier();
+    if (gl_SubgroupID == 0) {
+        float x = (gl_SubgroupInvocationID < gl_NumSubgroups) ? smem[gl_SubgroupInvocationID] : 0.0;
+        float tot = subgroupAdd(x);
+        if (subgroupElect()) smem[0] = tot;
+    }
+    barrier();
+    return smem[0];
+}
+
+void main() {
+    int kh = int(gl_WorkGroupID.x);
+    if (kh >= num_k_heads) return;
+    int tid = int(gl_LocalInvocationID.x);
+    int ratio = num_v_heads / num_k_heads;
+    int q_dim = num_k_heads * dk;
+
+    float q_sq = 0.0;
+    float k_sq = 0.0;
+    for (int i = tid; i < dk; i += 128) {
+        float qv = apply_conv_silu(kh * dk + i);
+        float kv = apply_conv_silu(q_dim + kh * dk + i);
+        q_sh[i] = qv;
+        k_sh[i] = kv;
+        q_sq += qv * qv;
+        k_sq += kv * kv;
+    }
+
+    float q_inv = inversesqrt(block_sum(q_sq) + 1e-6);
+    float k_inv = inversesqrt(block_sum(k_sq) + 1e-6);
+    for (int i = tid; i < dk; i += 128) {
+        q_sh[i] = q_sh[i] * q_inv * q_scale;
+        k_sh[i] = k_sh[i] * k_inv;
+    }
+    barrier();
+
+    int v_offset = 2 * q_dim;
+    for (int r = 0; r < ratio; ++r) {
+        int vh = tiled_value_heads != 0 ? r * num_k_heads + kh : kh * ratio + r;
+        if (tid < dv) {
+            v_sh[tid] = apply_conv_silu(v_offset + vh * dv + tid);
+        }
+        barrier();
+
+        float g = exp(-exp(A_log[vh]) * softplus(a[vh] + dt_bias[vh]));
+        float beta = 1.0 / (1.0 + exp(-b[vh]));
+
+        float y_j = 0.0;
+        if (tid < dv) {
+            int s_base = vh * dk * dv;
+            float s_reg[128];
+            float kv_mem = 0.0;
+            for (int i = 0; i < dk; ++i) {
+                float sv = ssm_state[s_base + i * dv + tid] * g;
+                s_reg[i] = sv;
+                kv_mem += sv * k_sh[i];
+            }
+            float delta = (v_sh[tid] - kv_mem) * beta;
+            for (int i = 0; i < dk; ++i) {
+                float s_new = s_reg[i] + k_sh[i] * delta;
+                ssm_state[s_base + i * dv + tid] = s_new;
+                y_j += s_new * q_sh[i];
+            }
+        }
+
+        float y_sq = (tid < dv) ? (y_j * y_j) : 0.0;
+        float y_inv = inversesqrt(block_sum(y_sq) / float(dv) + eps);
+        if (tid < dv) {
+            float z_val = z[vh * dv + tid];
+            out_buf[vh * dv + tid] = (y_j * y_inv * norm_w[tid]) * silu(z_val);
+        }
+        barrier();
+    }
+}

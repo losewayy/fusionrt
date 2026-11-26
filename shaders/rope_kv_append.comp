@@ -1,0 +1,94 @@
+#version 450
+#extension GL_KHR_shader_subgroup_arithmetic : enable
+
+// Fused Q/K RMSNorm + RoPE + KV Cache Append
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+
+layout(std430, binding = 0) buffer QBuf { float q[]; };
+layout(std430, binding = 1) buffer KBuf { float k[]; };
+layout(std430, binding = 2) readonly buffer VBuf { float v[]; };
+layout(std430, binding = 3) readonly buffer QNormBuf { float q_norm_w[]; };
+layout(std430, binding = 4) readonly buffer KNormBuf { float k_norm_w[]; };
+layout(std430, binding = 5) writeonly buffer KCacheBuf { float k_cache[]; };
+layout(std430, binding = 6) writeonly buffer VCacheBuf { float v_cache[]; };
+
+layout(push_constant) uniform Params {
+    int num_q_heads;
+    int num_kv_heads;
+    int head_dim;
+    int rot_dim;
+    int pos;
+    float theta;
+    float eps;
+    int flags;  // bit0: use_qk_norm, bit1: neox
+};
+
+shared float smem[16];
+shared float h_buf[256];
+
+void main() {
+    int h = int(gl_WorkGroupID.x);
+    int tid = int(gl_LocalInvocationID.x);
+    bool is_q = (h < num_q_heads);
+    int kh = is_q ? h : (h - num_q_heads);
+    if (!is_q && kh >= num_kv_heads) return;
+
+    float sq = 0.0;
+    for (int i = tid; i < head_dim; i += 128) {
+        float val = is_q ? q[h * head_dim + i] : k[kh * head_dim + i];
+        h_buf[i] = val;
+        sq += val * val;
+    }
+    barrier();
+
+    if ((flags & 1) != 0) {
+        float sg = subgroupAdd(sq);
+        if (subgroupElect()) smem[gl_SubgroupID] = sg;
+        barrier();
+        if (gl_SubgroupID == 0) {
+            float val = (gl_SubgroupInvocationID < gl_NumSubgroups) ? smem[gl_SubgroupInvocationID] : 0.0;
+            float tot = subgroupAdd(val);
+            if (subgroupElect()) smem[0] = inversesqrt(tot / float(head_dim) + eps);
+        }
+        barrier();
+        float inv = smem[0];
+        for (int i = tid; i < head_dim; i += 128) {
+            float nw = is_q ? q_norm_w[i] : k_norm_w[i];
+            h_buf[i] = h_buf[i] * inv * nw;
+        }
+        barrier();
+    }
+
+    int half_rot = rot_dim >> 1;
+    bool neox = ((flags & 2) != 0);
+    for (int i = tid; i < half_rot; i += 128) {
+        float freq = pow(theta, -float(2 * i) / float(rot_dim));
+        float angle = float(pos) * freq;
+        float cs = cos(angle);
+        float sn = sin(angle);
+        if (neox) {
+            float x0 = h_buf[i];
+            float x1 = h_buf[i + half_rot];
+            h_buf[i] = x0 * cs - x1 * sn;
+            h_buf[i + half_rot] = x0 * sn + x1 * cs;
+        } else {
+            float x0 = h_buf[2 * i];
+            float x1 = h_buf[2 * i + 1];
+            h_buf[2 * i] = x0 * cs - x1 * sn;
+            h_buf[2 * i + 1] = x0 * sn + x1 * cs;
+        }
+    }
+    barrier();
+
+    for (int i = tid; i < head_dim; i += 128) {
+        float val = h_buf[i];
+        if (is_q) {
+            q[h * head_dim + i] = val;
+        } else {
+            k[kh * head_dim + i] = val;
+            int kv_off = (pos * num_kv_heads + kh) * head_dim + i;
+            k_cache[kv_off] = val;
+            v_cache[kv_off] = v[kh * head_dim + i];
+        }
+    }
+}

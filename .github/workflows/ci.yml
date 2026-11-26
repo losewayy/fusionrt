@@ -1,0 +1,23 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  cpu-build-and-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install build tools
+        run: sudo apt-get update && sudo apt-get install -y ninja-build cmake
+      - name: Configure CPU build
+        run: cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DFUSIONRT_ENABLE_CUDA=OFF -DFUSIONRT_ENABLE_VULKAN=OFF
+      - name: Build
+        run: cmake --build build -j 4
+      - name: Run CPU unit tests
+        run: ctest --test-dir build --output-on-failure
+      - name: Check Python script syntax
+        run: python3 -m py_compile scripts/verify_pytorch_and_llamacpp.py

@@ -1,0 +1,69 @@
+#version 450
+#extension GL_KHR_shader_subgroup_arithmetic : enable
+
+// Fused Pre-Norm (RMSNorm) + packed QKV vec4 GEMV writing directly into separate Q, K, V buffers
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+
+layout(std430, binding = 0) readonly buffer XBuf { vec4 x[]; };
+layout(std430, binding = 1) readonly buffer NBuf { vec4 norm_w[]; };
+layout(std430, binding = 2) readonly buffer WBuf { vec4 w[]; };
+layout(std430, binding = 3) writeonly buffer QBuf { float q_out[]; };
+layout(std430, binding = 4) writeonly buffer KBuf { float k_out[]; };
+layout(std430, binding = 5) writeonly buffer VBuf { float v_out[]; };
+
+layout(push_constant) uniform Params {
+    int q_dim;
+    int kv_dim;
+    int K;
+    float eps;
+};
+
+shared float smem[16];
+shared float inv_rms_sh;
+
+void main() {
+    int n = int(gl_WorkGroupID.x);
+    int total_n = q_dim + 2 * kv_dim;
+    if (n >= total_n) return;
+    int tid = int(gl_LocalInvocationID.x);
+    int k4 = K >> 2;
+
+    float sq = 0.0;
+    for (int i = tid; i < k4; i += 128) {
+        vec4 xv = x[i];
+        sq += dot(xv, xv);
+    }
+    float sg = subgroupAdd(sq);
+    if (subgroupElect()) smem[gl_SubgroupID] = sg;
+    barrier();
+    if (gl_SubgroupID == 0) {
+        float v = (gl_SubgroupInvocationID < gl_NumSubgroups) ? smem[gl_SubgroupInvocationID] : 0.0;
+        float tot = subgroupAdd(v);
+        if (subgroupElect()) inv_rms_sh = inversesqrt(tot / float(K) + eps);
+    }
+    barrier();
+
+    float acc = 0.0;
+    int w_row = n * k4;
+    for (int i = tid; i < k4; i += 128) {
+        vec4 wv = w[w_row + i] * norm_w[i];
+        acc += dot(x[i], wv) * inv_rms_sh;
+    }
+
+    float sg_acc = subgroupAdd(acc);
+    if (subgroupElect()) smem[gl_SubgroupID] = sg_acc;
+    barrier();
+    if (gl_SubgroupID == 0) {
+        float v = (gl_SubgroupInvocationID < gl_NumSubgroups) ? smem[gl_SubgroupInvocationID] : 0.0;
+        float tot = subgroupAdd(v);
+        if (subgroupElect()) {
+            if (n < q_dim) {
+                q_out[n] = tot;
+            } else if (n < q_dim + kv_dim) {
+                k_out[n - q_dim] = tot;
+            } else {
+                v_out[n - q_dim - kv_dim] = tot;
+            }
+        }
+    }
+}

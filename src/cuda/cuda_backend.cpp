@@ -1,0 +1,256 @@
+#include "fusionrt/cuda_backend.h"
+#include <algorithm>
+#include <sstream>
+#include <stdexcept>
+
+namespace fusionrt {
+
+static void check_cublas(cublasStatus_t status, const char* expr, const char* file, int line) {
+    if (status != CUBLAS_STATUS_SUCCESS) {
+        std::ostringstream oss;
+        oss << "cuBLAS error at " << file << ":" << line << " (" << expr << "): status="
+            << static_cast<int>(status);
+        throw std::runtime_error(oss.str());
+    }
+}
+#define FUSIONRT_CUBLAS_CHECK(x) check_cublas((x), #x, __FILE__, __LINE__)
+
+void check_cuda(cudaError_t err, const char* expr, const char* file, int line) {
+    if (err != cudaSuccess) {
+        std::ostringstream oss;
+        oss << "CUDA error at " << file << ":" << line << " (" << expr << "): "
+            << cudaGetErrorString(err);
+        throw std::runtime_error(oss.str());
+    }
+}
+
+void check_cu(CUresult err, const char* expr, const char* file, int line) {
+    if (err != CUDA_SUCCESS) {
+        const char* msg = nullptr;
+        cuGetErrorString(err, &msg);
+        std::ostringstream oss;
+        oss << "CUDA Driver error at " << file << ":" << line << " (" << expr << "): "
+            << (msg ? msg : "unknown");
+        throw std::runtime_error(oss.str());
+    }
+}
+
+void CudaContext::set_kv_dtype(DType dtype) {
+    if (dtype != DType::F16 && dtype != DType::F32) {
+        throw std::invalid_argument("CUDA KV cache supports F16 and F32");
+    }
+    kv_dtype_ = dtype;
+}
+
+CudaArena::~CudaArena() {
+    release();
+}
+
+void CudaArena::init(size_t capacity_bytes) {
+    release();
+    if (capacity_bytes == 0) return;
+    FUSIONRT_CUDA_CHECK(cudaMalloc(&base_, capacity_bytes));
+    FUSIONRT_CUDA_CHECK(cudaMemset(base_, 0, capacity_bytes));
+    // Uploads use a non-blocking stream and do not wait for the default-stream memset.
+    FUSIONRT_CUDA_CHECK(cudaStreamSynchronize(nullptr));
+    capacity_ = capacity_bytes;
+    offset_ = 0;
+}
+
+void CudaArena::release() {
+    if (base_) {
+        cudaFree(base_);
+        base_ = nullptr;
+    }
+    capacity_ = 0;
+    offset_ = 0;
+}
+
+void* CudaArena::alloc(size_t bytes, size_t alignment) {
+    size_t aligned = (offset_ + alignment - 1) & ~(alignment - 1);
+    if (aligned + bytes > capacity_) {
+        std::ostringstream oss;
+        oss << "CudaArena OOM: requested " << bytes << " bytes at offset " << aligned
+            << " exceeds capacity " << capacity_;
+        throw std::runtime_error(oss.str());
+    }
+    void* ptr = static_cast<uint8_t*>(base_) + aligned;
+    offset_ = aligned + bytes;
+    if (track_peak_) peak_ = std::max(peak_, offset_);
+    return ptr;
+}
+
+Tensor CudaArena::alloc_tensor(const std::vector<int64_t>& shape, DType dt, const std::string& name) {
+    Tensor t = Tensor::from_shape(shape, dt, Backend::CUDA);
+    t.name = name;
+    t.data = alloc(t.nbytes());
+    return t;
+}
+
+CudaGraphExec::~CudaGraphExec() {
+    reset();
+}
+
+void CudaGraphExec::reset() {
+    if (exec_) {
+        cudaGraphExecDestroy(exec_);
+        exec_ = nullptr;
+    }
+    if (graph_) {
+        cudaGraphDestroy(graph_);
+        graph_ = nullptr;
+    }
+}
+
+void CudaGraphExec::capture(cudaStream_t stream, const std::function<void()>& fn) {
+    reset();
+    FUSIONRT_CUDA_CHECK(cudaStreamBeginCapture(stream, cudaStreamCaptureModeGlobal));
+    try {
+        fn();
+    } catch (...) {
+        cudaGraph_t aborted = nullptr;
+        cudaStreamEndCapture(stream, &aborted);
+        if (aborted) cudaGraphDestroy(aborted);
+        throw;
+    }
+    FUSIONRT_CUDA_CHECK(cudaStreamEndCapture(stream, &graph_));
+    FUSIONRT_CUDA_CHECK(cudaGraphInstantiate(&exec_, graph_, nullptr, nullptr, 0));
+}
+
+void CudaGraphExec::launch(cudaStream_t stream) {
+    if (!exec_) throw std::runtime_error("CudaGraphExec::launch called before capture");
+    FUSIONRT_CUDA_CHECK(cudaGraphLaunch(exec_, stream));
+}
+
+std::vector<CudaDeviceInfo> CudaContext::enumerate_devices() {
+    std::vector<CudaDeviceInfo> out;
+    int count = 0;
+    if (cudaGetDeviceCount(&count) != cudaSuccess || count <= 0) {
+        return out;
+    }
+    int driver_ver = 0;
+    cudaDriverGetVersion(&driver_ver);
+    std::ostringstream drv_ss;
+    drv_ss << (driver_ver / 1000) << "." << ((driver_ver % 1000) / 10);
+
+    for (int i = 0; i < count; ++i) {
+        cudaDeviceProp prop{};
+        if (cudaGetDeviceProperties(&prop, i) != cudaSuccess) continue;
+        CudaDeviceInfo info;
+        info.device_id = i;
+        info.name = prop.name;
+        info.sm_major = prop.major;
+        info.sm_minor = prop.minor;
+        info.total_vram_bytes = prop.totalGlobalMem;
+        info.l2_cache_bytes = static_cast<size_t>(prop.l2CacheSize);
+        info.multi_processor_count = prop.multiProcessorCount;
+        info.shared_mem_per_block = static_cast<int>(prop.sharedMemPerBlock);
+        info.shared_mem_per_sm = static_cast<int>(prop.sharedMemPerMultiprocessor);
+        info.warp_size = prop.warpSize;
+        info.max_threads_per_block = prop.maxThreadsPerBlock;
+        info.memory_bus_width_bits = prop.memoryBusWidth;
+
+        int mem_clock_khz = 0;
+        int sm_clock_khz = 0;
+        cudaDeviceGetAttribute(&mem_clock_khz, cudaDevAttrMemoryClockRate, i);
+        cudaDeviceGetAttribute(&sm_clock_khz, cudaDevAttrClockRate, i);
+        info.mem_clock_khz = static_cast<double>(mem_clock_khz);
+        info.sm_clock_khz = static_cast<double>(sm_clock_khz);
+        // DDR/GDDR effective rate = 2 * mem_clock_khz * 1e3 * (bus_width / 8) / 1e9
+        info.peak_bandwidth_gbps = 2.0 * info.mem_clock_khz * 1e3 * (info.memory_bus_width_bits / 8.0) / 1e9;
+        info.driver_version = drv_ss.str();
+        out.push_back(std::move(info));
+    }
+    return out;
+}
+
+CudaContext::CudaContext(int device_id, size_t weight_arena_mb, size_t scratch_arena_mb) {
+    FUSIONRT_CU_CHECK(cuInit(0));
+    auto devs = enumerate_devices();
+    if (device_id < 0 || device_id >= static_cast<int>(devs.size())) {
+        throw std::runtime_error("Invalid CUDA device_id");
+    }
+    info_ = devs[device_id];
+    FUSIONRT_CUDA_CHECK(cudaSetDevice(device_id));
+    FUSIONRT_CUDA_CHECK(cudaStreamCreateWithFlags(&stream_, cudaStreamNonBlocking));
+    FUSIONRT_CUBLAS_CHECK(cublasCreate(&cublas_));
+    FUSIONRT_CUBLAS_CHECK(cublasSetStream(cublas_, stream_));
+    FUSIONRT_CUBLAS_CHECK(cublasSetMathMode(cublas_, CUBLAS_DEFAULT_MATH));
+    weight_arena_.init(weight_arena_mb * 1024ULL * 1024ULL);
+    scratch_arena_.init(scratch_arena_mb * 1024ULL * 1024ULL);
+
+    // One-time cuBLAS heuristic warmup using scratch arena so first prefill pays 0 init cost
+    if (scratch_arena_.capacity() >= 4096) {
+        size_t mark = scratch_arena_.mark();
+        void* a = scratch_arena_.alloc(16 * 16 * sizeof(uint16_t));
+        void* b = scratch_arena_.alloc(16 * 16 * sizeof(uint16_t));
+        void* c = scratch_arena_.alloc(16 * 16 * sizeof(float));
+        FUSIONRT_CUDA_CHECK(cudaMemsetAsync(a, 0, 512, stream_));
+        FUSIONRT_CUDA_CHECK(cudaMemsetAsync(b, 0, 512, stream_));
+        const float alpha = 1.0f, beta = 0.0f;
+        cublasGemmEx(cublas_, CUBLAS_OP_T, CUBLAS_OP_N, 16, 16, 16, &alpha,
+                     a, CUDA_R_16F, 16, b, CUDA_R_16F, 16, &beta, c, CUDA_R_32F, 16,
+                     CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+        scratch_arena_.reset(mark);
+    }
+
+    // Allocate L2 flush buffer >= 2x device L2 (or at least 64 MiB)
+    l2_flush_bytes_ = std::max<size_t>(info_.l2_cache_bytes * 2, 64ULL * 1024ULL * 1024ULL);
+    FUSIONRT_CUDA_CHECK(cudaMalloc(&l2_flush_buf_, l2_flush_bytes_));
+    FUSIONRT_CUDA_CHECK(cudaMemsetAsync(l2_flush_buf_, 0xA5, l2_flush_bytes_, stream_));
+    FUSIONRT_CUDA_CHECK(cudaStreamSynchronize(stream_));
+}
+
+CudaContext::~CudaContext() {
+    if (l2_flush_buf_) cudaFree(l2_flush_buf_);
+    scratch_arena_.release();
+    weight_arena_.release();
+    if (cublas_) cublasDestroy(cublas_);
+    if (stream_) cudaStreamDestroy(stream_);
+}
+
+Tensor CudaContext::upload(const HostTensor& ht, bool persistent) {
+    CudaArena& arena = persistent ? weight_arena_ : scratch_arena_;
+    Tensor dst = arena.alloc_tensor(
+        std::vector<int64_t>(ht.desc.shape.begin(), ht.desc.shape.begin() + ht.desc.ndim),
+        ht.desc.dtype, ht.desc.name);
+    if (ht.desc.nbytes() > 0) {
+        FUSIONRT_CUDA_CHECK(cudaMemcpyAsync(dst.ptr(), ht.storage.data(), ht.desc.nbytes(),
+                                            cudaMemcpyHostToDevice, stream_));
+        FUSIONRT_CUDA_CHECK(cudaStreamSynchronize(stream_));
+    }
+    return dst;
+}
+
+void CudaContext::upload_into(const HostTensor& ht, Tensor& dst) {
+    if (ht.desc.nbytes() != dst.nbytes()) {
+        throw std::runtime_error("upload_into size mismatch");
+    }
+    if (ht.desc.nbytes() > 0) {
+        FUSIONRT_CUDA_CHECK(cudaMemcpyAsync(dst.ptr(), ht.storage.data(), ht.desc.nbytes(),
+                                            cudaMemcpyHostToDevice, stream_));
+        FUSIONRT_CUDA_CHECK(cudaStreamSynchronize(stream_));
+    }
+}
+
+HostTensor CudaContext::download(const Tensor& t) {
+    std::vector<int64_t> dims(t.shape.begin(), t.shape.begin() + t.ndim);
+    HostTensor ht = HostTensor::create(dims, t.dtype);
+    ht.desc.name = t.name;
+    if (t.nbytes() > 0) {
+        FUSIONRT_CUDA_CHECK(cudaMemcpyAsync(ht.storage.data(), t.ptr(), t.nbytes(),
+                                            cudaMemcpyDeviceToHost, stream_));
+        FUSIONRT_CUDA_CHECK(cudaStreamSynchronize(stream_));
+    }
+    return ht;
+}
+
+void CudaContext::synchronize() {
+    FUSIONRT_CUDA_CHECK(cudaStreamSynchronize(stream_));
+}
+
+void CudaContext::flush_l2() {
+    FUSIONRT_CUDA_CHECK(cudaMemsetAsync(l2_flush_buf_, 0x5A, l2_flush_bytes_, stream_));
+}
+
+}  // namespace fusionrt

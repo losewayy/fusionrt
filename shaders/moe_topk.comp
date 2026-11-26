@@ -1,0 +1,51 @@
+#version 450
+
+layout(local_size_x = 1, local_size_y = 1, local_size_z = 1) in;
+
+layout(std430, binding = 0) readonly buffer LogitsBuf { float logits[]; };
+layout(std430, binding = 1) writeonly buffer IdxBuf { int topk_idx[]; };
+layout(std430, binding = 2) writeonly buffer WeightBuf { float topk_weight[]; };
+
+layout(push_constant) uniform Params {
+    int num_experts;
+    int top_k;
+    int norm_topk;
+};
+
+void main() {
+    float max_l = -1e30;
+    int ne = min(num_experts, 256);
+    for (int e = 0; e < ne; ++e) max_l = max(max_l, logits[e]);
+
+    float probs[256];
+    float sum_e = 0.0;
+    for (int e = 0; e < ne; ++e) {
+        probs[e] = exp(logits[e] - max_l);
+        sum_e += probs[e];
+    }
+    for (int e = 0; e < ne; ++e) probs[e] /= sum_e;
+
+    int chosen[32];
+    float wsum = 0.0;
+    for (int k = 0; k < top_k; ++k) {
+        int best_e = -1;
+        float best_p = -1.0;
+        for (int e = 0; e < ne; ++e) {
+            bool used = false;
+            for (int p = 0; p < k; ++p) {
+                if (chosen[p] == e) used = true;
+            }
+            if (!used && probs[e] > best_p) {
+                best_p = probs[e];
+                best_e = e;
+            }
+        }
+        chosen[k] = best_e;
+        topk_idx[k] = best_e;
+        topk_weight[k] = best_p;
+        wsum += best_p;
+    }
+    if (norm_topk != 0 && wsum > 0.0) {
+        for (int k = 0; k < top_k; ++k) topk_weight[k] /= wsum;
+    }
+}

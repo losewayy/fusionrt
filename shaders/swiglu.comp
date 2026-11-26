@@ -1,0 +1,22 @@
+#version 450
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(std430, binding = 0) readonly buffer GateUpBuf { float gate_up[]; };
+layout(std430, binding = 1) writeonly buffer OutBuf { float out_buf[]; };
+
+layout(push_constant) uniform Params {
+    int rows;
+    int inter_dim;
+};
+
+void main() {
+    int idx = int(gl_GlobalInvocationID.x);
+    int total = rows * inter_dim;
+    if (idx >= total) return;
+    int r = idx / inter_dim;
+    int c = idx % inter_dim;
+    float g = gate_up[r * (2 * inter_dim) + c];
+    float u = gate_up[r * (2 * inter_dim) + inter_dim + c];
+    out_buf[idx] = (g / (1.0 + exp(-g))) * u;
+}

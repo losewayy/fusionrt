@@ -1,0 +1,40 @@
+#pragma once
+
+#include "fusionrt/models.h"
+#include <random>
+
+namespace fusionrt::model_io {
+
+struct LoadedLayerRaw {
+    int kind = 0;  // 0=dense, 1=gdn, 2=moe
+    bool gated_q_attn = false;
+    // Dense
+    HostTensor attn_norm, q_proj, k_proj, v_proj, qkv_proj, q_norm, k_norm, o_proj, mlp_norm, gate_up, gate, up, down;
+    HostTensor q_bias, k_bias, v_bias;
+    // GDN extras
+    HostTensor z_proj, a_proj, b_proj, conv_w, conv_bias, A_log, dt_bias, gdn_norm_w;
+    // MoE extras
+    HostTensor router_w, experts_gate_up, experts_down, shared_gate_up, shared_down;
+    bool has_shared = false;
+};
+
+struct LoadedModelRaw {
+    HybridModelConfig cfg;
+    HostTensor tok_embeddings;
+    HostTensor final_norm_w;
+    HostTensor lm_head_w;
+    HostTensor rope_factors;
+    std::vector<LoadedLayerRaw> layers;
+};
+
+
+HostTensor make_rand_f32(const std::vector<int64_t>& shape, std::mt19937_64& rng, float scale = 0.05f);
+HostTensor make_ones_f32(const std::vector<int64_t>& shape);
+HostTensor make_zeros_f32(const std::vector<int64_t>& shape);
+HostTensor quantize_host_matrix(const HostTensor&, DType);
+HostTensor concat_rows_same_dtype(const std::vector<HostTensor>& parts);
+HostTensor to_f32_host(const HostTensor&);
+bool parse_gguf_model_raw(const std::string&, int max_seq_override, LoadedModelRaw&, std::string* err);
+bool parse_safetensors_model_raw(const std::string&, int max_seq_override, LoadedModelRaw&, std::string* err);
+
+}  // namespace fusionrt::model_io

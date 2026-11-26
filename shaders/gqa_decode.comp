@@ -1,0 +1,65 @@
+#version 450
+#extension GL_KHR_shader_subgroup_arithmetic : enable
+
+// GQA Online-Softmax Decode (1 workgroup per q_head)
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+
+layout(std430, binding = 0) readonly buffer QBuf { float q[]; };
+layout(std430, binding = 1) readonly buffer KCacheBuf { float k_cache[]; };
+layout(std430, binding = 2) readonly buffer VCacheBuf { float v_cache[]; };
+layout(std430, binding = 3) writeonly buffer OutBuf { float out_buf[]; };
+
+layout(push_constant) uniform Params {
+    int num_q_heads;
+    int num_kv_heads;
+    int head_dim;
+    int kv_len;
+    float scale;
+};
+
+shared float smem[16];
+shared float q_sh[256];
+
+void main() {
+    int qh = int(gl_WorkGroupID.x);
+    if (qh >= num_q_heads) return;
+    int tid = int(gl_LocalInvocationID.x);
+    int group_size = num_q_heads / num_kv_heads;
+    int kvh = qh / group_size;
+
+    if (tid < head_dim) {
+        q_sh[tid] = q[qh * head_dim + tid] * scale;
+    }
+    barrier();
+
+    float m_i = -1e30;
+    float l_i = 0.0;
+    float o_j = 0.0;
+
+    for (int t = 0; t < kv_len; ++t) {
+        int kv_base = (t * num_kv_heads + kvh) * head_dim;
+        float qk = (tid < head_dim) ? (q_sh[tid] * k_cache[kv_base + tid]) : 0.0;
+        float sg = subgroupAdd(qk);
+        if (subgroupElect()) smem[gl_SubgroupID] = sg;
+        barrier();
+        if (gl_SubgroupID == 0) {
+            float v = (gl_SubgroupInvocationID < gl_NumSubgroups) ? smem[gl_SubgroupInvocationID] : 0.0;
+            float tot = subgroupAdd(v);
+            if (subgroupElect()) smem[0] = tot;
+        }
+        barrier();
+        float score = smem[0];
+        float m_new = max(m_i, score);
+        float alpha = (t == 0) ? 0.0 : exp(m_i - m_new);
+        float p = exp(score - m_new);
+        l_i = l_i * alpha + p;
+        if (tid < head_dim) {
+            o_j = o_j * alpha + p * v_cache[kv_base + tid];
+        }
+        m_i = m_new;
+    }
+
+    if (tid < head_dim) {
+        out_buf[qh * head_dim + tid] = (l_i > 0.0) ? (o_j / l_i) : 0.0;
+    }
+}

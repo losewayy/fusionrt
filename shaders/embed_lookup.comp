@@ -1,0 +1,68 @@
+#version 450
+
+// Embedding table lookup (F32, Q8_0, Q4_0) -> F32 [M, hidden]
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(std430, binding = 0) readonly buffer EmbBuf { uint emb_u32[]; };
+layout(std430, binding = 1) readonly buffer TokBuf { int token_ids[]; };
+layout(std430, binding = 2) writeonly buffer OutBuf { float out_buf[]; };
+
+layout(push_constant) uniform Params {
+    int M;
+    int hidden;
+    int dtype;  // 0=F32, 1=F16, 2=BF16, 3=Q8_0, 4=Q4_0
+};
+
+uint read_u16(uint byte_off) {
+    uint w = byte_off >> 2;
+    uint s = (byte_off & 3u) * 8u;
+    if ((byte_off & 3u) == 3u) {
+        return ((emb_u32[w] >> 24) | (emb_u32[w + 1u] << 8)) & 0xFFFFu;
+    }
+    return (emb_u32[w] >> s) & 0xFFFFu;
+}
+
+uint read_u8(uint byte_off) {
+    uint w = byte_off >> 2;
+    uint s = (byte_off & 3u) * 8u;
+    return (emb_u32[w] >> s) & 0xFFu;
+}
+
+void main() {
+    int idx = int(gl_GlobalInvocationID.x);
+    int total = M * hidden;
+    if (idx >= total) return;
+    int m = idx / hidden;
+    int c = idx % hidden;
+    int tid = token_ids[m];
+
+    float val = 0.0;
+    if (dtype == 0) {
+        val = uintBitsToFloat(emb_u32[tid * hidden + c]);
+    } else if (dtype == 1) {
+        uint h = read_u16(uint(tid * hidden + c) * 2u);
+        val = unpackHalf2x16(h).x;
+    } else if (dtype == 2) {
+        uint b = read_u16(uint(tid * hidden + c) * 2u);
+        val = uintBitsToFloat(b << 16);
+    } else if (dtype == 3) {
+        int nb = hidden >> 5;
+        int blk = c >> 5;
+        int i = c & 31;
+        uint base_b = uint(tid * nb + blk) * 34u;
+        float d = unpackHalf2x16(read_u16(base_b)).x;
+        uint qb = read_u8(base_b + 2u + uint(i));
+        int qi = (qb >= 128u) ? int(qb) - 256 : int(qb);
+        val = float(qi) * d;
+    } else if (dtype == 4) {
+        int nb = hidden >> 5;
+        int blk = c >> 5;
+        int i = c & 31;
+        uint base_b = uint(tid * nb + blk) * 18u;
+        float d = unpackHalf2x16(read_u16(base_b)).x;
+        uint byte_v = read_u8(base_b + 2u + uint(i & 15));
+        int q = (i < 16) ? int(byte_v & 0xFu) - 8 : int(byte_v >> 4) - 8;
+        val = float(q) * d;
+    }
+    out_buf[idx] = val;
+}

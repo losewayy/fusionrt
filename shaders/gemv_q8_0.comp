@@ -1,0 +1,69 @@
+#version 450
+#extension GL_KHR_shader_subgroup_arithmetic : enable
+
+// Q8_0 Dequantize-GEMV for M=1..8 (portable uint32 word access)
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+
+layout(std430, binding = 0) readonly buffer XBuf { float x[]; };
+layout(std430, binding = 1) readonly buffer WBuf { uint w_u32[]; };
+layout(std430, binding = 2) writeonly buffer YBuf { float y[]; };
+
+layout(push_constant) uniform Params {
+    int M;
+    int N;
+    int K;
+};
+
+shared float smem[16];
+
+uint read_u16(uint byte_off) {
+    uint w = byte_off >> 2;
+    uint s = (byte_off & 3u) * 8u;
+    if ((byte_off & 3u) == 3u) {
+        return ((w_u32[w] >> 24) | (w_u32[w + 1u] << 8)) & 0xFFFFu;
+    }
+    return (w_u32[w] >> s) & 0xFFFFu;
+}
+
+uint read_u8(uint byte_off) {
+    uint w = byte_off >> 2;
+    uint s = (byte_off & 3u) * 8u;
+    return (w_u32[w] >> s) & 0xFFu;
+}
+
+void main() {
+    int n = int(gl_WorkGroupID.x);
+    if (n >= N) return;
+    int tid = int(gl_LocalInvocationID.x);
+    int nb = K >> 5;
+
+    float acc[8];
+    for (int m = 0; m < 8; ++m) acc[m] = 0.0;
+
+    for (int b = tid; b < nb; b += 128) {
+        uint base_b = uint(n * nb + b) * 34u;
+        float d = unpackHalf2x16(read_u16(base_b)).x;
+        int base_k = b << 5;
+        for (int m = 0; m < M; ++m) {
+            float loc = 0.0;
+            for (int i = 0; i < 32; ++i) {
+                uint qb = read_u8(base_b + 2u + uint(i));
+                int qi = (qb >= 128u) ? int(qb) - 256 : int(qb);
+                loc += x[m * K + base_k + i] * float(qi);
+            }
+            acc[m] += loc * d;
+        }
+    }
+
+    for (int m = 0; m < M; ++m) {
+        float sg = subgroupAdd(acc[m]);
+        if (subgroupElect()) smem[gl_SubgroupID] = sg;
+        barrier();
+        if (gl_SubgroupID == 0) {
+            float v = (gl_SubgroupInvocationID < gl_NumSubgroups) ? smem[gl_SubgroupInvocationID] : 0.0;
+            float tot = subgroupAdd(v);
+            if (subgroupElect()) y[m * N + n] = tot;
+        }
+        barrier();
+    }
+}

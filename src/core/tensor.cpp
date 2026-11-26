@@ -1,0 +1,268 @@
+#include "fusionrt/tensor.h"
+#include <algorithm>
+#include <cmath>
+#include <cstring>
+
+namespace fusionrt {
+
+void quantize_row_q8_0(const float* src, BlockQ8_0* dst, int64_t cols) {
+    const int64_t nb = cols / 32;
+    for (int64_t b = 0; b < nb; ++b) {
+        const float* x = src + b * 32;
+        float amax = 0.0f;
+        for (int i = 0; i < 32; ++i) {
+            amax = std::max(amax, std::fabs(x[i]));
+        }
+        const float d = amax / 127.0f;
+        const float id = (d > 0.0f) ? (1.0f / d) : 0.0f;
+        dst[b].d = fp32_to_fp16(d);
+        for (int i = 0; i < 32; ++i) {
+            int32_t q = static_cast<int32_t>(std::lround(x[i] * id));
+            q = std::max(-127, std::min(127, q));
+            dst[b].qs[i] = static_cast<int8_t>(q);
+        }
+    }
+}
+
+void dequantize_row_q8_0(const BlockQ8_0* src, float* dst, int64_t cols) {
+    const int64_t nb = cols / 32;
+    for (int64_t b = 0; b < nb; ++b) {
+        const float d = fp16_to_fp32(src[b].d);
+        for (int i = 0; i < 32; ++i) {
+            dst[b * 32 + i] = static_cast<float>(src[b].qs[i]) * d;
+        }
+    }
+}
+
+void quantize_row_q4_0(const float* src, BlockQ4_0* dst, int64_t cols) {
+    const int64_t nb = cols / 32;
+    for (int64_t b = 0; b < nb; ++b) {
+        const float* x = src + b * 32;
+        float amax = 0.0f;
+        float abs_signed_max = 0.0f;
+        for (int i = 0; i < 32; ++i) {
+            float ax = std::fabs(x[i]);
+            if (ax > amax) {
+                amax = ax;
+                abs_signed_max = x[i];
+            }
+        }
+        const float d = abs_signed_max / -8.0f;
+        const float id = (d != 0.0f) ? (1.0f / d) : 0.0f;
+        dst[b].d = fp32_to_fp16(d);
+        for (int i = 0; i < 16; ++i) {
+            float x0 = x[i] * id;
+            float x1 = x[i + 16] * id;
+            int32_t q0 = std::min(15, std::max(0, static_cast<int32_t>(x0 + 8.5f)));
+            int32_t q1 = std::min(15, std::max(0, static_cast<int32_t>(x1 + 8.5f)));
+            dst[b].qs[i] = static_cast<uint8_t>(q0 | (q1 << 4));
+        }
+    }
+}
+
+void dequantize_row_q4_0(const BlockQ4_0* src, float* dst, int64_t cols) {
+    const int64_t nb = cols / 32;
+    for (int64_t b = 0; b < nb; ++b) {
+        const float d = fp16_to_fp32(src[b].d);
+        for (int i = 0; i < 16; ++i) {
+            uint8_t byte = src[b].qs[i];
+            int32_t q0 = static_cast<int32_t>(byte & 0x0F) - 8;
+            int32_t q1 = static_cast<int32_t>(byte >> 4) - 8;
+            dst[b * 32 + i] = static_cast<float>(q0) * d;
+            dst[b * 32 + i + 16] = static_cast<float>(q1) * d;
+        }
+    }
+}
+
+void dequantize_row_q4_1(const BlockQ4_1* src, float* dst, int64_t cols) {
+    const int64_t nb = cols / 32;
+    for (int64_t b = 0; b < nb; ++b) {
+        const float d = fp16_to_fp32(src[b].d);
+        const float m = fp16_to_fp32(src[b].m);
+        for (int i = 0; i < 16; ++i) {
+            uint8_t byte = src[b].qs[i];
+            dst[b * 32 + i] = static_cast<float>(byte & 0x0F) * d + m;
+            dst[b * 32 + i + 16] = static_cast<float>(byte >> 4) * d + m;
+        }
+    }
+}
+
+void dequantize_row_q4_k(const BlockQ4_K* src, float* dst, int64_t cols) {
+    const int64_t nb = cols / 256;
+    auto get_scale_min = [](int j, const uint8_t* q, uint8_t& d_out, uint8_t& m_out) {
+        if (j < 4) {
+            d_out = q[j] & 63;
+            m_out = q[j + 4] & 63;
+        } else {
+            d_out = static_cast<uint8_t>((q[j + 4] & 0xF) | ((q[j - 4] >> 6) << 4));
+            m_out = static_cast<uint8_t>((q[j + 4] >> 4) | ((q[j - 0] >> 6) << 4));
+        }
+    };
+    for (int64_t b = 0; b < nb; ++b) {
+        const float d = fp16_to_fp32(src[b].d);
+        const float min_val = fp16_to_fp32(src[b].dmin);
+        const uint8_t* q = src[b].qs;
+        float* y = dst + b * 256;
+        int is = 0;
+        for (int j = 0; j < 256; j += 64) {
+            uint8_t sc, m;
+            get_scale_min(is, src[b].scales, sc, m);
+            const float d1 = d * static_cast<float>(sc);
+            const float m1 = min_val * static_cast<float>(m);
+            get_scale_min(is + 1, src[b].scales, sc, m);
+            const float d2 = d * static_cast<float>(sc);
+            const float m2 = min_val * static_cast<float>(m);
+            for (int l = 0; l < 32; ++l) {
+                y[j + l] = d1 * static_cast<float>(q[l] & 0xF) - m1;
+            }
+            for (int l = 0; l < 32; ++l) {
+                y[j + 32 + l] = d2 * static_cast<float>(q[l] >> 4) - m2;
+            }
+            q += 32;
+            is += 2;
+        }
+    }
+}
+
+void dequantize_row_q6_k(const BlockQ6_K* src, float* dst, int64_t cols) {
+    const int64_t nb = cols / 256;
+    for (int64_t b = 0; b < nb; ++b) {
+        const float d = fp16_to_fp32(src[b].d);
+        const uint8_t* ql = src[b].ql;
+        const uint8_t* qh = src[b].qh;
+        const int8_t* sc = src[b].scales;
+        float* y = dst + b * 256;
+        for (int n = 0; n < 256; n += 128) {
+            for (int l = 0; l < 32; ++l) {
+                int is = l / 16;
+                int8_t q1 = static_cast<int8_t>((ql[l + 0] & 0xF) | (((qh[l] >> 0) & 3) << 4)) - 32;
+                int8_t q2 = static_cast<int8_t>((ql[l + 32] & 0xF) | (((qh[l] >> 2) & 3) << 4)) - 32;
+                int8_t q3 = static_cast<int8_t>((ql[l + 0] >> 4) | (((qh[l] >> 4) & 3) << 4)) - 32;
+                int8_t q4 = static_cast<int8_t>((ql[l + 32] >> 4) | (((qh[l] >> 6) & 3) << 4)) - 32;
+                y[l + 0]  = d * static_cast<float>(sc[is + 0]) * static_cast<float>(q1);
+                y[l + 32] = d * static_cast<float>(sc[is + 2]) * static_cast<float>(q2);
+                y[l + 64] = d * static_cast<float>(sc[is + 4]) * static_cast<float>(q3);
+                y[l + 96] = d * static_cast<float>(sc[is + 6]) * static_cast<float>(q4);
+            }
+            y += 128;
+            ql += 64;
+            qh += 32;
+            sc += 8;
+        }
+    }
+}
+
+void dequantize_row_q5_k(const BlockQ5_K* src, float* dst, int64_t cols) {
+    const int64_t nb = cols / 256;
+    auto get_scale_min = [](int j, const uint8_t* q, uint8_t& d_out, uint8_t& m_out) {
+        if (j < 4) {
+            d_out = q[j] & 63;
+            m_out = q[j + 4] & 63;
+        } else {
+            d_out = static_cast<uint8_t>((q[j + 4] & 0xF) | ((q[j - 4] >> 6) << 4));
+            m_out = static_cast<uint8_t>((q[j + 4] >> 4) | ((q[j - 0] >> 6) << 4));
+        }
+    };
+    for (int64_t b = 0; b < nb; ++b) {
+        const float d = fp16_to_fp32(src[b].d);
+        const float min_val = fp16_to_fp32(src[b].dmin);
+        const uint8_t* ql = src[b].qs;
+        const uint8_t* qh = src[b].qh;
+        float* y = dst + b * 256;
+        int is = 0;
+        uint8_t u1 = 1, u2 = 2;
+        for (int j = 0; j < 256; j += 64) {
+            uint8_t sc, m;
+            get_scale_min(is, src[b].scales, sc, m);
+            const float d1 = d * static_cast<float>(sc);
+            const float m1 = min_val * static_cast<float>(m);
+            get_scale_min(is + 1, src[b].scales, sc, m);
+            const float d2 = d * static_cast<float>(sc);
+            const float m2 = min_val * static_cast<float>(m);
+            for (int l = 0; l < 32; ++l) {
+                y[j + l] = d1 * static_cast<float>((ql[l] & 0xF) + ((qh[l] & u1) ? 16 : 0)) - m1;
+            }
+            for (int l = 0; l < 32; ++l) {
+                y[j + 32 + l] = d2 * static_cast<float>((ql[l] >> 4) + ((qh[l] & u2) ? 16 : 0)) - m2;
+            }
+            ql += 32;
+            is += 2;
+            u1 <<= 2;
+            u2 <<= 2;
+        }
+    }
+}
+
+void convert_f32_to_f16(const float* src, uint16_t* dst, int64_t n) {
+    for (int64_t i = 0; i < n; ++i) dst[i] = fp32_to_fp16(src[i]);
+}
+
+void convert_f16_to_f32(const uint16_t* src, float* dst, int64_t n) {
+    for (int64_t i = 0; i < n; ++i) dst[i] = fp16_to_fp32(src[i]);
+}
+
+void convert_f32_to_bf16(const float* src, uint16_t* dst, int64_t n) {
+    for (int64_t i = 0; i < n; ++i) dst[i] = fp32_to_bf16(src[i]);
+}
+
+void convert_bf16_to_f32(const uint16_t* src, float* dst, int64_t n) {
+    for (int64_t i = 0; i < n; ++i) dst[i] = bf16_to_fp32(src[i]);
+}
+
+void repack_q4_0_to_q4_a(const BlockQ4_0* src, BlockQ4_A* dst, int64_t cols) {
+    const int64_t n_super = cols / 256;
+    for (int64_t s = 0; s < n_super; ++s) {
+        BlockQ4_A& out = dst[s];
+        for (int sb = 0; sb < 8; ++sb) {
+            const BlockQ4_0& in = src[s * 8 + sb];
+            out.d[sb] = in.d;
+            std::memcpy(&out.qs[sb * 4], in.qs, 16);
+        }
+    }
+}
+
+void repack_q8_0_to_q8_a(const BlockQ8_0* src, BlockQ8_A* dst, int64_t cols) {
+    const int64_t n_super = cols / 256;
+    for (int64_t s = 0; s < n_super; ++s) {
+        BlockQ8_A& out = dst[s];
+        for (int sb = 0; sb < 8; ++sb) {
+            const BlockQ8_0& in = src[s * 8 + sb];
+            out.d[sb] = in.d;
+            std::memcpy(&out.qs[sb * 8], in.qs, 32);
+        }
+    }
+}
+
+void dequantize_row_q4_a(const BlockQ4_A* src, float* dst, int64_t cols) {
+    const int64_t n_super = cols / 256;
+    for (int64_t s = 0; s < n_super; ++s) {
+        const BlockQ4_A& in = src[s];
+        for (int sb = 0; sb < 8; ++sb) {
+            const float d = fp16_to_fp32(in.d[sb]);
+            const auto* qs = reinterpret_cast<const uint8_t*>(&in.qs[sb * 4]);
+            float* out = dst + s * 256 + sb * 32;
+            for (int i = 0; i < 16; ++i) {
+                uint8_t byte = qs[i];
+                out[i]      = static_cast<float>(static_cast<int32_t>(byte & 0x0F) - 8) * d;
+                out[i + 16] = static_cast<float>(static_cast<int32_t>(byte >> 4) - 8) * d;
+            }
+        }
+    }
+}
+
+void dequantize_row_q8_a(const BlockQ8_A* src, float* dst, int64_t cols) {
+    const int64_t n_super = cols / 256;
+    for (int64_t s = 0; s < n_super; ++s) {
+        const BlockQ8_A& in = src[s];
+        for (int sb = 0; sb < 8; ++sb) {
+            const float d = fp16_to_fp32(in.d[sb]);
+            const auto* qs = reinterpret_cast<const int8_t*>(&in.qs[sb * 8]);
+            float* out = dst + s * 256 + sb * 32;
+            for (int i = 0; i < 32; ++i) {
+                out[i] = static_cast<float>(qs[i]) * d;
+            }
+        }
+    }
+}
+
+}  // namespace fusionrt
