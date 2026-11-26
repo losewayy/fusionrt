@@ -12,6 +12,7 @@
 #include <iostream>
 #include <stdexcept>
 #include <thread>
+#include <tuple>
 #include <unordered_set>
 
 namespace fusionrt {
@@ -439,8 +440,7 @@ void upload_projections(CudaContext& ctx, const std::array<const HostTensor*, Co
 }  // namespace
 
 void FusionModel::init_synthetic(CudaContext& ctx, uint64_t seed) {
-    cuda_session_.cached_prompt_tokens.clear();
-    cuda_session_.graph_captured = false;
+    release_cuda_sessions();
     std::mt19937_64 rng(seed);
     int H = (cfg_.arch == "hybrid") ? cfg_.gdn.hidden_size
           : (cfg_.arch == "moe") ? cfg_.moe.hidden_size
@@ -449,22 +449,17 @@ void FusionModel::init_synthetic(CudaContext& ctx, uint64_t seed) {
     tok_embeddings_ = ctx.upload(make_rand_f32({cfg_.vocab_size, H}, rng, 0.1f), true);
     final_norm_w_ = ctx.upload(make_ones_f32({H}), true);
     lm_head_w_ = ctx.upload(make_rand_f32({cfg_.vocab_size, H}, rng, 0.05f), true);
-    cuda_session_.hidden = ctx.weight_arena().alloc_tensor({H}, DType::F32, "hidden_buf");
-    cuda_session_.logits = ctx.weight_arena().alloc_tensor({cfg_.vocab_size}, DType::F32, "logits_buf");
-    cuda_session_.token_ids = ctx.weight_arena().alloc_tensor({1 + static_cast<int64_t>(cfg_.dense.max_seq_len)}, DType::I32, "tok_id_dev");
-    cuda_session_.position = ctx.weight_arena().alloc_tensor({1}, DType::I32, "pos_dev");
-    cuda_session_.kv_length = ctx.weight_arena().alloc_tensor({1}, DType::I32, "kv_len_dev");
+    cuda_workspace_.hidden = ctx.weight_arena().alloc_tensor({H}, DType::F32, "hidden_buf");
+    cuda_workspace_.logits = ctx.weight_arena().alloc_tensor({cfg_.vocab_size}, DType::F32, "logits_buf");
+    cuda_workspace_.token_ids = ctx.weight_arena().alloc_tensor({1 + static_cast<int64_t>(cfg_.dense.max_seq_len)}, DType::I32, "tok_id_dev");
+    cuda_workspace_.position = ctx.weight_arena().alloc_tensor({1}, DType::I32, "pos_dev");
+    cuda_workspace_.kv_length = ctx.weight_arena().alloc_tensor({1}, DType::I32, "kv_len_dev");
 
     layer_kinds_.clear();
     layer_indices_.clear();
     dense_layers_.clear();
     gdn_layers_.clear();
-    cuda_session_.decode_graph.reset();
-    cuda_session_.kv_pool.release();
-    cuda_session_.kv.clear();
-    cuda_session_.gdn.clear();
     moe_layers_.clear();
-    cuda_session_.graph_captured = false;
 
     for (int l = 0; l < cfg_.num_layers; ++l) {
         int kind = 0;
@@ -497,7 +492,6 @@ void FusionModel::init_synthetic(CudaContext& ctx, uint64_t seed) {
             L.mlp_norm_w = ctx.upload(make_ones_f32({H}), true);
             L.gate_up_proj = ctx.upload(quantize_host_matrix(make_rand_f32({2 * I, H}, rng, 0.04f), wdt), true);
             L.down_proj = ctx.upload(quantize_host_matrix(make_rand_f32({H, I}, rng, 0.04f), wdt), true);
-            cuda_session_.kv.push_back(make_cuda_kv_view(ctx, L.cfg.max_seq_len, L.cfg.num_key_value_heads, L.cfg.head_dim));
 
             layer_indices_.push_back(dense_layers_.size());
             dense_layers_.push_back(std::move(L));
@@ -533,9 +527,6 @@ void FusionModel::init_synthetic(CudaContext& ctx, uint64_t seed) {
             L.mlp_norm_w = ctx.upload(make_ones_f32({H}), true);
             L.gate_up_proj = ctx.upload(quantize_host_matrix(make_rand_f32({2 * I, H}, rng, 0.04f), wdt), true);
             L.down_proj = ctx.upload(quantize_host_matrix(make_rand_f32({H, I}, rng, 0.04f), wdt), true);
-            cuda_session_.gdn.push_back(CudaGdnState{
-                ctx.weight_arena().alloc_tensor({conv_dim, 3}, DType::F32, "conv_state"),
-                ctx.weight_arena().alloc_tensor({nv, dk, dv}, DType::F32, "ssm_state")});
 
             layer_indices_.push_back(gdn_layers_.size());
             gdn_layers_.push_back(std::move(L));
@@ -569,6 +560,8 @@ void FusionModel::init_synthetic(CudaContext& ctx, uint64_t seed) {
         }
     }
     ctx.synchronize();
+    cuda_kv_dtype_ = ctx.kv_dtype();
+    cuda_slots_[0] = make_cuda_session();
     rebuild_cuda_ir();
 }
 
@@ -580,7 +573,6 @@ static bool upload_raw_model_to_cuda(CudaContext& ctx, const LoadedModelRaw& raw
                                      std::vector<int>& layer_kinds, std::vector<size_t>& layer_indices,
                                      std::vector<CudaDenseGQALayer>& dense_layers,
                                      std::vector<CudaGatedDeltaNetLayer>& gdn_layers,
-                                     std::vector<CudaKvView>& kv_states, std::vector<CudaGdnState>& gdn_states,
                                      std::vector<CudaSparseMoELayer>& moe_layers) {
     cfg_out = raw.cfg;
     const Tensor rope_factors = raw.rope_factors.storage.empty() ? Tensor{} : ctx.upload(raw.rope_factors, true);
@@ -601,8 +593,6 @@ static bool upload_raw_model_to_cuda(CudaContext& ctx, const LoadedModelRaw& raw
     layer_indices.clear();
     dense_layers.clear();
     gdn_layers.clear();
-    kv_states.clear();
-    gdn_states.clear();
     moe_layers.clear();
 
     auto upload_moe = [&](const LoadedLayerRaw& lr) {
@@ -654,7 +644,6 @@ static bool upload_raw_model_to_cuda(CudaContext& ctx, const LoadedModelRaw& raw
                 }
                 L.down_proj = upload_cuda_matrix(ctx, lr.down);
             }
-            kv_states.push_back(make_cuda_kv_view(ctx, L.cfg.max_seq_len, L.cfg.num_key_value_heads, L.cfg.head_dim));
             layer_indices.push_back(dense_layers.size());
             dense_layers.push_back(std::move(L));
         } else if (lr.kind == 1) {
@@ -677,10 +666,6 @@ static bool upload_raw_model_to_cuda(CudaContext& ctx, const LoadedModelRaw& raw
                 L.up_proj = upload_cuda_matrix(ctx, lr.up);
             }
             L.down_proj = upload_cuda_matrix(ctx, lr.down);
-            int conv_dim = static_cast<int>(lr.conv_w.desc.shape[0]);
-            gdn_states.push_back(CudaGdnState{
-                ctx.weight_arena().alloc_tensor({conv_dim, 3}, DType::F32, "conv_state"),
-                ctx.weight_arena().alloc_tensor({L.cfg.num_v_heads, L.cfg.head_k_dim, L.cfg.head_v_dim}, DType::F32, "ssm_state")});
             layer_indices.push_back(gdn_layers.size());
             gdn_layers.push_back(std::move(L));
         } else {
@@ -703,7 +688,6 @@ static size_t gguf_cuda_arena_bytes(const LoadedModelRaw& raw) {
     else reserve(raw.tok_embeddings.storage.size());
     for (const auto* t : {&raw.final_norm_w, &raw.lm_head_w, &raw.rope_factors}) weight(*t);
     const auto& d = raw.cfg.dense;
-    const auto& g = raw.cfg.gdn;
     reserve(sizeof(float) * static_cast<size_t>(d.hidden_size));
     reserve(sizeof(float) * static_cast<size_t>(raw.cfg.vocab_size));
     reserve(sizeof(int32_t) * (1 + static_cast<size_t>(d.max_seq_len)));
@@ -717,13 +701,7 @@ static size_t gguf_cuda_arena_bytes(const LoadedModelRaw& raw) {
                              &l.router_w, &l.experts_gate_up, &l.experts_down, &l.shared_gate_up, &l.shared_down}) {
             weight(*t);
         }
-        if (l.kind == 0) {
-            reserve((1 + (d.max_seq_len - 1) / kKvPageTokens) * sizeof(void*));
-        } else if (l.kind == 1) {
-            weight(l.qkv_proj);
-            reserve(sizeof(float) * static_cast<size_t>(l.conv_w.desc.shape[0]) * 3);
-            reserve(sizeof(float) * static_cast<size_t>(g.num_v_heads) * g.head_k_dim * g.head_v_dim);
-        }
+        if (l.kind == 1) weight(l.qkv_proj);
     }
     return bytes;
 }
@@ -731,19 +709,20 @@ static size_t gguf_cuda_arena_bytes(const LoadedModelRaw& raw) {
 bool FusionModel::load_gguf(CudaContext& ctx, const std::string& path, std::string* err, int max_seq_override) {
     LoadedModelRaw raw;
     if (!parse_gguf_model_raw(path, max_seq_override, raw, err)) return false;
-    if (ctx.weight_arena().capacity() == 0) {
-        ctx.weight_arena().init(gguf_cuda_arena_bytes(raw));
+    release_cuda_sessions();
+    if (ctx.weight_arena().capacity() == 0 || owned_gguf_arena_ == &ctx) {
+        const size_t bytes = gguf_cuda_arena_bytes(raw);
+        if (ctx.weight_arena().capacity() != bytes) ctx.weight_arena().init(bytes);
+        else ctx.weight_arena().reset();
+        owned_gguf_arena_ = &ctx;
     }
-    cuda_session_.decode_graph.reset();
-    cuda_session_.kv_pool.release();
-    cuda_session_.graph_captured = false;
-    cuda_session_.cached_prompt_tokens.clear();
     if (!upload_raw_model_to_cuda(ctx, raw, cfg_, tok_embeddings_, final_norm_w_, lm_head_w_,
-                                    cuda_session_.hidden, cuda_session_.logits, cuda_session_.token_ids, cuda_session_.position, cuda_session_.kv_length,
-                                    layer_kinds_, layer_indices_, dense_layers_, gdn_layers_,
-                                    cuda_session_.kv, cuda_session_.gdn, moe_layers_)) {
+                                    cuda_workspace_.hidden, cuda_workspace_.logits, cuda_workspace_.token_ids, cuda_workspace_.position, cuda_workspace_.kv_length,
+                                    layer_kinds_, layer_indices_, dense_layers_, gdn_layers_, moe_layers_)) {
         return false;
     }
+    cuda_kv_dtype_ = ctx.kv_dtype();
+    cuda_slots_[0] = make_cuda_session();
     rebuild_cuda_ir();
     return true;
 }
@@ -751,28 +730,120 @@ bool FusionModel::load_gguf(CudaContext& ctx, const std::string& path, std::stri
 bool FusionModel::load_safetensors(CudaContext& ctx, const std::string& path, std::string* err, int max_seq_override) {
     LoadedModelRaw raw;
     if (!parse_safetensors_model_raw(path, max_seq_override, raw, err)) return false;
-    cuda_session_.decode_graph.reset();
-    cuda_session_.kv_pool.release();
-    cuda_session_.graph_captured = false;
-    cuda_session_.cached_prompt_tokens.clear();
+    release_cuda_sessions();
     if (!upload_raw_model_to_cuda(ctx, raw, cfg_, tok_embeddings_, final_norm_w_, lm_head_w_,
-                                    cuda_session_.hidden, cuda_session_.logits, cuda_session_.token_ids, cuda_session_.position, cuda_session_.kv_length,
-                                    layer_kinds_, layer_indices_, dense_layers_, gdn_layers_,
-                                    cuda_session_.kv, cuda_session_.gdn, moe_layers_)) {
+                                    cuda_workspace_.hidden, cuda_workspace_.logits, cuda_workspace_.token_ids, cuda_workspace_.position, cuda_workspace_.kv_length,
+                                    layer_kinds_, layer_indices_, dense_layers_, gdn_layers_, moe_layers_)) {
         return false;
     }
+    cuda_kv_dtype_ = ctx.kv_dtype();
+    cuda_slots_[0] = make_cuda_session();
     rebuild_cuda_ir();
     return true;
 }
 
-void FusionModel::reset_kv_and_state(CudaContext& ctx) {
-    cuda_session_.cached_prompt_tokens.clear();
-    cuda_session_.kv_pool.clear(ctx);
-    for (auto& state : cuda_session_.gdn) {
-        FUSIONRT_CUDA_CHECK(cudaMemsetAsync(state.convolution.ptr(), 0, state.convolution.nbytes(), ctx.stream()));
-        FUSIONRT_CUDA_CHECK(cudaMemsetAsync(state.recurrence.ptr(), 0, state.recurrence.nbytes(), ctx.stream()));
+void FusionModel::set_num_slots(int n) {
+    if (n < 1) throw std::invalid_argument("Expected --slots >= 1");
+    const auto count = static_cast<size_t>(n);
+    if (active_slot_ >= count) {
+        cuda_workspace_.decode_graph.reset();
+        cuda_workspace_.graph_captured = false;
+        active_slot_ = 0;
     }
+    for (size_t i = count; i < cuda_slots_.size(); ++i) {
+        if (cuda_slots_[i]) cuda_kv_pool_.truncate(cuda_slots_[i]->pages, 0);
+    }
+    cuda_slots_.resize(count);
+}
+
+std::unique_ptr<FusionModel::CudaSession> FusionModel::make_cuda_session() const {
+    auto slot = std::make_unique<CudaSession>();
+    auto aligned = [](size_t bytes) { return (bytes + 255) & ~size_t{255}; };
+    size_t table_bytes = 0;
+    for (const auto& layer : dense_layers_) {
+        table_bytes += aligned((1 + (layer.cfg.max_seq_len - 1) / kKvPageTokens) * sizeof(uint8_t*));
+    }
+    size_t state_bytes = 0;
+    for (const auto& layer : gdn_layers_) {
+        const auto& g = layer.cfg;
+        slot->gdn.push_back({
+            Tensor::from_shape({layer.conv_w.shape[0], 3}, DType::F32, Backend::CUDA),
+            Tensor::from_shape({g.num_v_heads, g.head_k_dim, g.head_v_dim}, DType::F32, Backend::CUDA)});
+        state_bytes += aligned(slot->gdn.back().convolution.nbytes()) + aligned(slot->gdn.back().recurrence.nbytes());
+    }
+    slot->storage.init(table_bytes + state_bytes);
+    for (const auto& layer : dense_layers_) {
+        const auto& d = layer.cfg;
+        slot->kv.push_back(make_cuda_kv_view(slot->storage, cuda_kv_dtype_, d.max_seq_len,
+                                             d.num_key_value_heads, d.head_dim));
+    }
+    if (state_bytes != 0) {
+        slot->gdn_data = slot->storage.alloc(state_bytes);
+        slot->ssm_bytes = state_bytes;
+        auto* data = static_cast<uint8_t*>(slot->gdn_data);
+        for (auto& state : slot->gdn) {
+            state.convolution.data = data;
+            data += aligned(state.convolution.nbytes());
+            state.recurrence.data = data;
+            data += aligned(state.recurrence.nbytes());
+        }
+    }
+    return slot;
+}
+
+void FusionModel::release_cuda_sessions() {
+    cuda_workspace_.decode_graph.reset();
+    cuda_workspace_.graph_captured = false;
+    for (auto& slot : cuda_slots_) slot.reset();
+    cuda_kv_pool_.release();
+    active_slot_ = 0;
+    slot_clock_ = 0;
+}
+
+void FusionModel::clear_cuda_history() {
+    auto& slot = cuda_session();
+    slot.cached_tokens.clear();
+    slot.checkpoints.clear();
+}
+
+void FusionModel::zero_cuda_gdn(CudaContext& ctx) {
+    auto& slot = cuda_session();
+    if (slot.ssm_bytes != 0) {
+        FUSIONRT_CUDA_CHECK(cudaMemsetAsync(slot.gdn_data, 0, slot.ssm_bytes, ctx.stream()));
+    }
+}
+
+void FusionModel::reset_kv_and_state(CudaContext& ctx) {
+    clear_cuda_history();
+    cuda_kv_pool_.truncate(cuda_session().pages, 0);
+    zero_cuda_gdn(ctx);
     ctx.synchronize();
+}
+
+void FusionModel::ensure_cuda_kv(CudaContext& ctx, int first_write, int tokens) {
+    auto& slot = cuda_session();
+    cuda_kv_pool_.ensure(ctx, slot.kv, slot.pages, first_write, tokens);
+}
+
+void FusionModel::save_cuda_checkpoint(CudaContext& ctx, int tokens, bool logits) {
+    auto& slot = cuda_session();
+    if (slot.gdn.empty()) return;
+    constexpr size_t max_checkpoints = 6;
+    auto& checkpoints = slot.checkpoints;
+    std::erase_if(checkpoints, [=](const auto& entry) { return entry.tokens == tokens; });
+    if (checkpoints.size() == max_checkpoints) checkpoints.erase(checkpoints.begin());
+    auto snapshot = std::make_shared<GdnSnapshot>();
+    const size_t logits_bytes = logits ? cuda_workspace_.logits.nbytes() : 0;
+    uint8_t* data = nullptr;
+    FUSIONRT_CUDA_CHECK(cudaMalloc(&data, slot.ssm_bytes + logits_bytes));
+    snapshot->data.reset(data);
+    snapshot->has_logits = logits;
+    FUSIONRT_CUDA_CHECK(cudaMemcpyAsync(data, slot.gdn_data, slot.ssm_bytes, cudaMemcpyDeviceToDevice, ctx.stream()));
+    if (logits) {
+        FUSIONRT_CUDA_CHECK(cudaMemcpyAsync(data + slot.ssm_bytes, cuda_workspace_.logits.ptr(), logits_bytes,
+                                            cudaMemcpyDeviceToDevice, ctx.stream()));
+    }
+    checkpoints.push_back({tokens, std::move(snapshot)});
 }
 
 struct CudaIRWorkspace {
@@ -1434,20 +1505,20 @@ static void run_forward_token_step_cuda(
 
 std::vector<float> FusionModel::forward_token_cuda(CudaContext& ctx, int32_t token_id, int pos,
                                                    bool use_fused, bool use_graph) {
-    cuda_session_.cached_prompt_tokens.clear();
     if (pos < 0 || pos >= cfg_.dense.max_seq_len) throw std::invalid_argument("Token position exceeds context");
-    cuda_session_.kv_pool.ensure(ctx, cuda_session_.kv, pos + 1);
+    clear_cuda_history();
+    ensure_cuda_kv(ctx, pos, pos + 1);
     const MiniGraph& ir = use_fused ? fused_ir_graph_ : raw_ir_graph_;
     CudaIRWorkspace ws(ir);
     int32_t tid = std::clamp(token_id, int32_t{0}, cfg_.vocab_size - 1);
-    FUSIONRT_CUDA_CHECK(cudaMemcpyAsync(cuda_session_.token_ids.ptr(), &tid, sizeof(tid), cudaMemcpyHostToDevice, ctx.stream()));
+    FUSIONRT_CUDA_CHECK(cudaMemcpyAsync(cuda_workspace_.token_ids.ptr(), &tid, sizeof(tid), cudaMemcpyHostToDevice, ctx.stream()));
     run_forward_token_step_cuda(ctx, cfg_, tok_embeddings_, ir, ws,
-                                cuda_session_.hidden, cuda_session_.logits, cuda_session_.token_ids, cuda_session_.position, cuda_session_.kv_length,
-                                dense_layers_, gdn_layers_, cuda_session_.kv, cuda_session_.gdn, moe_layers_,
-                                cuda_session_.decode_graph, cuda_session_.graph_captured, cuda_session_.graph_fused, cuda_session_.graph_has_argmax,
-                                cuda_session_.graph_split_bucket,
+                                cuda_workspace_.hidden, cuda_workspace_.logits, cuda_workspace_.token_ids, cuda_workspace_.position, cuda_workspace_.kv_length,
+                                dense_layers_, gdn_layers_, cuda_session().kv, cuda_session().gdn, moe_layers_,
+                                cuda_workspace_.decode_graph, cuda_workspace_.graph_captured, cuda_workspace_.graph_fused, cuda_workspace_.graph_has_argmax,
+                                cuda_workspace_.graph_split_bucket,
                                 pos, use_fused, use_graph, false);
-    HostTensor h_logits = ctx.download(cuda_session_.logits);
+    HostTensor h_logits = ctx.download(cuda_workspace_.logits);
     return std::vector<float>(h_logits.data<float>(), h_logits.data<float>() + cfg_.vocab_size);
 }
 
@@ -1483,14 +1554,37 @@ void FusionModel::set_device_profile(CudaContext& ctx, const DeviceProfile& prof
     ctx.set_preferred_gemv_geometry({profile.preferred_gemv_warps, profile.preferred_gemv_rows_per_warp});
     ctx.set_empirical_l2_bytes(profile.empirical_l2_bytes);
     recommend_cuda_graph_ = profile.recommend_cuda_graph;
-    cuda_session_.graph_captured = false;
-    cuda_session_.cached_prompt_tokens.clear();
+    cuda_workspace_.graph_captured = false;
+    for (const auto& slot : cuda_slots_) {
+        if (!slot) continue;
+        slot->cached_tokens.clear();
+        slot->checkpoints.clear();
+    }
+}
+
+ModelMemory FusionModel::cuda_cache_memory() const {
+    ModelMemory result;
+    result.kv_pages = cuda_kv_pool_.pages();
+    result.kv_bytes = cuda_kv_pool_.bytes();
+    result.kv_reserved_bytes = cuda_kv_pool_.reserved_bytes();
+    std::unordered_set<const GdnSnapshot*> counted;
+    for (const auto& slot : cuda_slots_) {
+        if (!slot) continue;
+        result.ssm_bytes += slot->ssm_bytes;
+        result.persistent_bytes += slot->storage.capacity();
+        for (const auto& checkpoint : slot->checkpoints) {
+            if (!counted.insert(checkpoint.snapshot.get()).second) continue;
+            result.ssm_bytes += slot->ssm_bytes;
+            result.persistent_bytes += slot->ssm_bytes;
+            if (checkpoint.snapshot->has_logits) result.persistent_bytes += cuda_workspace_.logits.nbytes();
+        }
+    }
+    return result;
 }
 
 ModelMemory FusionModel::inspect_cuda(CudaContext& ctx) {
-    ModelMemory result;
-    for (const auto& state : cuda_session_.gdn) result.ssm_bytes += state.recurrence.nbytes() + state.convolution.nbytes();
-    result.persistent_bytes = ctx.weight_arena().used();
+    ModelMemory result = cuda_cache_memory();
+    result.persistent_bytes += ctx.weight_arena().used();
     std::unordered_set<const void*> counted;
     auto count = [&](std::initializer_list<const Tensor*> weights) {
         for (const auto* w : weights) {
@@ -1516,34 +1610,38 @@ ModelMemory FusionModel::inspect_cuda(CudaContext& ctx) {
     const std::vector<int32_t> tokens(rows, 0);
     auto& arena = ctx.scratch_arena();
     const size_t mark = arena.mark();
+    auto probe_slot = make_cuda_session();
+    CudaKvPool probe_pool;
+    std::swap(probe_slot, cuda_slots_[active_slot_]);
+    std::swap(probe_pool, cuda_kv_pool_);
     arena.track_peak(true);
     try {
-        reset_kv_and_state(ctx);
         (void)prefill_cuda_impl(ctx, tokens.data(), rows, 0, true);
         reset_kv_and_state(ctx);
         (void)prefill_cuda_impl(ctx, tokens.data(), 1, 0, true);
-        decode_argmax(ctx, cuda_session_.logits, cuda_session_.token_ids, cfg_.vocab_size);
+        decode_argmax(ctx, cuda_workspace_.logits, cuda_workspace_.token_ids, cfg_.vocab_size);
         ctx.synchronize();
         result.static_scratch_bytes = arena.peak() - mark;
     } catch (...) {
         arena.track_peak(false);
         arena.reset(mark);
+        std::swap(probe_pool, cuda_kv_pool_);
+        std::swap(probe_slot, cuda_slots_[active_slot_]);
         throw;
     }
     arena.track_peak(false);
-    result.kv_bytes = cuda_session_.kv_pool.bytes();
-    result.kv_pages = cuda_session_.kv_pool.pages();
-    reset_kv_and_state(ctx);
+    std::swap(probe_pool, cuda_kv_pool_);
+    std::swap(probe_slot, cuda_slots_[active_slot_]);
     return result;
 }
 
 std::vector<float> FusionModel::forward_prefill_cuda(CudaContext& ctx, const std::vector<int32_t>& token_ids,
                                                      int start_pos, bool use_fused) {
     if (token_ids.empty()) return {};
-    cuda_session_.cached_prompt_tokens.clear();
     if (start_pos < 0 || token_ids.size() > static_cast<size_t>(cfg_.dense.max_seq_len - std::min(start_pos, cfg_.dense.max_seq_len))) {
         throw std::invalid_argument("Prompt exceeds model context");
     }
+    clear_cuda_history();
     return prefill_cuda_impl(ctx, token_ids.data(), static_cast<int>(token_ids.size()), start_pos, use_fused);
 }
 
@@ -1553,30 +1651,108 @@ std::vector<float> FusionModel::prefill_cached_cuda(CudaContext& ctx, const std:
     if (prompt.empty() || prompt.size() > static_cast<size_t>(cfg_.dense.max_seq_len)) {
         throw std::invalid_argument("Prompt is empty or exceeds model context");
     }
-    size_t lcp = 0;
-    if (cuda_session_.cached_fused == use_fused) {
-        lcp = static_cast<size_t>(std::mismatch(prompt.begin(), prompt.end(), cuda_session_.cached_prompt_tokens.begin(),
-                                               cuda_session_.cached_prompt_tokens.end()).first - prompt.begin());
+    const int length = static_cast<int>(prompt.size());
+    struct Match {
+        size_t index = 0;
+        int common = 0;
+        int prefix = 0;
+        bool append = false;
+        uint64_t last_used = 0;
+        std::shared_ptr<const GdnSnapshot> snapshot;
+    } best;
+    for (size_t i = 0; i < cuda_slots_.size(); ++i) {
+        const auto& slot = cuda_slots_[i];
+        if (!slot || slot->cached_fused != use_fused || slot->cached_tokens.empty()) continue;
+        const int common = static_cast<int>(std::mismatch(prompt.begin(), prompt.end(), slot->cached_tokens.begin(),
+                                                          slot->cached_tokens.end()).first - prompt.begin());
+        const bool append = common == static_cast<int>(slot->cached_tokens.size());
+        Match candidate{i, common, 0, append, slot->last_used, {}};
+        if (slot->gdn.empty()) {
+            candidate.prefix = std::min(common, length - 1);
+        } else if (append && common < length) {
+            candidate.prefix = common;
+        } else {
+            for (const auto& checkpoint : slot->checkpoints) {
+                if (checkpoint.tokens > common || checkpoint.tokens <= candidate.prefix) continue;
+                if (checkpoint.tokens == length && (!checkpoint.snapshot->has_logits || trace || op_trace)) continue;
+                candidate.prefix = checkpoint.tokens;
+                candidate.snapshot = checkpoint.snapshot;
+            }
+        }
+        if (candidate.prefix > 0 || (candidate.append && candidate.common == length)) {
+            if (std::tie(candidate.append, candidate.prefix, candidate.common, candidate.last_used) >
+                std::tie(best.append, best.prefix, best.common, best.last_used)) {
+                best = std::move(candidate);
+            }
+        }
     }
-    if (gdn_layers_.empty() && lcp == prompt.size()) {
-        --lcp;
+
+    size_t target = best.index;
+    if (!best.append && cuda_slots_.size() > 1) {
+        size_t oldest = cuda_slots_.size();
+        for (size_t i = 0; i < cuda_slots_.size(); ++i) {
+            if (best.prefix > 0 && i == best.index) continue;
+            const auto& slot = cuda_slots_[i];
+            if (!slot || slot->cached_tokens.empty()) {
+                oldest = i;
+                break;
+            }
+            if (oldest == cuda_slots_.size() || slot->last_used < cuda_slots_[oldest]->last_used) oldest = i;
+        }
+        target = oldest;
     }
-    if (lcp == 0 || (!gdn_layers_.empty() && (lcp != cuda_session_.cached_prompt_tokens.size() || lcp == prompt.size()))) {
-        reset_kv_and_state(ctx);
-        lcp = 0;
+    if (!cuda_slots_[target]) cuda_slots_[target] = make_cuda_session();
+    if (active_slot_ != target) {
+        cuda_workspace_.decode_graph.reset();
+        cuda_workspace_.graph_captured = false;
+        active_slot_ = target;
     }
-    cuda_session_.cached_prompt_tokens.clear();
-    auto logits = prefill_cuda_impl(ctx, prompt.data() + lcp, static_cast<int>(prompt.size() - lcp),
-                                    static_cast<int>(lcp), use_fused, trace, op_trace);
-    cuda_session_.cached_prompt_tokens = prompt;
-    cuda_session_.cached_fused = use_fused;
-    if (prefilled_tokens) *prefilled_tokens = static_cast<int>(prompt.size() - lcp);
+    auto& slot = cuda_session();
+    slot.cached_tokens.clear();
+    slot.last_used = ++slot_clock_;
+    const int prefix = best.prefix;
+    if (target != best.index && prefix > 0) {
+        const auto& source = *cuda_slots_[best.index];
+        slot.checkpoints.clear();
+        for (const auto& entry : source.checkpoints) {
+            if (entry.tokens <= prefix) slot.checkpoints.push_back(entry);
+        }
+        cuda_kv_pool_.fork(slot.pages, source.pages, prefix);
+    } else {
+        std::erase_if(slot.checkpoints, [=](const auto& entry) { return entry.tokens > prefix; });
+        cuda_kv_pool_.truncate(slot.pages, prefix);
+    }
+    if (best.snapshot) {
+        const auto* data = best.snapshot->data.get();
+        FUSIONRT_CUDA_CHECK(cudaMemcpyAsync(slot.gdn_data, data, slot.ssm_bytes, cudaMemcpyDeviceToDevice, ctx.stream()));
+        if (prefix == length) {
+            FUSIONRT_CUDA_CHECK(cudaMemcpyAsync(cuda_workspace_.logits.ptr(), data + slot.ssm_bytes,
+                                                cuda_workspace_.logits.nbytes(), cudaMemcpyDeviceToDevice, ctx.stream()));
+        }
+    } else if (prefix == 0) {
+        zero_cuda_gdn(ctx);
+    }
+
+    std::vector<float> logits;
+    if (prefix == length) {
+        ensure_cuda_kv(ctx, length, length);
+        auto saved_logits = ctx.download(cuda_workspace_.logits);
+        logits.assign(saved_logits.data<float>(), saved_logits.data<float>() + cfg_.vocab_size);
+    } else {
+        const bool checkpoint_pages = cuda_slots_.size() > 1 && !slot.gdn.empty();
+        logits = prefill_cuda_impl(ctx, prompt.data() + prefix, length - prefix, prefix, use_fused, trace, op_trace,
+                                   checkpoint_pages);
+        save_cuda_checkpoint(ctx, length, true);
+    }
+    slot.cached_tokens = prompt;
+    slot.cached_fused = use_fused;
+    if (prefilled_tokens) *prefilled_tokens = length - prefix;
     return logits;
 }
 
 void FusionModel::execute_prefill_chunks(CudaContext& ctx, const int32_t* token_ids, int count,
                                          int start_pos, bool use_fused, LayerTrace* layer_trace,
-                                         OpTrace* op_trace, bool compute_logits) {
+                                         OpTrace* op_trace, bool compute_logits, bool save_prefix_checkpoints) {
     const int H = static_cast<int>(tok_embeddings_.shape[1]);
     auto& arena = ctx.scratch_arena();
     struct RestoreArena {
@@ -1585,7 +1761,7 @@ void FusionModel::execute_prefill_chunks(CudaContext& ctx, const int32_t* token_
         ~RestoreArena() { arena.reset(mark); }
     } restore{arena, arena.mark()};
 
-    cuda_session_.kv_pool.ensure(ctx, cuda_session_.kv, start_pos + count);
+    ensure_cuda_kv(ctx, start_pos, start_pos + count);
     const int capacity = std::min(count, prefill_batch_limit(ctx));
     Tensor ids = cuda_scratch(ctx, {capacity}, DType::I32);
     Tensor hidden = cuda_scratch(ctx, {capacity, H});
@@ -1595,9 +1771,14 @@ void FusionModel::execute_prefill_chunks(CudaContext& ctx, const int32_t* token_
     if (op_trace) timer = std::make_unique<CudaOpTimer>(ir.nodes.size());
     auto& pa = prof_acc();
 
-    for (int begin = 0; begin < count; begin += capacity) {
-        const int rows = std::min(capacity, count - begin);
+    const int end = start_pos + count;
+    // Keep two recent page boundaries so a different question can reuse a long prompt.
+    int checkpoint = save_prefix_checkpoints ?
+        std::max((start_pos / kKvPageTokens + 1) * kKvPageTokens,
+                 ((end - 1) / kKvPageTokens - 1) * kKvPageTokens) : end;
+    for (int begin = 0; begin < count;) {
         const int position = start_pos + begin;
+        const int rows = std::min(capacity, std::min(end, checkpoint) - position);
         const bool last = begin + rows == count;
         FUSIONRT_CUDA_CHECK(cudaMemcpyAsync(ids.ptr(), token_ids + begin, rows * sizeof(int32_t),
                                             cudaMemcpyHostToDevice, ctx.stream()));
@@ -1605,13 +1786,18 @@ void FusionModel::execute_prefill_chunks(CudaContext& ctx, const int32_t* token_
                                    ids.ptr<int32_t>(), hidden.ptr<float>(), rows, H, ctx.stream());
         if (pa.enabled) pa.reset();
         if (layer_trace || op_trace) {
-            execute_ir_graph_cuda<true>(ir, ws, ctx, hidden, cuda_session_.logits, rows, position, position,
-                nullptr, nullptr, dense_layers_, gdn_layers_, cuda_session_.kv, cuda_session_.gdn,
+            execute_ir_graph_cuda<true>(ir, ws, ctx, hidden, cuda_workspace_.logits, rows, position, position,
+                nullptr, nullptr, dense_layers_, gdn_layers_, cuda_session().kv, cuda_session().gdn,
                 moe_layers_, use_fused, op_trace, timer.get(), last ? layer_trace : nullptr, last && compute_logits);
         } else {
-            execute_ir_graph_cuda(ir, ws, ctx, hidden, cuda_session_.logits, rows, position, position,
-                nullptr, nullptr, dense_layers_, gdn_layers_, cuda_session_.kv, cuda_session_.gdn,
+            execute_ir_graph_cuda(ir, ws, ctx, hidden, cuda_workspace_.logits, rows, position, position,
+                nullptr, nullptr, dense_layers_, gdn_layers_, cuda_session().kv, cuda_session().gdn,
                 moe_layers_, use_fused, nullptr, nullptr, nullptr, last && compute_logits);
+        }
+        begin += rows;
+        if (position + rows == checkpoint && checkpoint < end) {
+            save_cuda_checkpoint(ctx, checkpoint, false);
+            checkpoint += kKvPageTokens;
         }
         if (pa.enabled) {
             std::cerr << "[PROF prefill M=" << rows << "] x16=" << pa.x16_ms << "ms w16=" << pa.w16_ms
@@ -1624,11 +1810,12 @@ void FusionModel::execute_prefill_chunks(CudaContext& ctx, const int32_t* token_
 
 std::vector<float> FusionModel::prefill_cuda_impl(CudaContext& ctx, const int32_t* token_ids, int count,
                                                  int start_pos, bool use_fused, LayerTrace* layer_trace,
-                                                 OpTrace* op_trace) {
+                                                 OpTrace* op_trace, bool save_prefix_checkpoints) {
     std::vector<int32_t> tokens(token_ids, token_ids + count);
     for (auto& token : tokens) token = std::clamp(token, int32_t{0}, cfg_.vocab_size - 1);
-    execute_prefill_chunks(ctx, tokens.data(), count, start_pos, use_fused, layer_trace, op_trace);
-    HostTensor logits = ctx.download(cuda_session_.logits);
+    execute_prefill_chunks(ctx, tokens.data(), count, start_pos, use_fused, layer_trace, op_trace, true,
+                           save_prefix_checkpoints);
+    HostTensor logits = ctx.download(cuda_workspace_.logits);
     return {logits.data<float>(), logits.data<float>() + cfg_.vocab_size};
 }
 
@@ -1646,11 +1833,9 @@ std::vector<int32_t> FusionModel::generate_cuda(CudaContext& ctx, const std::vec
         throw std::invalid_argument("Prompt exceeds model context");
     }
     max_new_tokens = std::min(max_new_tokens, cfg_.dense.max_seq_len - start_pos - prompt_len);
-    bool reuse = options.reuse_prefix && !keep_state;
-    if (!reuse) {
-        cuda_session_.cached_prompt_tokens.clear();
-        if (!keep_state) reset_kv_and_state(ctx);
-    }
+    const bool reuse = options.reuse_prefix && !keep_state;
+    if (keep_state) clear_cuda_history();
+    else if (!reuse) reset_kv_and_state(ctx);
     const bool greedy = options.sampling.greedy();
     use_graph = use_graph && greedy && !options.op_trace;
     std::mt19937_64 rng;
@@ -1660,13 +1845,13 @@ std::vector<int32_t> FusionModel::generate_cuda(CudaContext& ctx, const std::vec
 
     auto download_argmax_tok = [&]() -> int32_t {
         int32_t tok = 0;
-        FUSIONRT_CUDA_CHECK(cudaMemcpyAsync(&tok, cuda_session_.token_ids.ptr<int32_t>(), sizeof(int32_t),
+        FUSIONRT_CUDA_CHECK(cudaMemcpyAsync(&tok, cuda_workspace_.token_ids.ptr<int32_t>(), sizeof(int32_t),
                                             cudaMemcpyDeviceToHost, ctx.stream()));
         ctx.synchronize();
         return tok;
     };
     auto sample_gpu = [&]() {
-        decode_argmax(ctx, cuda_session_.logits, cuda_session_.token_ids, cfg_.vocab_size);
+        decode_argmax(ctx, cuda_workspace_.logits, cuda_workspace_.token_ids, cfg_.vocab_size);
         return download_argmax_tok();
     };
 
@@ -1677,7 +1862,7 @@ std::vector<int32_t> FusionModel::generate_cuda(CudaContext& ctx, const std::vec
                         : prefill_cuda_impl(ctx, tokens.data(), prompt_len, start_pos, use_fused,
                                             options.layer_trace, prefill_trace);
     // A failing callback or CUDA operation must not leave a reusable recurrent state.
-    cuda_session_.cached_prompt_tokens.clear();
+    cuda_session().cached_tokens.clear();
     int32_t next_tok = -1;
     if (max_new_tokens > 0) {
         next_tok = greedy ? sample_gpu() :
@@ -1696,23 +1881,23 @@ std::vector<int32_t> FusionModel::generate_cuda(CudaContext& ctx, const std::vec
         options.op_trace->mode = "decode";
     }
     auto decode = [&](bool first_step) {
-        cuda_session_.kv_pool.ensure(ctx, cuda_session_.kv, pos + 1);
+        ensure_cuda_kv(ctx, pos, pos + 1);
         run_forward_token_step_cuda(ctx, cfg_, tok_embeddings_, ir, ws,
-                                    cuda_session_.hidden, cuda_session_.logits, cuda_session_.token_ids, cuda_session_.position, cuda_session_.kv_length,
-                                    dense_layers_, gdn_layers_, cuda_session_.kv, cuda_session_.gdn, moe_layers_,
-                                    cuda_session_.decode_graph, cuda_session_.graph_captured, cuda_session_.graph_fused, cuda_session_.graph_has_argmax,
-                                    cuda_session_.graph_split_bucket,
+                                    cuda_workspace_.hidden, cuda_workspace_.logits, cuda_workspace_.token_ids, cuda_workspace_.position, cuda_workspace_.kv_length,
+                                    dense_layers_, gdn_layers_, cuda_session().kv, cuda_session().gdn, moe_layers_,
+                                    cuda_workspace_.decode_graph, cuda_workspace_.graph_captured, cuda_workspace_.graph_fused, cuda_workspace_.graph_has_argmax,
+                                    cuda_workspace_.graph_split_bucket,
                                     pos++, use_fused, use_graph, greedy, first_step, options.op_trace, timer.get());
     };
     auto td0 = std::chrono::high_resolution_clock::now();
     if (greedy && use_graph && can_use_cuda_graph(cfg_) && !options.on_token && stop_eos_id < 0 && max_new_tokens > 1 &&
-        static_cast<int64_t>(pos) + max_new_tokens <= cuda_session_.token_ids.shape[0]) {
+        static_cast<int64_t>(pos) + max_new_tokens <= cuda_workspace_.token_ids.shape[0]) {
         // Graph replay feeds the next greedy step and records IDs on the device.
         int first_pos = pos;
         for (int step = 1; step < max_new_tokens; ++step) decode(step == 1);
         tokens.push_back(next_tok);
         tokens.resize(static_cast<size_t>(prompt_len) + max_new_tokens);
-        FUSIONRT_CUDA_CHECK(cudaMemcpyAsync(tokens.data() + prompt_len + 1, cuda_session_.token_ids.ptr<int32_t>() + 1 + first_pos,
+        FUSIONRT_CUDA_CHECK(cudaMemcpyAsync(tokens.data() + prompt_len + 1, cuda_workspace_.token_ids.ptr<int32_t>() + 1 + first_pos,
                                             static_cast<size_t>(max_new_tokens - 1) * sizeof(int32_t),
                                             cudaMemcpyDeviceToHost, ctx.stream()));
         ctx.synchronize();
@@ -1725,22 +1910,23 @@ std::vector<int32_t> FusionModel::generate_cuda(CudaContext& ctx, const std::vec
             if (options.on_token && !options.on_token(next_tok)) break;
             if (step + 1 == max_new_tokens) break;
             if (!greedy) {
-                FUSIONRT_CUDA_CHECK(cudaMemcpyAsync(cuda_session_.token_ids.ptr(), &next_tok, sizeof(next_tok),
+                FUSIONRT_CUDA_CHECK(cudaMemcpyAsync(cuda_workspace_.token_ids.ptr(), &next_tok, sizeof(next_tok),
                                                     cudaMemcpyHostToDevice, ctx.stream()));
             }
             decode(step == 0);
             if (greedy) {
                 next_tok = download_argmax_tok();
             } else {
-                HostTensor host_logits = ctx.download(cuda_session_.logits);
+                HostTensor host_logits = ctx.download(cuda_workspace_.logits);
                 next_tok = Sampler::sample(host_logits.data<float>(), cfg_.vocab_size, tokens, options.sampling, rng);
             }
         }
     }
     if (reuse) {
         // The most recently sampled token has not been forwarded into KV/SSM state.
-        cuda_session_.cached_prompt_tokens.assign(tokens.begin(), tokens.begin() + pos);
-        cuda_session_.cached_fused = use_fused;
+        if (pos > prompt_len) save_cuda_checkpoint(ctx, pos, true);
+        cuda_session().cached_tokens.assign(tokens.begin(), tokens.begin() + pos);
+        cuda_session().cached_fused = use_fused;
     }
     if (options.op_trace && options.op_trace->ops.empty()) *options.op_trace = std::move(prefill_profile);
     auto td1 = std::chrono::high_resolution_clock::now();
@@ -1778,18 +1964,19 @@ std::vector<GenerationStats> FusionModel::bench_model_cuda(CudaContext& ctx, int
     std::vector<GenerationStats> results(reps);
 
     void* host_ptr = nullptr;
-    size_t logits_bytes = cuda_session_.logits.nbytes();
+    size_t logits_bytes = cuda_workspace_.logits.nbytes();
     FUSIONRT_CUDA_CHECK(cudaMallocHost(&host_ptr, logits_bytes + sizeof(int32_t) * std::max(pp, 3)));
     std::unique_ptr<void, decltype(&cudaFreeHost)> host_logits(host_ptr, cudaFreeHost);
     auto* host_args = reinterpret_cast<int32_t*>(static_cast<uint8_t*>(host_ptr) + logits_bytes);
     auto read_logits = [&] {
-        FUSIONRT_CUDA_CHECK(cudaMemcpyAsync(host_logits.get(), cuda_session_.logits.ptr(), logits_bytes,
+        FUSIONRT_CUDA_CHECK(cudaMemcpyAsync(host_logits.get(), cuda_workspace_.logits.ptr(), logits_bytes,
                                            cudaMemcpyDeviceToHost, ctx.stream()));
     };
     use_graph = use_graph && can_use_cuda_graph(cfg_);
+    reset_kv_and_state(ctx);
 
     if (pp > 0) {
-        cuda_session_.kv_pool.ensure(ctx, cuda_session_.kv, pp);
+        ensure_cuda_kv(ctx, 0, pp);
         std::copy(prompt.begin(), prompt.end(), host_args);
         auto prefill = [&] {
             execute_prefill_chunks(ctx, host_args, pp, 0, true, nullptr, nullptr);
@@ -1798,7 +1985,8 @@ std::vector<GenerationStats> FusionModel::bench_model_cuda(CudaContext& ctx, int
         CudaGraphExec graph;
         if (use_graph) graph.capture(ctx.stream(), prefill);
         for (int rep = -1; rep < reps; ++rep) {
-            reset_kv_and_state(ctx);
+            zero_cuda_gdn(ctx);
+            ctx.synchronize();
             auto start = Clock::now();
             if (use_graph) graph.launch(ctx.stream());
             else prefill();
@@ -1814,35 +2002,38 @@ std::vector<GenerationStats> FusionModel::bench_model_cuda(CudaContext& ctx, int
     }
 
     if (tg > 0) {
-        cuda_session_.kv_pool.ensure(ctx, cuda_session_.kv, decode_prefix + tg);
+        ensure_cuda_kv(ctx, 0, decode_prefix + tg);
         Tensor args = cuda_scratch(ctx, {3}, DType::I32);
         auto decode = [&](int pos) {
             FUSIONRT_CUDA_CHECK(cudaMemcpyAsync(args.ptr(), host_args, args.nbytes(), cudaMemcpyHostToDevice, ctx.stream()));
             cuda_ops::embed_lookup_f32(tok_embeddings_.ptr(), tok_embeddings_.dtype,
-                                       args.ptr<int32_t>(), cuda_session_.hidden.ptr<float>(), 1, H, ctx.stream());
-            execute_ir_graph_cuda(ir, ws, ctx, cuda_session_.hidden, cuda_session_.logits, 1, pos, pos,
+                                       args.ptr<int32_t>(), cuda_workspace_.hidden.ptr<float>(), 1, H, ctx.stream());
+            execute_ir_graph_cuda(ir, ws, ctx, cuda_workspace_.hidden, cuda_workspace_.logits, 1, pos, pos,
                                   use_graph ? args.ptr<int32_t>() + 1 : nullptr,
                                   use_graph ? args.ptr<int32_t>() + 2 : nullptr,
-                                  dense_layers_, gdn_layers_, cuda_session_.kv, cuda_session_.gdn, moe_layers_, true);
+                                  dense_layers_, gdn_layers_, cuda_session().kv, cuda_session().gdn, moe_layers_, true);
             read_logits();
         };
         CudaGraphExec graph;
         if (use_graph) graph.capture(ctx.stream(), [&] { decode(decode_prefix); });
         std::vector<std::pair<HostTensor, HostTensor>> recurrent_prefix;
         if (!prefix.empty()) {
-            reset_kv_and_state(ctx);
+            zero_cuda_gdn(ctx);
             execute_prefill_chunks(ctx, prefix.data(), decode_prefix, 0, true, nullptr, nullptr, false);
-            for (const auto& state : cuda_session_.gdn) {
+            for (const auto& state : cuda_session().gdn) {
                 recurrent_prefix.emplace_back(ctx.download(state.convolution), ctx.download(state.recurrence));
             }
             ctx.synchronize();
         }
         for (int rep = -1; rep < reps; ++rep) {
-            if (prefix.empty()) reset_kv_and_state(ctx);
+            if (prefix.empty()) {
+                zero_cuda_gdn(ctx);
+                ctx.synchronize();
+            }
             // Decode only overwrites KV after the prefix. GDN state must be restored in place.
             for (size_t i = 0; i < recurrent_prefix.size(); ++i) {
-                ctx.upload_into(recurrent_prefix[i].first, cuda_session_.gdn[i].convolution);
-                ctx.upload_into(recurrent_prefix[i].second, cuda_session_.gdn[i].recurrence);
+                ctx.upload_into(recurrent_prefix[i].first, cuda_session().gdn[i].convolution);
+                ctx.upload_into(recurrent_prefix[i].second, cuda_session().gdn[i].recurrence);
             }
             auto start = Clock::now();
             for (int pos = 0; pos < tg; ++pos) {
@@ -1866,15 +2057,16 @@ std::vector<GenerationStats> FusionModel::bench_model_cuda(CudaContext& ctx, int
         reset_kv_and_state(ctx);
         if (tg > 0) {
             trace->mode = "decode";
+            ensure_cuda_kv(ctx, 0, decode_prefix + tg);
             if (!prefix.empty()) execute_prefill_chunks(ctx, prefix.data(), decode_prefix, 0, true, nullptr, nullptr, false);
             CudaOpTimer timer(ir.nodes.size());
             for (int pos = 0; pos < tg; ++pos) {
-                FUSIONRT_CUDA_CHECK(cudaMemcpyAsync(cuda_session_.token_ids.ptr(), &steps[pos], sizeof(int32_t),
+                FUSIONRT_CUDA_CHECK(cudaMemcpyAsync(cuda_workspace_.token_ids.ptr(), &steps[pos], sizeof(int32_t),
                                                     cudaMemcpyHostToDevice, ctx.stream()));
-                run_forward_token_step_cuda(ctx, cfg_, tok_embeddings_, ir, ws, cuda_session_.hidden, cuda_session_.logits,
-                                            cuda_session_.token_ids, cuda_session_.position, cuda_session_.kv_length, dense_layers_, gdn_layers_, cuda_session_.kv, cuda_session_.gdn, moe_layers_,
-                                            cuda_session_.decode_graph, cuda_session_.graph_captured, cuda_session_.graph_fused, cuda_session_.graph_has_argmax,
-                                cuda_session_.graph_split_bucket,
+                run_forward_token_step_cuda(ctx, cfg_, tok_embeddings_, ir, ws, cuda_workspace_.hidden, cuda_workspace_.logits,
+                                            cuda_workspace_.token_ids, cuda_workspace_.position, cuda_workspace_.kv_length, dense_layers_, gdn_layers_, cuda_session().kv, cuda_session().gdn, moe_layers_,
+                                            cuda_workspace_.decode_graph, cuda_workspace_.graph_captured, cuda_workspace_.graph_fused, cuda_workspace_.graph_has_argmax,
+                                cuda_workspace_.graph_split_bucket,
                                             decode_prefix + pos, true, false, false, true, trace, &timer);
             }
         } else {

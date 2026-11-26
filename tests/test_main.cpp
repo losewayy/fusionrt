@@ -1061,10 +1061,11 @@ void test_cuda_wave2_prefill(CudaContext& ctx) {
             ctx.set_kv_dtype(dtype);
             const auto persistent_mark = ctx.weight_arena().mark();
             {
-                const auto cache = make_cuda_kv_view(ctx, 262144, nkv, hd);
+                const auto cache = make_cuda_kv_view(ctx.weight_arena(), dtype, 262144, nkv, hd);
                 CudaKvPool pool;
+                CudaKvPool::Table pages;
                 auto append = [&](int from, int count) {
-                    pool.ensure(ctx, std::span(&cache, 1), from + count);
+                    pool.ensure(ctx, std::span(&cache, 1), pages, from, from + count);
                     cuda_ops::batched_qk_norm_rope_kv_append_f32(
                         q.ptr<float>() + from * stride, k.ptr<float>() + from * nkv * hd, v.ptr<float>() + from * nkv * hd,
                         nullptr, nullptr, nullptr, nullptr, count, nq, nkv, hd, 0, from, total, 10000.0f, 1e-6f,
@@ -1148,8 +1149,9 @@ void test_cuda_qk_rope_and_gqa_64k(CudaContext& ctx) {
     ctx.set_kv_dtype(DType::Q8_0);
     {
         CudaKvPool pool;
-        const auto cache = make_cuda_kv_view(ctx, max_seq, nkv, hd);
-        pool.ensure(ctx, std::span(&cache, 1), max_seq);
+        CudaKvPool::Table pages;
+        const auto cache = make_cuda_kv_view(ctx.weight_arena(), ctx.kv_dtype(), max_seq, nkv, hd);
+        pool.ensure(ctx, std::span(&cache, 1), pages, pos, max_seq);
         ctx.upload_into(hq, dq);
         ctx.upload_into(hk, dk);
         cuda_ops::fused_qk_norm_rope_kv_append_f32(dq.ptr<float>(), dk.ptr<float>(), dv.ptr<float>(),
@@ -1792,6 +1794,108 @@ void test_wave3() {
 }
 
 #ifdef FUSIONRT_ENABLE_CUDA
+void test_cuda_session_slots() {
+    std::cout << "Testing CUDA session slots, KV sharing, GDN checkpoints and LRU...\n";
+    CudaContext ctx(0, 48, 48);
+    ctx.set_kv_dtype(DType::Q8_0);
+    HybridModelConfig cfg;
+    cfg.num_layers = 2;
+    cfg.vocab_size = 64;
+    cfg.dense.hidden_size = cfg.gdn.hidden_size = 128;
+    cfg.dense.num_attention_heads = 2;
+    cfg.dense.intermediate_size = cfg.gdn.intermediate_size = 128;
+    cfg.dense.max_seq_len = 512;
+    const auto mark = ctx.weight_arena().mark();
+    int prefilled = 0;
+
+    {
+        FusionModel model(cfg);
+        model.set_num_slots(2);
+        model.init_synthetic(ctx);
+        const std::vector<int32_t> a(170, 1);
+        const std::vector<int32_t> a_append{3};
+        model.forward_prefill_cuda(ctx, a, 0);
+        model.forward_prefill_cuda(ctx, a_append, static_cast<int>(a.size()));
+        const auto cold = model.forward_token_cuda(ctx, 4, static_cast<int>(a.size() + 1), true, true);
+        model.reset_kv_and_state(ctx);
+        model.prefill_cached_cuda(ctx, a);
+        const auto a_cache = model.cuda_cache_memory();
+        auto b = a;
+        std::fill(b.begin() + 145, b.end(), 2);
+        model.prefill_cached_cuda(ctx, b, true, &prefilled);
+        const auto b_cache = model.cuda_cache_memory();
+        if (prefilled != 25 || a_cache.kv_pages != 2 || b_cache.kv_pages != 3 ||
+            b_cache.kv_bytes * 2 != a_cache.kv_bytes * 3) {
+            throw std::runtime_error("Dense fork must share the complete page and copy only the partial page");
+        }
+        auto a_next = a;
+        a_next.push_back(a_append.front());
+        model.prefill_cached_cuda(ctx, a_next, true, &prefilled);
+        const auto resumed = model.forward_token_cuda(ctx, 4, static_cast<int>(a_next.size()), true, true);
+        if (prefilled != 1 || resumed != cold) {
+            throw std::runtime_error("Dense slot A decode after the fork must match cold logits exactly");
+        }
+    }
+    ctx.weight_arena().reset(mark);
+
+    {
+        auto hybrid = cfg;
+        hybrid.arch = "hybrid";
+        hybrid.num_layers = 4;
+        FusionModel model(hybrid);
+        model.set_num_slots(2);
+        model.init_synthetic(ctx);
+        const auto initial_ssm = model.cuda_cache_memory().ssm_bytes;
+        std::vector<int32_t> a(147, 1);
+        GenerationOptions options;
+        options.reuse_prefix = true;
+        GenerationStats stats;
+        auto turn = model.generate_cuda(ctx, a, 3, true, true, &stats, false, 0, -1, options);
+        turn.pop_back();  // Only the forwarded tokens have a checkpoint.
+        auto next = turn;
+        next.insert(next.end(), 7, 2);
+        model.prefill_cached_cuda(ctx, next, true, &prefilled);
+        if (prefilled != 7) throw std::runtime_error("Hybrid turn must append to the live recurrent state");
+
+        auto b = turn;
+        b.insert(b.end(), 8, 3);
+        const auto forked = model.prefill_cached_cuda(ctx, b, true, &prefilled);
+        const auto cache = model.cuda_cache_memory();
+        if (prefilled != 8 || cache.kv_pages != 3 || initial_ssm == 0 || cache.ssm_bytes != 7 * initial_ssm) {
+            throw std::runtime_error("Hybrid fork must restore the turn checkpoint and share immutable snapshots");
+        }
+        model.reset_kv_and_state(ctx);
+        const auto cold = model.forward_prefill_cuda(ctx, b, 0);
+        expect_close(forked, {cold.begin(), cold.end()}, 1e-5, 1e-5,
+                     "Hybrid GDN turn checkpoint fork against cold prefill");
+    }
+    ctx.weight_arena().reset(mark);
+
+    {
+        FusionModel model(cfg);
+        model.set_num_slots(2);
+        model.init_synthetic(ctx);
+        const std::vector<int32_t> a(300, 1), b(150, 2), c(80, 3);
+        model.prefill_cached_cuda(ctx, a);
+        model.prefill_cached_cuda(ctx, b);
+        model.prefill_cached_cuda(ctx, a);
+        const auto before = model.cuda_cache_memory();
+        model.prefill_cached_cuda(ctx, c, true, &prefilled);
+        const auto after = model.cuda_cache_memory();
+        if (prefilled != 80 || before.kv_pages != 5 || after.kv_pages != 4 ||
+            after.kv_reserved_bytes != before.kv_reserved_bytes) {
+            throw std::runtime_error("LRU eviction must return unreferenced pages to the free list");
+        }
+        model.prefill_cached_cuda(ctx, a, true, &prefilled);
+        if (prefilled != 1) throw std::runtime_error("LRU eviction must keep the most recently used slot");
+        model.prefill_cached_cuda(ctx, b, true, &prefilled);
+        const auto reused = model.cuda_cache_memory();
+        if (prefilled != 150 || reused.kv_pages != 5 || reused.kv_reserved_bytes != before.kv_reserved_bytes) {
+            throw std::runtime_error("An evicted prompt must start cold and recycle the released pages");
+        }
+    }
+}
+
 void test_chunked_prefill_and_k_quant_gdn() {
     std::cout << "Testing chunked prefill and K-quant GDN GGUF...\n";
     CudaContext ctx(0, 64, 64);
@@ -1924,6 +2028,7 @@ int main() {
         test_wave3();
 #ifdef FUSIONRT_ENABLE_CUDA
         test_chunked_prefill_and_k_quant_gdn();
+        test_cuda_session_slots();
 #endif
         std::cout << "\nALL TESTS PASSED!\n";
         return 0;

@@ -140,7 +140,7 @@ struct Request {
 
 std::optional<Request> read_request(SocketHandle fd) {
     constexpr size_t max_headers = 16 * 1024;
-    constexpr size_t max_body = 2 * 1024 * 1024;
+    constexpr size_t max_body = 16 * 1024 * 1024;
     std::string data;
     auto receive = [&] {
         char buf[4096];
@@ -268,6 +268,10 @@ Completion generate(CudaContext& ctx, FusionModel& model, const BpeTokenizer& to
     };
     const int limit = std::min(params.max_tokens, context - static_cast<int>(prompt.size()));
     model.generate_cuda(ctx, prompt, limit, true, graph, &completion.stats, false, 0, -1, opts);
+    const auto& stats = completion.stats;
+    std::clog << "prompt_tokens=" << stats.prompt_tokens << " prefilled_tokens=" << stats.prefilled_tokens
+              << " cached_tokens=" << stats.prompt_tokens - stats.prefilled_tokens
+              << " prefill_ms=" << stats.prefill_ms << std::endl;
     if (connected && !stop.matched && emit(stop.push(utf8.finish())) && !stop.matched) emit(stop.pending);
     if (stop.matched) completion.finish = agent::Finish::stop;
     return completion;
@@ -335,8 +339,7 @@ void complete_agent(SocketHandle fd, CudaContext& ctx, FusionModel& model, const
     agent::ToolParser parser(request, rendered, [&](std::string_view text) { response.text(text); },
                              [&](agent::ToolCall call) { response.call(std::move(call)); });
     try {
-        // Agent clients replay their history. A separate turn starts with fresh KV and recurrent state.
-        const auto completion = generate(ctx, model, tokenizer, prompt, request.generation, context, graph, false,
+        const auto completion = generate(ctx, model, tokenizer, prompt, request.generation, context, graph, true,
             [&](const std::string& text) {
                 parser.push(text);
                 return response.connected();
@@ -422,7 +425,12 @@ void serve_http(CudaContext& ctx, FusionModel& model, const BpeTokenizer& tokeni
             if (req->method == "OPTIONS") {
                 send_all(fd, std::string("HTTP/1.1 204 No Content\r\nConnection: close\r\n") + cors + "\r\n");
             } else if (req->method == "GET" && req->path == "/health") {
-                reply(fd, "200 OK", JsonObject{{"status", "ok"}, {"model", model_name}, {"arch", arch}, {"backend", "cuda"}});
+                const auto cache = model.cuda_cache_memory();
+                reply(fd, "200 OK", JsonObject{{"status", "ok"}, {"model", model_name}, {"arch", arch}, {"backend", "cuda"},
+                      {"slots", model.num_slots()}, {"kv_pages", cache.kv_pages},
+                      {"kv_bytes", static_cast<int64_t>(cache.kv_bytes)},
+                      {"kv_reserved_bytes", static_cast<int64_t>(cache.kv_reserved_bytes)},
+                      {"ssm_bytes", static_cast<int64_t>(cache.ssm_bytes)}});
             } else if (req->method == "GET" && req->path == "/v1/models") {
                 reply(fd, "200 OK", JsonObject{{"object", "list"}, {"data", JsonArray{JsonObject{
                       {"id", model_name}, {"object", "model"}, {"created", int64_t{0}}, {"owned_by", "fusionrt"}}}}});

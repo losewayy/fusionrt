@@ -41,7 +41,7 @@ void print_usage() {
               << "               [--profile <json>] [--profile-ops <json>] [--trace-layers <json>]\n"
               << "  fusionrt inspect --model <path> [--max-seq 4096]\n"
               << "  fusionrt chat --model <path> [--system <text>] [--temp 0.7] [--max-tokens 512]\n"
-              << "  fusionrt serve --model <path> [--host 127.0.0.1] [--port 8080] [--max-seq 4096] [--profile <json>]\n"
+              << "  fusionrt serve --model <path> [--host 127.0.0.1] [--port 8080] [--max-seq 4096] [--slots 1] [--profile <json>]\n"
               << "  fusionrt bench-model --model <path> [--pp 128] [--tg 64] [--decode-prefix 0] [--ubatch 512] [--reps 5] [--graph] [--profile-ops <json>]\n"
               << "  CUDA run, chat, serve, inspect and bench-model accept --kv-type {f32|f16|q8_0}.\n"
               << "  fusionrt bench [--suite all|fusions|blocks|vulkan] [--output <path>] [--vk-device 0]\n";
@@ -192,7 +192,7 @@ int cmd_daily(const std::string& cmd, int argc, char** argv) {
     return 1;
 #else
     std::string path, system, profile, host = "127.0.0.1";
-    int max_seq = 4096, steps = 512, port = 8080;
+    int max_seq = 4096, steps = 512, port = 8080, slots = 1;
     std::optional<bool> graph;
     SamplingParams sampling;
     sampling.temperature = 0.7f;
@@ -213,6 +213,11 @@ int cmd_daily(const std::string& cmd, int argc, char** argv) {
         else if (arg == "--profile") profile = value;
         else if (cmd == "serve" && arg == "--host") host = value;
         else if (cmd == "serve" && arg == "--port") port = std::stoi(value);
+        else if (cmd == "serve" && arg == "--slots") {
+            size_t parsed = 0;
+            slots = std::stoi(value, &parsed);
+            if (parsed != value.size() || slots < 1) throw std::invalid_argument("Expected --slots >= 1");
+        }
         else if (cmd == "chat" && arg == "--system") system = value;
         else if (cmd == "chat" && arg == "--max-tokens") steps = std::stoi(value);
         else if (cmd != "chat" || !parse_sampling(arg, value, sampling)) {
@@ -226,6 +231,7 @@ int cmd_daily(const std::string& cmd, int argc, char** argv) {
     CudaContext ctx(0, is_gguf(path) ? 0 : estimate_arena_mb(path), 256);
     ctx.set_kv_dtype(kv_dtype);
     FusionModel model(HybridModelConfig{});
+    model.set_num_slots(slots);
     load_cuda_model(ctx, model, path, max_seq, profile);
     const bool use_graph = graph.value_or(model.recommended_cuda_graph());
     if (cmd == "inspect") {
@@ -268,10 +274,11 @@ int cmd_daily(const std::string& cmd, int argc, char** argv) {
                   << "\nstatic_scratch_peak_bytes=" << mem.static_scratch_bytes
                   << " kv_cache_dtype=" << dtype_name(kv_dtype) << " kv_cache_bytes=" << mem.kv_bytes
                   << " kv_cache_pages=" << mem.kv_pages
+                  << " kv_cache_reserved_bytes=" << mem.kv_reserved_bytes
                   << " weight_arena_reserved_bytes=" << ctx.weight_arena().capacity()
                   << " ssm_cache_bytes=" << mem.ssm_bytes
                   << " persistent_bytes=" << mem.persistent_bytes
-                  << " total_vram_estimate_bytes=" << mem.persistent_bytes + mem.kv_bytes + mem.static_scratch_bytes << '\n';
+                  << " total_vram_estimate_bytes=" << mem.persistent_bytes + mem.kv_reserved_bytes + mem.static_scratch_bytes << '\n';
         return 0;
     }
     BpeTokenizer tokenizer;

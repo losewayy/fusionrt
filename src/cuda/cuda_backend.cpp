@@ -42,61 +42,131 @@ void CudaContext::set_kv_dtype(DType dtype) {
     kv_dtype_ = dtype;
 }
 
-CudaKvView make_cuda_kv_view(CudaContext& ctx, int max_tokens, int kv_heads, int head_dim) {
-    const DType dtype = ctx.kv_dtype();
+CudaKvView make_cuda_kv_view(CudaArena& arena, DType dtype, int max_tokens, int kv_heads, int head_dim) {
     if (dtype == DType::Q8_0 && head_dim % 32 != 0) {
         throw std::invalid_argument("Q8_0 KV requires a head dimension divisible by 32");
     }
     const int pages = 1 + (max_tokens - 1) / kKvPageTokens;
     const int elements = kKvPageTokens * kv_heads * head_dim;
     const size_t plane = size_t(elements) / dtype_block_size(dtype) * dtype_type_size(dtype);
-    auto* table = static_cast<uint8_t**>(ctx.weight_arena().alloc(pages * sizeof(uint8_t*)));
+    auto* table = static_cast<uint8_t**>(arena.alloc(pages * sizeof(uint8_t*)));
     return {table, plane, elements, pages, dtype};
 }
 
-void CudaKvPool::ensure(CudaContext& ctx, std::span<const CudaKvView> layers, int tokens) {
-    if (tokens <= 0 || layers.empty()) return;
-    const int requested = 1 + (tokens - 1) / kKvPageTokens;
-    if (requested <= pages_) return;
-    const int added = requested - pages_;
-    size_t stride = 0;
-    for (const auto& layer : layers) {
-        if (requested > layer.max_pages) throw std::invalid_argument("KV position exceeds context");
-        stride += 2 * layer.plane_bytes;
-    }
-    const size_t bytes = added * stride;
-    std::vector<uint8_t*> entries(layers.size() * added);
+static int kv_pages_for(int tokens) { return tokens > 0 ? 1 + (tokens - 1) / kKvPageTokens : 0; }
+
+void CudaKvPool::grow(int count) {
     if (slabs_.size() == slabs_.capacity()) {
         slabs_.reserve(2 * slabs_.size() + 1);
     }
+    const int old_size = static_cast<int>(physical_.size());
+    if (physical_.size() + count > physical_.capacity()) {
+        physical_.reserve(std::max(2 * physical_.size(), physical_.size() + count));
+    }
     uint8_t* data = nullptr;
-    FUSIONRT_CUDA_CHECK(cudaMalloc(&data, bytes));
-    Slab slab{{data, cudaFree}, bytes};
-    FUSIONRT_CUDA_CHECK(cudaMemsetAsync(data, 0, bytes, ctx.stream()));
+    FUSIONRT_CUDA_CHECK(cudaMalloc(&data, count * page_bytes_));
+    slabs_.emplace_back(data, cudaFree);
+    for (int i = 0; i < count; ++i) {
+        physical_.push_back({data + i * page_bytes_, 0, i + 1 < count ? old_size + i + 1 : free_});
+    }
+    free_ = old_size;
+}
+
+int CudaKvPool::acquire() {
+    const int id = free_;
+    auto& page = physical_[id];
+    free_ = page.next_free;
+    page.refs = 1;
+    ++pages_;
+    return id;
+}
+
+void CudaKvPool::drop(int id) {
+    auto& page = physical_[id];
+    if (--page.refs == 0) {
+        page.next_free = free_;
+        free_ = id;
+        --pages_;
+    }
+}
+
+void CudaKvPool::ensure(CudaContext& ctx, std::span<const CudaKvView> layers, Table& table,
+                        int first_write, int tokens) {
+    if (tokens <= 0 || layers.empty()) return;
+    const int requested = kv_pages_for(tokens);
+    const int existing = static_cast<int>(table.pages_.size());
+    const int first = first_write < tokens ? first_write / kKvPageTokens : requested;
+    int needed = std::max(0, requested - existing);
+    for (int p = first; p < std::min(requested, existing); ++p) {
+        needed += physical_[table.pages_[p]].refs > 1;
+    }
+    if (requested > layers.front().max_pages) throw std::invalid_argument("KV position exceeds context");
+    if (page_bytes_ == 0) {
+        for (const auto& layer : layers) page_bytes_ += 2 * layer.plane_bytes;
+    }
+    const int missing = needed - (static_cast<int>(physical_.size()) - pages_);
+    if (missing > 0) grow(missing);
+    if (static_cast<size_t>(requested) > table.pages_.capacity()) {
+        table.pages_.reserve(std::max(static_cast<size_t>(requested), 2 * table.pages_.size()));
+    }
+    for (int p = std::min(first, existing); p < requested; ++p) {
+        const int old = p < existing ? table.pages_[p] : -1;
+        if (old >= 0 && physical_[old].refs == 1) continue;
+        const int id = acquire();
+        auto* data = physical_[id].data;
+        if (old >= 0) {
+            table.pages_[p] = id;
+            table.published_ = std::min(table.published_, p);
+            drop(old);
+            FUSIONRT_CUDA_CHECK(cudaMemcpyAsync(data, physical_[old].data, page_bytes_,
+                                                cudaMemcpyDeviceToDevice, ctx.stream()));
+        } else {
+            table.pages_.push_back(id);
+            FUSIONRT_CUDA_CHECK(cudaMemsetAsync(data, 0, page_bytes_, ctx.stream()));
+        }
+    }
+    const int added = requested - table.published_;
+    if (added <= 0) return;
+    std::vector<uint8_t*> entries(layers.size() * added);
     size_t offset = 0;
     for (size_t i = 0; i < layers.size(); ++i) {
         auto* entry = entries.data() + i * added;
-        for (int p = 0; p < added; ++p) entry[p] = data + offset + p * stride;
-        FUSIONRT_CUDA_CHECK(cudaMemcpyAsync(layers[i].pages + pages_, entry, added * sizeof(*entry),
+        for (int p = 0; p < added; ++p) entry[p] = physical_[table.pages_[table.published_ + p]].data + offset;
+        FUSIONRT_CUDA_CHECK(cudaMemcpyAsync(layers[i].pages + table.published_, entry, added * sizeof(*entry),
                                             cudaMemcpyHostToDevice, ctx.stream()));
         offset += 2 * layers[i].plane_bytes;
     }
     ctx.synchronize();
-    slabs_.push_back(std::move(slab));
-    pages_ = requested;
-    bytes_ += bytes;
+    table.published_ = requested;
 }
 
-void CudaKvPool::clear(CudaContext& ctx) {
-    for (const auto& slab : slabs_) {
-        FUSIONRT_CUDA_CHECK(cudaMemsetAsync(slab.data.get(), 0, slab.bytes, ctx.stream()));
+void CudaKvPool::fork(Table& dst, const Table& src, int tokens) {
+    const int kept = std::min(kv_pages_for(tokens), static_cast<int>(src.pages_.size()));
+    if (&dst == &src) {
+        truncate(dst, tokens);
+        return;
     }
+    std::vector<int> prefix(src.pages_.begin(), src.pages_.begin() + kept);
+    for (int id : prefix) ++physical_[id].refs;
+    truncate(dst, 0);
+    dst.pages_ = std::move(prefix);
+}
+
+void CudaKvPool::truncate(Table& table, int tokens) {
+    const int kept = std::min(kv_pages_for(tokens), static_cast<int>(table.pages_.size()));
+    while (table.pages_.size() > static_cast<size_t>(kept)) {
+        drop(table.pages_.back());
+        table.pages_.pop_back();
+    }
+    table.published_ = std::min(table.published_, kept);
 }
 
 void CudaKvPool::release() {
     slabs_.clear();
+    physical_.clear();
     pages_ = 0;
-    bytes_ = 0;
+    page_bytes_ = 0;
+    free_ = -1;
 }
 
 CudaArena::~CudaArena() {

@@ -145,24 +145,45 @@ struct CudaKvView {
     DType dtype = DType::F32;
 };
 
-CudaKvView make_cuda_kv_view(CudaContext& ctx, int max_tokens, int kv_heads, int head_dim);
+CudaKvView make_cuda_kv_view(CudaArena& arena, DType dtype, int max_tokens, int kv_heads, int head_dim);
 
 class CudaKvPool {
 public:
-    void ensure(CudaContext& ctx, std::span<const CudaKvView> layers, int tokens);
-    void clear(CudaContext& ctx);
+    class Table {
+    public:
+        Table() = default;
+        Table(const Table&) = delete;
+        Table& operator=(const Table&) = delete;
+
+    private:
+        friend class CudaKvPool;
+        std::vector<int> pages_;
+        int published_ = 0;
+    };
+
+    void ensure(CudaContext& ctx, std::span<const CudaKvView> layers, Table& table, int first_write, int tokens);
+    void fork(Table& dst, const Table& src, int tokens);
+    void truncate(Table& table, int tokens);
     void release();
-    size_t bytes() const { return bytes_; }
+    size_t bytes() const { return pages_ * page_bytes_; }
     int pages() const { return pages_; }
+    size_t reserved_bytes() const { return physical_.size() * page_bytes_; }
 
 private:
-    struct Slab {
-        std::unique_ptr<uint8_t, decltype(&cudaFree)> data{nullptr, cudaFree};
-        size_t bytes;
+    struct Page {
+        uint8_t* data;
+        size_t refs = 0;
+        int next_free = -1;
     };
-    std::vector<Slab> slabs_;
-    size_t bytes_ = 0;
+    void grow(int count);
+    int acquire();
+    void drop(int id);
+
+    std::vector<std::unique_ptr<uint8_t, decltype(&cudaFree)>> slabs_;
+    std::vector<Page> physical_;
+    size_t page_bytes_ = 0;
     int pages_ = 0;
+    int free_ = -1;
 };
 
 void check_cuda(cudaError_t err, const char* expr, const char* file, int line);

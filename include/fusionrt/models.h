@@ -114,6 +114,7 @@ struct ModelMemory {
     size_t static_scratch_bytes = 0;
     size_t kv_bytes = 0;
     int kv_pages = 0;
+    size_t kv_reserved_bytes = 0;
     size_t ssm_bytes = 0;
     size_t persistent_bytes = 0;
     std::map<DType, size_t> weight_bytes;
@@ -239,6 +240,8 @@ public:
     const HybridModelConfig& config() const { return cfg_; }
 
 #ifdef FUSIONRT_ENABLE_CUDA
+    void set_num_slots(int n);
+    int num_slots() const { return static_cast<int>(cuda_slots_.size()); }
     void init_synthetic(CudaContext& ctx, uint64_t seed = 42);
     bool load_gguf(CudaContext& ctx, const std::string& path, std::string* err = nullptr, int max_seq_override = 0);
     bool load_safetensors(CudaContext& ctx, const std::string& path, std::string* err = nullptr, int max_seq_override = 0);
@@ -259,6 +262,7 @@ public:
                                                   OpTrace* trace = nullptr, int decode_prefix = 0);
     void set_device_profile(CudaContext& ctx, const DeviceProfile& profile);
     bool recommended_cuda_graph() const { return recommend_cuda_graph_; }
+    ModelMemory cuda_cache_memory() const;
     ModelMemory inspect_cuda(CudaContext& ctx);
     int prefill_batch_limit(CudaContext& ctx) const;
 
@@ -292,19 +296,50 @@ private:
     Tensor tok_embeddings_;
     Tensor final_norm_w_;
     Tensor lm_head_w_;
-    struct CudaSession {
+    struct CudaWorkspace {
         Tensor hidden, logits, token_ids, position, kv_length;
-        std::vector<CudaKvView> kv;
-        CudaKvPool kv_pool;
-        std::vector<CudaGdnState> gdn;
-        std::vector<int32_t> cached_prompt_tokens;
-        bool cached_fused = true;
         CudaGraphExec decode_graph;
         bool graph_captured = false;
         bool graph_fused = true;
         bool graph_has_argmax = false;
         int graph_split_bucket = 0;
-    } cuda_session_;
+    } cuda_workspace_;
+
+    struct GdnSnapshot {
+        std::unique_ptr<uint8_t, decltype(&cudaFree)> data{nullptr, cudaFree};
+        bool has_logits = false;
+    };
+    struct GdnCheckpoint {
+        int tokens;
+        std::shared_ptr<const GdnSnapshot> snapshot;
+    };
+    struct CudaSession {
+        CudaArena storage;
+        std::vector<CudaKvView> kv;
+        CudaKvPool::Table pages;
+        std::vector<CudaGdnState> gdn;
+        void* gdn_data = nullptr;
+        size_t ssm_bytes = 0;
+        std::vector<GdnCheckpoint> checkpoints;
+        // Checkpoints belong to exact prefixes of this token history.
+        std::vector<int32_t> cached_tokens;
+        bool cached_fused = true;
+        uint64_t last_used = 0;
+    };
+    CudaKvPool cuda_kv_pool_;
+    std::vector<std::unique_ptr<CudaSession>> cuda_slots_{1};
+    DType cuda_kv_dtype_ = DType::F32;
+    size_t active_slot_ = 0;
+    uint64_t slot_clock_ = 0;
+    CudaContext* owned_gguf_arena_ = nullptr;
+
+    CudaSession& cuda_session() { return *cuda_slots_[active_slot_]; }
+    std::unique_ptr<CudaSession> make_cuda_session() const;
+    void release_cuda_sessions();
+    void clear_cuda_history();
+    void zero_cuda_gdn(CudaContext& ctx);
+    void ensure_cuda_kv(CudaContext& ctx, int first_write, int tokens);
+    void save_cuda_checkpoint(CudaContext& ctx, int tokens, bool logits);
 
     std::vector<CudaDenseGQALayer> dense_layers_;
     std::vector<CudaGatedDeltaNetLayer> gdn_layers_;
@@ -313,10 +348,11 @@ private:
     MiniGraph fused_ir_graph_;
     bool recommend_cuda_graph_ = false;
     void execute_prefill_chunks(CudaContext& ctx, const int32_t* token_ids, int count, int start_pos,
-                                bool use_fused, LayerTrace* layer_trace, OpTrace* op_trace, bool compute_logits = true);
+                                bool use_fused, LayerTrace* layer_trace, OpTrace* op_trace,
+                                bool compute_logits = true, bool save_prefix_checkpoints = false);
     std::vector<float> prefill_cuda_impl(CudaContext& ctx, const int32_t* token_ids, int count,
                                          int start_pos, bool use_fused, LayerTrace* layer_trace = nullptr,
-                                         OpTrace* op_trace = nullptr);
+                                         OpTrace* op_trace = nullptr, bool save_prefix_checkpoints = false);
 
 #endif
 
