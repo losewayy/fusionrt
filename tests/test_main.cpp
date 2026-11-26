@@ -6,6 +6,7 @@
 #include "fusionrt/tokenizer.h"
 #include "agent.h"
 #ifdef FUSIONRT_ENABLE_CUDA
+#include "../src/core/cpu_moe.h"
 #include "fusionrt/cuda_backend.h"
 #include "fusionrt/cuda_kernels.h"
 #endif
@@ -13,14 +14,17 @@
 #include "fusionrt/vulkan_backend.h"
 #include "fusionrt/vulkan_kernels.h"
 #endif
+#include <chrono>
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <limits>
 #include <random>
 #include <stdexcept>
+#include <thread>
 #include <type_traits>
 #include <vector>
 
@@ -2212,6 +2216,227 @@ void test_cuda_session_slots() {
     }
 }
 
+void test_tiered_cuda_kv() {
+    CudaContext ctx(0, 32, 32);
+    ctx.set_kv_dtype(DType::Q8_0);
+    HybridModelConfig cfg;
+    cfg.num_layers = 2;
+    cfg.vocab_size = 64;
+    cfg.dense.hidden_size = cfg.dense.intermediate_size = 128;
+    cfg.dense.num_attention_heads = cfg.dense.num_key_value_heads = 2;
+    cfg.dense.head_dim = 64;
+    cfg.dense.max_seq_len = 384;
+    const size_t page_bytes = 2 * cfg.num_layers * row_nbytes(DType::Q8_0,
+        kKvPageTokens * cfg.dense.num_key_value_heads * cfg.dense.head_dim);
+    const size_t vram_budget = 3 * page_bytes;
+    const std::vector<int32_t> a(300, 1);
+    auto b = a;
+    std::fill(b.begin() + kKvPageTokens, b.end(), 2);
+    auto resumed_prompt = a;
+    resumed_prompt.push_back(3);
+
+    auto run = [&](size_t budget, size_t host_budget) {
+        const auto mark = ctx.weight_arena().mark();
+        FusionModel model(cfg);
+        model.set_num_slots(2);
+        model.set_kv_vram_budget_bytes(budget);
+        model.set_kv_host_budget_bytes(host_budget);
+        model.init_synthetic(ctx, 41);
+        int prefilled = 0;
+        model.prefill_cached_cuda(ctx, a);
+        model.prefill_cached_cuda(ctx, b, true, &prefilled);
+        const auto paused = model.cuda_cache_memory();
+        if (prefilled != 300 - kKvPageTokens ||
+            (budget && (paused.kv_pages != 3 || paused.kv_reserved_bytes != budget ||
+                        paused.host_kv_pages != 2 || paused.host_kv_bytes != 2 * page_bytes)) ||
+            (!budget && (paused.kv_pages != 5 || paused.host_kv_bytes != 0))) {
+            throw std::runtime_error("Tiered KV must spill only the paused slot's two private pages");
+        }
+        model.prefill_cached_cuda(ctx, resumed_prompt, true, &prefilled);
+        const auto active = model.cuda_cache_memory();
+        if (prefilled != 1 || (budget && (active.kv_reserved_bytes > budget || active.host_kv_pages != 2))) {
+            throw std::runtime_error("Tiered KV must restore the prefix and prefill only the new token");
+        }
+        std::vector<float> logits = model.forward_token_cuda(ctx, 4, static_cast<int>(resumed_prompt.size()), true, true);
+        ctx.weight_arena().reset(mark);
+        return logits;
+    };
+    const auto unspilled = run(0, 0);
+    const auto spilled = run(vram_budget, 4 * page_bytes);
+    const auto full_host = run(vram_budget, 2 * page_bytes);
+    if (spilled != unspilled || full_host != unspilled) {
+        throw std::runtime_error("Tiered KV decode logits differ after restore");
+    }
+    std::cout << "  [PASS] Tiered KV: GPU " << vram_budget << " B, pinned host " << 2 * page_bytes
+              << " B (2 pages), reused 300 tokens, max_abs=0\n";
+}
+
+HostTensor moe_test_weights(std::vector<int64_t> shape, DType dtype, std::mt19937_64& rng) {
+    if (dtype == DType::F32) return rand_f32(shape, rng, 0.04f);
+    auto result = HostTensor::create(shape, dtype);
+    if (dtype == DType::Q4_K) {
+        for (size_t i = 0; i < result.storage.size() / sizeof(BlockQ4_K); ++i) {
+            auto& block = result.data<BlockQ4_K>()[i];
+            block.d = fp32_to_fp16(0.00018f);
+            block.dmin = fp32_to_fp16(0.00135f);
+            for (auto& scale : block.scales) scale = static_cast<uint8_t>(rng());
+            for (auto& q : block.qs) q = static_cast<uint8_t>(rng());
+        }
+    } else if (dtype == DType::Q4_0) {
+        for (size_t i = 0; i < result.storage.size() / sizeof(BlockQ4_0); ++i) {
+            auto& block = result.data<BlockQ4_0>()[i];
+            block.d = fp32_to_fp16(0.009f);
+            for (auto& q : block.qs) q = static_cast<uint8_t>(rng());
+        }
+    } else if (dtype == DType::Q8_0) {
+        for (size_t i = 0; i < result.storage.size() / sizeof(BlockQ8_0); ++i) {
+            auto& block = result.data<BlockQ8_0>()[i];
+            block.d = fp32_to_fp16(0.0005f);
+            for (auto& q : block.qs) q = static_cast<int8_t>(rng());
+        }
+    }
+    return result;
+}
+
+void test_cuda_native_quantized_moe() {
+    constexpr int H = 256, I = 256, E = 8, resident = 3, V = 64;
+    constexpr double mib = 1024.0 * 1024.0;
+    struct Fixture {
+        std::filesystem::path path = "test-u4-moe.gguf";
+        ~Fixture() { std::error_code ec; std::filesystem::remove(path, ec); }
+    } fixture;
+    CudaContext ctx(0, 0, 32);
+    FusionModel model(HybridModelConfig{});
+    const std::map<std::string, GgufMetaValue> meta{
+        {"general.architecture", std::string("qwen3moe")}, {"qwen3moe.block_count", uint32_t{1}},
+        {"qwen3moe.embedding_length", uint32_t{H}}, {"qwen3moe.attention.head_count", uint32_t{8}},
+        {"qwen3moe.attention.head_count_kv", uint32_t{2}}, {"qwen3moe.feed_forward_length", uint32_t{I}},
+        {"qwen3moe.expert_count", uint32_t{E}}, {"qwen3moe.expert_used_count", uint32_t{2}}
+    };
+    for (const auto dtype : {DType::Q4_0, DType::Q4_K, DType::F32}) {
+        std::mt19937_64 rng(841);
+        auto embeddings = rand_f32({V, H}, rng, 0.1f);
+        for (int t = 0; t < V; ++t) embeddings.data<float>()[t * H] = 0.35f;
+        HostTensor router({E, H}, DType::F32);
+        // With a zero attention output, the positive first hidden feature routes to one hot and one cold expert.
+        router.data<float>()[H] = 0.9f;
+        router.data<float>()[6 * H] = 0.7f;
+        std::vector<std::pair<std::string, HostTensor>> weights{
+            {"token_embd.weight", std::move(embeddings)}, {"output_norm.weight", make_ones_f32({H})},
+            {"blk.0.attn_norm.weight", make_ones_f32({H})}, {"blk.0.ffn_norm.weight", make_ones_f32({H})},
+            {"blk.0.attn_q.weight", rand_f32({H, H}, rng)}, {"blk.0.attn_k.weight", rand_f32({64, H}, rng)},
+            {"blk.0.attn_v.weight", rand_f32({64, H}, rng)}, {"blk.0.attn_output.weight", HostTensor({H, H}, DType::F32)},
+            {"blk.0.ffn_gate_inp.weight", std::move(router)},
+            {"blk.0.ffn_gate_shexp.weight", rand_f32({I, H}, rng, 0.035f)},
+            {"blk.0.ffn_up_shexp.weight", rand_f32({I, H}, rng, 0.035f)},
+            {"blk.0.ffn_down_shexp.weight", rand_f32({H, I}, rng, 0.035f)},
+            {"blk.0.ffn_down_exps.weight", moe_test_weights({E, H, I}, dtype, rng)}
+        };
+        const bool split = dtype == DType::Q4_K;
+        const auto up_type = split ? DType::Q8_0 : dtype;
+        weights.emplace_back(split ? "blk.0.ffn_gate_exps.weight" : "blk.0.ffn_gate_up_exps.weight",
+                             moe_test_weights({E, split ? I : 2 * I, H}, dtype, rng));
+        if (split) weights.emplace_back("blk.0.ffn_up_exps.weight", moe_test_weights({E, I, H}, up_type, rng));
+        std::string error;
+        if (!GgufFile::write_v3(fixture.path.string(), meta, weights, &error)) throw std::runtime_error(error);
+
+        const size_t gate_bytes = (split ? I : 2 * I) * row_nbytes(dtype, H);
+        const size_t down_bytes = H * row_nbytes(dtype, I);
+        const size_t up_bytes = split ? I * row_nbytes(up_type, H) : 0;
+        auto load = [&](int expert_override, int expected) {
+            model.set_moe_gpu_experts(expert_override);
+            if (!model.load_gguf(ctx, fixture.path.string(), &error, 32)) throw std::runtime_error(error);
+            const auto& layer = model.moe_layers().at(0);
+            const int cold = E - expected;
+            if (!layer.cfg.has_shared_expert || layer.cfg.top_k != 2 ||
+                model.config().moe.gpu_resident_experts != expected || layer.cfg.gpu_resident_experts != expected ||
+                layer.gpu_gate_up_w.dtype != dtype || layer.gpu_down_w.dtype != dtype ||
+                layer.gpu_gate_up_w.nbytes() != expected * gate_bytes ||
+                layer.gpu_down_w.nbytes() != expected * down_bytes ||
+                layer.gpu_up_w.nbytes() != expected * up_bytes ||
+                layer.cpu_gate_up_w.storage.size() != cold * gate_bytes ||
+                layer.cpu_down_w.storage.size() != cold * down_bytes ||
+                layer.cpu_up_w.storage.size() != cold * up_bytes ||
+                (cold && (layer.cpu_gate_up_w.desc.dtype != dtype || layer.cpu_down_w.desc.dtype != dtype)) ||
+                (split && (layer.gpu_up_w.dtype != up_type || (cold && layer.cpu_up_w.desc.dtype != up_type)))) {
+                throw std::runtime_error("MoE placement or native expert dtype/byte count is incorrect");
+            }
+        };
+        auto logits = [&] {
+            const std::vector<int32_t> prompt{2, 3, 4, 5, 6, 7, 8, 9};
+            auto prefill = model.forward_prefill_cuda(ctx, prompt, 0);
+            auto decode = model.forward_token_cuda(ctx, 10, static_cast<int>(prompt.size()), true, true);
+            return std::pair{std::move(prefill), std::move(decode)};
+        };
+        load(E, E);
+        const size_t full_arena = ctx.weight_arena().capacity();
+        const auto gpu = logits();
+        load(resident, resident);
+        const auto hybrid = logits();
+        DeviceProfile profile;
+        const size_t kv_bytes = 2 * kKvPageTokens * 64 * sizeof(float);
+        profile.vram_total_mb = (ctx.scratch_arena().capacity() + kv_bytes + 256 + full_arena -
+                                 (E - resident) * (gate_bytes + up_bytes + down_bytes)) / mib;
+        profile.cpu_q4_gemv_gbps = 51.38;
+        profile.pcie_h2d_gbps = 14.24;
+        model.set_device_profile(ctx, profile);
+        load(-1, resident);
+        const auto automatic = logits();
+        const double tolerance = dtype == DType::F32 ? 1e-6 : 1e-4;
+        auto compare = [&](const std::vector<float>& a, const std::vector<float>& b) {
+            double diff_sq = 0.0, ref_sq = 0.0;
+            for (size_t i = 0; i < a.size(); ++i) {
+                const double diff = static_cast<double>(a[i]) - b[i];
+                diff_sq += diff * diff;
+                ref_sq += static_cast<double>(a[i]) * a[i];
+            }
+            const double rel_l2 = std::sqrt(diff_sq / ref_sq);
+            if (!(rel_l2 < tolerance)) throw std::runtime_error("GPU vs hybrid MoE logits differ");
+            return rel_l2;
+        };
+        if (automatic != hybrid) throw std::runtime_error("MoE auto placement must match the explicit split");
+        std::cout << "  [PASS] Native " << dtype_name(dtype) << " MoE 8x top-2 + shared: gpu_resident=3 cpu_cold=5"
+                  << " prefill(M=8) rel_l2=" << compare(gpu.first, hybrid.first)
+                  << " decode(M=1) rel_l2=" << compare(gpu.second, hybrid.second) << '\n';
+    }
+}
+
+void test_cpu_quantized_moe_speed() {
+    constexpr int width = 1536;
+    std::mt19937_64 rng(161);
+    const auto input = rand_f32({width}, rng, 0.25f);
+    const HostTensor no_separate_up;
+    for (const auto dtype : {DType::Q4_0, DType::Q4_K}) {
+        const auto gate_up = moe_test_weights({1, 2 * width, width}, dtype, rng);
+        const auto down = moe_test_weights({1, width, width}, dtype, rng);
+        auto run = [&](CpuMoeMode mode, std::vector<float>& output) {
+            auto execute = [&] {
+                std::fill(output.begin(), output.end(), 0.0f);
+                cpu_moe_accumulate(gate_up, no_separate_up, down, 0, input.data<float>(), 0.5f, output.data(), mode);
+            };
+            execute();
+            double best_seconds = std::numeric_limits<double>::infinity();
+            for (int sample = 0; sample < 5; ++sample) {
+                const auto start = std::chrono::steady_clock::now();
+                execute();
+                best_seconds = std::min(best_seconds, std::chrono::duration<double>(
+                    std::chrono::steady_clock::now() - start).count());
+            }
+            return best_seconds;
+        };
+        std::vector<float> scalar(width), parallel(width);
+        const double scalar_seconds = run(CpuMoeMode::Scalar, scalar);
+        const double parallel_seconds = run(CpuMoeMode::Parallel, parallel);
+        expect_close(parallel, {scalar.begin(), scalar.end()}, 3e-4, 1e-4, "CPU native expert vs scalar");
+        if (std::thread::hardware_concurrency() > 1 && !(parallel_seconds < scalar_seconds)) {
+            throw std::runtime_error("Parallel CPU expert must beat single-thread scalar");
+        }
+        std::cout << "  [PASS] CPU " << dtype_name(dtype) << " "
+                  << (gate_up.storage.size() + down.storage.size()) / parallel_seconds / 1e9 << " GB/s, "
+                  << scalar_seconds / parallel_seconds << "x vs single-thread scalar\n";
+    }
+}
+
 void test_chunked_prefill_and_k_quant_gdn() {
     std::cout << "Testing chunked prefill and K-quant GDN GGUF...\n";
     CudaContext ctx(0, 64, 64);
@@ -2355,6 +2580,9 @@ int main() {
 #ifdef FUSIONRT_ENABLE_CUDA
         test_chunked_prefill_and_k_quant_gdn();
         test_cuda_session_slots();
+        test_tiered_cuda_kv();
+        test_cuda_native_quantized_moe();
+        test_cpu_quantized_moe_speed();
 #endif
         std::cout << "\nALL TESTS PASSED!\n";
         return 0;

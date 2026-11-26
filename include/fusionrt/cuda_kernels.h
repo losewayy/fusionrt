@@ -278,14 +278,18 @@ void gqa_prefill_online_f32(const float* q, int q_stride, CudaKvView cache, floa
 void moe_topk_router_f32(const float* logits, int* topk_idx, float* topk_weight,
                          int num_experts, int top_k, bool norm_topk, cudaStream_t stream);
 
-void moe_indexed_swiglu_gemv_f32(
-    const float* x,
-    const int* topk_idx,
-    const float* gate_up_w,
-    const float* down_w,
-    const float* topk_weight,
-    float* out,
-    float* scratch_inter,
-    int hidden, int inter, int top_k, cudaStream_t stream);
+void moe_indexed_swiglu_gemv(
+    const float* x, const int* topk_idx, const void* gate_w, DType gate_type,
+    const void* up_w, DType up_type, const void* down_w, DType down_type,
+    const float* topk_weight, float* out, float* scratch_inter,
+    int hidden, int inter, int top_k, int resident, cudaStream_t stream);
+
+inline void moe_indexed_swiglu_gemv_f32(
+    const float* x, const int* topk_idx, const float* gate_up_w, const float* down_w,
+    const float* topk_weight, float* out, float* scratch_inter,
+    int hidden, int inter, int top_k, cudaStream_t stream) {
+    moe_indexed_swiglu_gemv(x, topk_idx, gate_up_w, DType::F32, nullptr, DType::F32, down_w, DType::F32,
+                            topk_weight, out, scratch_inter, hidden, inter, top_k, 256, stream);
+}
 
 }  // namespace fusionrt::cuda_ops

@@ -430,6 +430,8 @@ void serve_http(CudaContext& ctx, FusionModel& model, const BpeTokenizer& tokeni
                       {"slots", model.num_slots()}, {"kv_pages", cache.kv_pages},
                       {"kv_bytes", static_cast<int64_t>(cache.kv_bytes)},
                       {"kv_reserved_bytes", static_cast<int64_t>(cache.kv_reserved_bytes)},
+                      {"host_kv_bytes", static_cast<int64_t>(cache.host_kv_bytes)},
+                      {"host_kv_pages", cache.host_kv_pages},
                       {"ssm_bytes", static_cast<int64_t>(cache.ssm_bytes)}});
             } else if (req->method == "GET" && req->path == "/v1/models") {
                 reply(fd, "200 OK", JsonObject{{"object", "list"}, {"data", JsonArray{JsonObject{

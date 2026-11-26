@@ -61,7 +61,19 @@ static void upload_raw_model_to_vulkan(VkContext& ctx, const LoadedModelRaw& raw
         L.cfg.intermediate_size = static_cast<int>(lr.experts_down.desc.shape[2]);
         L.norm_w = ctx.upload(to_f32_host(lr.mlp_norm.storage.empty() ? lr.attn_norm : lr.mlp_norm), true);
         L.router_w = ctx.upload(to_f32_host(lr.router_w), true);
-        L.gpu_gate_up_w = ctx.upload(to_f32_host(lr.experts_gate_up), true);
+        auto gate = to_f32_host(lr.experts_gate_up);
+        if (!lr.experts_up.storage.empty()) {
+            const auto up = to_f32_host(lr.experts_up);
+            const int E = L.cfg.num_experts, I = L.cfg.intermediate_size;
+            auto packed = HostTensor::create({E, 2 * I, H}, DType::F32);
+            const size_t bytes = gate.storage.size() / E;
+            for (int e = 0; e < E; ++e) {
+                std::memcpy(packed.storage.data() + (2 * e) * bytes, gate.storage.data() + e * bytes, bytes);
+                std::memcpy(packed.storage.data() + (2 * e + 1) * bytes, up.storage.data() + e * bytes, bytes);
+            }
+            gate = std::move(packed);
+        }
+        L.gpu_gate_up_w = ctx.upload(gate, true);
         L.gpu_down_w = ctx.upload(to_f32_host(lr.experts_down), true);
         if (lr.has_shared) {
             L.cfg.shared_intermediate_size = static_cast<int>(lr.shared_down.desc.shape[1]);

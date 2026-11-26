@@ -55,7 +55,17 @@ CudaKvView make_cuda_kv_view(CudaArena& arena, DType dtype, int max_tokens, int 
 
 static int kv_pages_for(int tokens) { return tokens > 0 ? 1 + (tokens - 1) / kKvPageTokens : 0; }
 
-void CudaKvPool::grow(int count) {
+void CudaKvPool::set_kv_vram_budget_bytes(size_t bytes) {
+    if (bytes != 0 && bytes < reserved_bytes()) throw std::invalid_argument("KV VRAM budget is below existing allocation");
+    vram_budget_bytes_ = bytes;
+}
+
+void CudaKvPool::set_kv_host_budget_bytes(size_t bytes) {
+    if (bytes < host_bytes()) throw std::invalid_argument("Host KV budget is below existing allocation");
+    host_budget_bytes_ = bytes;
+}
+
+bool CudaKvPool::grow(int count) {
     if (slabs_.size() == slabs_.capacity()) {
         slabs_.reserve(2 * slabs_.size() + 1);
     }
@@ -64,12 +74,18 @@ void CudaKvPool::grow(int count) {
         physical_.reserve(std::max(2 * physical_.size(), physical_.size() + count));
     }
     uint8_t* data = nullptr;
-    FUSIONRT_CUDA_CHECK(cudaMalloc(&data, count * page_bytes_));
+    const auto status = cudaMalloc(&data, count * page_bytes_);
+    if (status == cudaErrorMemoryAllocation) {
+        (void)cudaGetLastError();
+        return false;
+    }
+    FUSIONRT_CUDA_CHECK(status);
     slabs_.emplace_back(data, cudaFree);
     for (int i = 0; i < count; ++i) {
         physical_.push_back({data + i * page_bytes_, 0, i + 1 < count ? old_size + i + 1 : free_});
     }
     free_ = old_size;
+    return true;
 }
 
 int CudaKvPool::acquire() {
@@ -82,6 +98,17 @@ int CudaKvPool::acquire() {
 }
 
 void CudaKvPool::drop(int id) {
+    if (id < 0) {
+        const int index = -id - 1;
+        auto& page = host_[index];
+        if (--page.refs == 0) {
+            page.data.reset();
+            page.next_free = host_free_;
+            host_free_ = index;
+            --host_pages_;
+        }
+        return;
+    }
     auto& page = physical_[id];
     if (--page.refs == 0) {
         page.next_free = free_;
@@ -90,25 +117,177 @@ void CudaKvPool::drop(int id) {
     }
 }
 
+std::vector<CudaKvPool::SlotPage> CudaKvPool::select_spill_pages(std::span<Table* const> paused, int count) const {
+    std::vector<SlotPage> victims;
+    for (auto* table : paused) {
+        for (int p = static_cast<int>(table->pages_.size()) - 1; p >= 0; --p) {
+            const int id = table->pages_[p];
+            if (id >= 0 && physical_[id].refs == 1) victims.emplace_back(table, p);
+            if (victims.size() == static_cast<size_t>(count)) return victims;
+        }
+    }
+    throw std::runtime_error("KV VRAM exhausted with too few private pages in paused slots");
+}
+
+void CudaKvPool::spill_pages_to_host(CudaContext& ctx, std::span<const SlotPage> victims) {
+    if (victims.empty()) return;
+    host_.reserve(host_.size() + victims.size());
+    std::vector<PinnedPage> batch;
+    batch.reserve(victims.size());
+    for (size_t i = 0; i < victims.size(); ++i) {
+        uint8_t* data = nullptr;
+        FUSIONRT_CUDA_CHECK(cudaMallocHost(&data, page_bytes_));
+        batch.emplace_back(data, cudaFreeHost);
+    }
+    try {
+        for (size_t i = 0; i < victims.size(); ++i) {
+            const auto [table, index] = victims[i];
+            const auto& page = physical_[table->pages_[index]];
+            FUSIONRT_CUDA_CHECK(cudaMemcpyAsync(batch[i].get(), page.data, page_bytes_,
+                                                cudaMemcpyDeviceToHost, ctx.stream()));
+        }
+        ctx.synchronize();
+    } catch (...) {
+        (void)cudaStreamSynchronize(ctx.stream());
+        throw;
+    }
+    for (size_t i = 0; i < victims.size(); ++i) {
+        const auto [table, index] = victims[i];
+        int id = host_free_;
+        if (id < 0) {
+            id = static_cast<int>(host_.size());
+            host_.emplace_back();
+        } else {
+            host_free_ = host_[id].next_free;
+        }
+        host_[id] = {std::move(batch[i]), 1, -1};
+        ++host_pages_;
+        drop(table->pages_[index]);
+        table->pages_[index] = -id - 1;
+        table->published_ = std::min(table->published_, index);
+        ++table->spilled_;
+    }
+}
+
+void CudaKvPool::exchange_spilled_pages(CudaContext& ctx, Table& table, int requested,
+                                       std::span<const SlotPage> victims) {
+    if (victims.empty()) return;
+    std::vector<int> incoming;
+    const int kept = std::min(requested, static_cast<int>(table.pages_.size()));
+    for (int p = 0; p < kept && incoming.size() < victims.size(); ++p) {
+        const int id = table.pages_[p];
+        if (id < 0 && host_[-id - 1].refs == 1) incoming.push_back(p);
+    }
+    if (incoming.size() != victims.size()) {
+        throw std::runtime_error("KV VRAM exhausted and host KV budget cannot hold the spill");
+    }
+    // With both tiers full, reuse the incoming pinned pages for the outgoing pages.
+    auto& arena = ctx.scratch_arena();
+    const size_t mark = arena.mark();
+    const size_t aligned = (mark + 255) & ~size_t{255};
+    const size_t chunk = std::min(page_bytes_, arena.capacity() - std::min(arena.capacity(), aligned));
+    if (chunk == 0) throw std::runtime_error("No CUDA scratch available for a full-tier KV exchange");
+    auto* scratch = arena.alloc(chunk);
+    try {
+        const auto stream = ctx.stream();
+        for (size_t i = 0; i < victims.size(); ++i) {
+            const auto [paused, index] = victims[i];
+            auto* gpu = physical_[paused->pages_[index]].data;
+            auto* host = host_[-table.pages_[incoming[i]] - 1].data.get();
+            for (size_t offset = 0; offset < page_bytes_; offset += chunk) {
+                const size_t bytes = std::min(chunk, page_bytes_ - offset);
+                FUSIONRT_CUDA_CHECK(cudaMemcpyAsync(scratch, gpu + offset, bytes, cudaMemcpyDeviceToDevice, stream));
+                FUSIONRT_CUDA_CHECK(cudaMemcpyAsync(gpu + offset, host + offset, bytes, cudaMemcpyHostToDevice, stream));
+                FUSIONRT_CUDA_CHECK(cudaMemcpyAsync(host + offset, scratch, bytes, cudaMemcpyDeviceToHost, stream));
+            }
+        }
+        ctx.synchronize();
+    } catch (...) {
+        (void)cudaStreamSynchronize(ctx.stream());
+        arena.reset(mark);
+        throw;
+    }
+    arena.reset(mark);
+    for (size_t i = 0; i < victims.size(); ++i) {
+        const auto [paused, index] = victims[i];
+        std::swap(table.pages_[incoming[i]], paused->pages_[index]);
+        paused->published_ = std::min(paused->published_, index);
+        ++paused->spilled_;
+    }
+    table.spilled_ -= static_cast<int>(incoming.size());
+    table.published_ = std::min(table.published_, incoming.front());
+}
+
+void CudaKvPool::restore_pages_from_host(CudaContext& ctx, Table& table, int requested) {
+    std::vector<std::pair<int, int>> batch;
+    const int kept = std::min(requested, static_cast<int>(table.pages_.size()));
+    for (int p = 0; p < kept; ++p) {
+        if (table.pages_[p] < 0) batch.emplace_back(p, -1);
+    }
+    if (batch.empty()) return;
+    try {
+        for (auto& [index, id] : batch) {
+            id = acquire();
+            FUSIONRT_CUDA_CHECK(cudaMemcpyAsync(physical_[id].data, host_[-table.pages_[index] - 1].data.get(),
+                                                page_bytes_, cudaMemcpyHostToDevice, ctx.stream()));
+        }
+        ctx.synchronize();
+    } catch (...) {
+        (void)cudaStreamSynchronize(ctx.stream());
+        for (const auto& entry : batch) {
+            if (entry.second >= 0) drop(entry.second);
+        }
+        throw;
+    }
+    for (const auto& [index, id] : batch) {
+        drop(table.pages_[index]);
+        table.pages_[index] = id;
+    }
+    table.spilled_ -= static_cast<int>(batch.size());
+    table.published_ = std::min(table.published_, batch.front().first);
+}
+
 void CudaKvPool::ensure(CudaContext& ctx, std::span<const CudaKvView> layers, Table& table,
-                        int first_write, int tokens) {
+                        int first_write, int tokens, std::span<Table* const> paused) {
     if (tokens <= 0 || layers.empty()) return;
     const int requested = kv_pages_for(tokens);
     const int existing = static_cast<int>(table.pages_.size());
     const int first = first_write < tokens ? first_write / kKvPageTokens : requested;
     int needed = std::max(0, requested - existing);
-    for (int p = first; p < std::min(requested, existing); ++p) {
-        needed += physical_[table.pages_[p]].refs > 1;
+    for (int p = table.spilled_ > 0 ? 0 : first; p < std::min(requested, existing); ++p) {
+        const int id = table.pages_[p];
+        needed += id < 0 || (p >= first && physical_[id].refs > 1);
     }
     if (requested > layers.front().max_pages) throw std::invalid_argument("KV position exceeds context");
     if (page_bytes_ == 0) {
         for (const auto& layer : layers) page_bytes_ += 2 * layer.plane_bytes;
     }
     const int missing = needed - (static_cast<int>(physical_.size()) - pages_);
-    if (missing > 0) grow(missing);
+    if (missing > 0) {
+        const int growth = vram_budget_bytes_ == 0 ? missing : static_cast<int>(
+            std::min(static_cast<size_t>(missing), (vram_budget_bytes_ - reserved_bytes()) / page_bytes_));
+        int to_spill = missing - growth;
+        if (growth > 0 && !grow(growth)) {
+            // A single large slab can fail even when smaller allocations still fit.
+            int remaining = growth;
+            for (int chunk = growth / 2; chunk > 0 && remaining > 0; chunk /= 2) {
+                while (chunk <= remaining && grow(chunk)) remaining -= chunk;
+            }
+            to_spill += remaining;
+        }
+        if (to_spill > 0) {
+            const auto victims = select_spill_pages(paused, to_spill);
+            const std::span<const SlotPage> batch(victims);
+            const size_t host_free = (host_budget_bytes_ - host_bytes()) / page_bytes_;
+            const size_t spill = std::min(host_free, batch.size());
+            exchange_spilled_pages(ctx, table, requested, batch.subspan(spill));
+            spill_pages_to_host(ctx, batch.first(spill));
+        }
+    }
     if (static_cast<size_t>(requested) > table.pages_.capacity()) {
         table.pages_.reserve(std::max(static_cast<size_t>(requested), 2 * table.pages_.size()));
     }
+    if (table.spilled_ > 0) restore_pages_from_host(ctx, table, requested);
     for (int p = std::min(first, existing); p < requested; ++p) {
         const int old = p < existing ? table.pages_[p] : -1;
         if (old >= 0 && physical_[old].refs == 1) continue;
@@ -148,14 +327,24 @@ void CudaKvPool::fork(Table& dst, const Table& src, int tokens) {
         return;
     }
     std::vector<int> prefix(src.pages_.begin(), src.pages_.begin() + kept);
-    for (int id : prefix) ++physical_[id].refs;
+    int spilled = 0;
+    for (int id : prefix) {
+        if (id < 0) {
+            ++host_[-id - 1].refs;
+            ++spilled;
+        } else {
+            ++physical_[id].refs;
+        }
+    }
     truncate(dst, 0);
     dst.pages_ = std::move(prefix);
+    dst.spilled_ = spilled;
 }
 
 void CudaKvPool::truncate(Table& table, int tokens) {
     const int kept = std::min(kv_pages_for(tokens), static_cast<int>(table.pages_.size()));
     while (table.pages_.size() > static_cast<size_t>(kept)) {
+        table.spilled_ -= table.pages_.back() < 0;
         drop(table.pages_.back());
         table.pages_.pop_back();
     }
@@ -168,6 +357,9 @@ void CudaKvPool::release() {
     pages_ = 0;
     page_bytes_ = 0;
     free_ = -1;
+    host_.clear();
+    host_pages_ = 0;
+    host_free_ = -1;
 }
 
 CudaArena::~CudaArena() {
@@ -361,11 +553,29 @@ void CudaContext::set_device_profile(const DeviceProfile& profile) {
 }
 
 CudaContext::~CudaContext() {
+    if (moe_input_ready_) {
+        (void)cudaStreamSynchronize(stream_);
+        cudaEventDestroy(moe_input_ready_);
+    }
     if (l2_flush_buf_) cudaFree(l2_flush_buf_);
     scratch_arena_.release();
     weight_arena_.release();
     if (cublas_) cublasDestroy(cublas_);
     if (stream_) cudaStreamDestroy(stream_);
+}
+
+float* CudaContext::moe_transfer_buffer(size_t bytes) {
+    if (bytes > moe_transfer_bytes_) {
+        if (moe_transfer_) synchronize();
+        if (!moe_input_ready_) {
+            FUSIONRT_CUDA_CHECK(cudaEventCreateWithFlags(&moe_input_ready_, cudaEventDisableTiming));
+        }
+        float* data = nullptr;
+        FUSIONRT_CUDA_CHECK(cudaMallocHost(&data, bytes));
+        moe_transfer_.reset(data);
+        moe_transfer_bytes_ = bytes;
+    }
+    return moe_transfer_.get();
 }
 
 Tensor CudaContext::upload(const HostTensor& ht, bool persistent) {

@@ -320,12 +320,41 @@ __global__ void k_moe_topk_router(const float* __restrict__ logits,
     }
 }
 
+template <int Format>
+__device__ float moe_warp_dot(const float* x, const void* weights, int row, int cols) {
+    const int lane = threadIdx.x & 31;
+    float acc = 0.0f;
+    for (int base = 0; base + lane < cols; base += 32) {
+        float w;
+        if constexpr (Format == -1) w = static_cast<const float*>(weights)[static_cast<int64_t>(row) * cols + base + lane];
+        else w = dequant_weight_elem<Format>(weights, row, base, lane, cols);
+        acc += x[base + lane] * w;
+    }
+    return warp_reduce_sum(acc);
+}
+
+__device__ float moe_warp_dot(const float* x, const void* w, DType type, int row, int cols) {
+    switch (type) {
+        case DType::F32: return moe_warp_dot<-1>(x, w, row, cols);
+        case DType::F16: return moe_warp_dot<0>(x, w, row, cols);
+        case DType::BF16: return moe_warp_dot<1>(x, w, row, cols);
+        case DType::Q8_0: return moe_warp_dot<2>(x, w, row, cols);
+        case DType::Q4_0: return moe_warp_dot<3>(x, w, row, cols);
+        case DType::Q4_1: return moe_warp_dot<4>(x, w, row, cols);
+        case DType::Q4_K: return moe_warp_dot<5>(x, w, row, cols);
+        case DType::Q6_K: return moe_warp_dot<6>(x, w, row, cols);
+        case DType::Q5_K: return moe_warp_dot<7>(x, w, row, cols);
+        default: return 0.0f;
+    }
+}
+
 __global__ void k_moe_indexed_gate_up_swiglu(
     const float* __restrict__ x,
     const int* __restrict__ topk_idx,
-    const float* __restrict__ gate_up_w,
+    const void* gate_w, DType gate_type,
+    const void* up_w, DType up_type,
     float* __restrict__ scratch_inter,
-    int hidden, int inter, int top_k)
+    int hidden, int inter, int top_k, int resident)
 {
     int wid = (blockIdx.x * blockDim.x + threadIdx.x) >> 5;
     int lane = threadIdx.x & 31;
@@ -335,17 +364,11 @@ __global__ void k_moe_indexed_gate_up_swiglu(
     int k_slot = wid / inter;
     int c = wid % inter;
     int e = topk_idx[k_slot];
-    const float* wg = gate_up_w + (static_cast<int64_t>(e) * 2 * inter + c) * hidden;
-    const float* wu = gate_up_w + (static_cast<int64_t>(e) * 2 * inter + inter + c) * hidden;
-
-    float g_acc = 0.0f, u_acc = 0.0f;
-    for (int i = lane; i < hidden; i += 32) {
-        float xv = x[i];
-        g_acc += xv * wg[i];
-        u_acc += xv * wu[i];
-    }
-    g_acc = warp_reduce_sum(g_acc);
-    u_acc = warp_reduce_sum(u_acc);
+    if (e < 0 || e >= resident) return;
+    const int gate_row = (up_w ? e : 2 * e) * inter + c;
+    const float g_acc = moe_warp_dot(x, gate_w, gate_type, gate_row, hidden);
+    const float u_acc = up_w ? moe_warp_dot(x, up_w, up_type, gate_row, hidden) :
+                               moe_warp_dot(x, gate_w, gate_type, gate_row + inter, hidden);
     if (lane == 0) {
         scratch_inter[k_slot * inter + c] = silu_f(g_acc) * u_acc;
     }
@@ -354,10 +377,10 @@ __global__ void k_moe_indexed_gate_up_swiglu(
 __global__ void k_moe_indexed_down_combine(
     const float* __restrict__ scratch_inter,
     const int* __restrict__ topk_idx,
-    const float* __restrict__ down_w,
+    const void* __restrict__ down_w, DType down_type,
     const float* __restrict__ topk_weight,
     float* __restrict__ out,
-    int hidden, int inter, int top_k)
+    int hidden, int inter, int top_k, int resident)
 {
     int wid = (blockIdx.x * blockDim.x + threadIdx.x) >> 5;
     int lane = threadIdx.x & 31;
@@ -366,13 +389,9 @@ __global__ void k_moe_indexed_down_combine(
     float total = 0.0f;
     for (int k_slot = 0; k_slot < top_k; ++k_slot) {
         int e = topk_idx[k_slot];
-        const float* wd = down_w + (static_cast<int64_t>(e) * hidden + wid) * inter;
-        const float* act = scratch_inter + k_slot * inter;
-        float acc = 0.0f;
-        for (int i = lane; i < inter; i += 32) {
-            acc += act[i] * wd[i];
-        }
-        total += warp_reduce_sum(acc) * topk_weight[k_slot];
+        if (e < 0 || e >= resident) continue;
+        total += moe_warp_dot(scratch_inter + k_slot * inter, down_w, down_type,
+                              e * hidden + wid, inter) * topk_weight[k_slot];
     }
     if (lane == 0) out[wid] = total;
 }
@@ -773,20 +792,21 @@ void moe_topk_router_f32(const float* logits, int* topk_idx, float* topk_weight,
     k_moe_topk_router<<<1, 1, 0, stream>>>(logits, topk_idx, topk_weight, num_experts, top_k, norm_topk);
 }
 
-void moe_indexed_swiglu_gemv_f32(
-    const float* x, const int* topk_idx, const float* gate_up_w, const float* down_w,
+void moe_indexed_swiglu_gemv(
+    const float* x, const int* topk_idx, const void* gate_w, DType gate_type,
+    const void* up_w, DType up_type, const void* down_w, DType down_type,
     const float* topk_weight, float* out, float* scratch_inter,
-    int hidden, int inter, int top_k, cudaStream_t stream)
+    int hidden, int inter, int top_k, int resident, cudaStream_t stream)
 {
     constexpr int WARPS = 8;
     int total_up_rows = top_k * inter;
     int up_blocks = (total_up_rows + WARPS - 1) / WARPS;
     k_moe_indexed_gate_up_swiglu<<<up_blocks, WARPS * 32, 0, stream>>>(
-        x, topk_idx, gate_up_w, scratch_inter, hidden, inter, top_k);
+        x, topk_idx, gate_w, gate_type, up_w, up_type, scratch_inter, hidden, inter, top_k, resident);
 
     int down_blocks = (hidden + WARPS - 1) / WARPS;
     k_moe_indexed_down_combine<<<down_blocks, WARPS * 32, 0, stream>>>(
-        scratch_inter, topk_idx, down_w, topk_weight, out, hidden, inter, top_k);
+        scratch_inter, topk_idx, down_w, down_type, topk_weight, out, hidden, inter, top_k, resident);
 }
 
 void embed_lookup_f32(const void* emb_table, DType table_dtype,

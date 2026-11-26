@@ -117,6 +117,8 @@ struct ModelMemory {
     size_t kv_bytes = 0;
     int kv_pages = 0;
     size_t kv_reserved_bytes = 0;
+    size_t host_kv_bytes = 0;
+    int host_kv_pages = 0;
     size_t ssm_bytes = 0;
     size_t persistent_bytes = 0;
     std::map<DType, size_t> weight_bytes;
@@ -179,9 +181,11 @@ struct CudaSparseMoELayer {
     MoEConfig cfg;
     Tensor norm_w;                // [hidden]
     Tensor router_w;              // [num_experts, hidden]
-    Tensor gpu_gate_up_w;         // [gpu_resident_experts, 2*inter, hidden]
+    Tensor gpu_gate_up_w;         // [gpu_resident_experts, (2*)inter, hidden]
+    Tensor gpu_up_w;              // Separate up projection for unpacked gate/up weights.
     Tensor gpu_down_w;            // [gpu_resident_experts, hidden, inter]
-    HostTensor cpu_gate_up_w;     // [offloaded, 2*inter, hidden]
+    HostTensor cpu_gate_up_w;     // [offloaded, (2*)inter, hidden]
+    HostTensor cpu_up_w;
     HostTensor cpu_down_w;        // [offloaded, hidden, inter]
     Tensor shared_gate_up_w;      // [2*shared_inter, hidden]
     Tensor shared_down_w;         // [hidden, shared_inter]
@@ -258,6 +262,9 @@ public:
 #ifdef FUSIONRT_ENABLE_CUDA
     void set_num_slots(int n);
     int num_slots() const { return static_cast<int>(cuda_slots_.size()); }
+    void set_kv_vram_budget_bytes(size_t bytes) { cuda_kv_pool_.set_kv_vram_budget_bytes(bytes); }
+    void set_kv_host_budget_bytes(size_t bytes) { cuda_kv_pool_.set_kv_host_budget_bytes(bytes); }
+    void set_moe_gpu_experts(int count);
     void init_synthetic(CudaContext& ctx, uint64_t seed = 42);
     bool load_gguf(CudaContext& ctx, const std::string& path, std::string* err = nullptr, int max_seq_override = 0);
     bool load_safetensors(CudaContext& ctx, const std::string& path, std::string* err = nullptr, int max_seq_override = 0);
@@ -347,6 +354,7 @@ private:
     DType cuda_kv_dtype_ = DType::F32;
     size_t active_slot_ = 0;
     uint64_t slot_clock_ = 0;
+    int moe_gpu_experts_override_ = -1;
     CudaContext* owned_gguf_arena_ = nullptr;
 
     CudaSession& cuda_session() { return *cuda_slots_[active_slot_]; }

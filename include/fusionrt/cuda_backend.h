@@ -11,6 +11,7 @@
 #include <memory>
 #include <span>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace fusionrt {
@@ -127,6 +128,8 @@ public:
     void upload_into(const HostTensor& ht, Tensor& dst);
     HostTensor download(const Tensor& t);
     void synchronize();
+    float* moe_transfer_buffer(size_t bytes);
+    cudaEvent_t moe_input_ready() const { return moe_input_ready_; }
 
     // L2 cache flush buffer (> 2x device L2) for anti-noise benchmarking
     void flush_l2();
@@ -146,6 +149,9 @@ private:
     size_t l2_flush_bytes_ = 0;
     int prefill_batch_ = 512;
     DType kv_dtype_ = DType::F32;
+    std::unique_ptr<float, decltype(&cudaFreeHost)> moe_transfer_{nullptr, cudaFreeHost};
+    size_t moe_transfer_bytes_ = 0;
+    cudaEvent_t moe_input_ready_ = nullptr;
 };
 
 inline constexpr int kKvPageTokens = 128;
@@ -172,15 +178,23 @@ public:
         friend class CudaKvPool;
         std::vector<int> pages_;
         int published_ = 0;
+        int spilled_ = 0;
     };
 
-    void ensure(CudaContext& ctx, std::span<const CudaKvView> layers, Table& table, int first_write, int tokens);
+    void ensure(CudaContext& ctx, std::span<const CudaKvView> layers, Table& table, int first_write, int tokens,
+                std::span<Table* const> paused = {});
     void fork(Table& dst, const Table& src, int tokens);
     void truncate(Table& table, int tokens);
     void release();
+    void set_kv_vram_budget_bytes(size_t bytes);
+    void set_kv_host_budget_bytes(size_t bytes);
+    size_t vram_budget_bytes() const { return vram_budget_bytes_; }
+    size_t host_budget_bytes() const { return host_budget_bytes_; }
     size_t bytes() const { return pages_ * page_bytes_; }
     int pages() const { return pages_; }
     size_t reserved_bytes() const { return physical_.size() * page_bytes_; }
+    size_t host_bytes() const { return host_pages_ * page_bytes_; }
+    int host_pages() const { return host_pages_; }
 
 private:
     struct Page {
@@ -188,15 +202,31 @@ private:
         size_t refs = 0;
         int next_free = -1;
     };
-    void grow(int count);
+    using PinnedPage = std::unique_ptr<uint8_t, decltype(&cudaFreeHost)>;
+    struct HostPage {
+        PinnedPage data{nullptr, cudaFreeHost};
+        size_t refs = 0;
+        int next_free = -1;
+    };
+    bool grow(int count);
     int acquire();
     void drop(int id);
+    using SlotPage = std::pair<Table*, int>;
+    std::vector<SlotPage> select_spill_pages(std::span<Table* const> paused, int count) const;
+    void spill_pages_to_host(CudaContext& ctx, std::span<const SlotPage> victims);
+    void exchange_spilled_pages(CudaContext& ctx, Table& table, int requested, std::span<const SlotPage> victims);
+    void restore_pages_from_host(CudaContext& ctx, Table& table, int requested);
 
     std::vector<std::unique_ptr<uint8_t, decltype(&cudaFree)>> slabs_;
     std::vector<Page> physical_;
     size_t page_bytes_ = 0;
     int pages_ = 0;
     int free_ = -1;
+    size_t vram_budget_bytes_ = 0;
+    size_t host_budget_bytes_ = 0;
+    std::vector<HostPage> host_;
+    int host_pages_ = 0;
+    int host_free_ = -1;
 };
 
 void check_cuda(cudaError_t err, const char* expr, const char* file, int line);

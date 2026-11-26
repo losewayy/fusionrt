@@ -446,31 +446,20 @@ bool parse_gguf_model_raw(const std::string& path, int max_seq_override, LoadedM
                 out.cfg.moe.num_experts = E;
                 out.cfg.moe.gpu_resident_experts = E;
                 if (gf.find_tensor(p + "ffn_gate_up_exps.weight")) {
-                    L.experts_gate_up = to_f32_host(req(p + "ffn_gate_up_exps.weight"));
+                    L.experts_gate_up = req(p + "ffn_gate_up_exps.weight");
                     if (L.experts_gate_up.desc.ndim != 3 || (L.experts_gate_up.desc.shape[1] % 2) != 0) {
                         throw std::runtime_error("Invalid GGUF packed expert projections: " + p);
                     }
                     out.cfg.moe.intermediate_size = static_cast<int>(L.experts_gate_up.desc.shape[1] / 2);
-                    L.experts_down = to_f32_host(req(p + "ffn_down_exps.weight"));
                 } else if (gf.find_tensor(p + "ffn_gate_exps.weight") && gf.find_tensor(p + "ffn_up_exps.weight")) {
-                    HostTensor ge = to_f32_host(gf.read_tensor(p + "ffn_gate_exps.weight"));
-                    HostTensor ue = to_f32_host(gf.read_tensor(p + "ffn_up_exps.weight"));
-                    int64_t inter_e = ge.desc.shape[1];
-                    if (ge.desc.ndim != 3 || ue.desc.ndim != 3 || ge.desc.shape != ue.desc.shape ||
-                        ge.desc.shape[0] != E || ge.desc.shape[2] != H) {
+                    L.experts_gate_up = req(p + "ffn_gate_exps.weight");
+                    L.experts_up = req(p + "ffn_up_exps.weight");
+                    const auto& gate = L.experts_gate_up.desc;
+                    const auto& up = L.experts_up.desc;
+                    if (gate.ndim != 3 || up.ndim != 3 || gate.shape != up.shape) {
                         throw std::runtime_error("Invalid GGUF expert projections: " + p);
                     }
-                    out.cfg.moe.intermediate_size = static_cast<int>(inter_e);
-                    L.experts_gate_up = HostTensor::create({E, 2 * inter_e, H}, DType::F32);
-                    for (int e = 0; e < E; ++e) {
-                        std::memcpy(L.experts_gate_up.data<float>() + static_cast<size_t>(e) * (2 * inter_e) * H,
-                                    ge.data<float>() + static_cast<size_t>(e) * inter_e * H,
-                                    static_cast<size_t>(inter_e * H) * sizeof(float));
-                        std::memcpy(L.experts_gate_up.data<float>() + (static_cast<size_t>(e) * 2 + 1) * inter_e * H,
-                                    ue.data<float>() + static_cast<size_t>(e) * inter_e * H,
-                                    static_cast<size_t>(inter_e * H) * sizeof(float));
-                    }
-                    L.experts_down = to_f32_host(req(p + "ffn_down_exps.weight"));
+                    out.cfg.moe.intermediate_size = static_cast<int>(gate.shape[1]);
                 } else {
                     std::vector<HostTensor> gu_list, dn_list;
                     for (int e = 0; e < E; ++e) {
@@ -485,12 +474,19 @@ bool parse_gguf_model_raw(const std::string& path, int max_seq_override, LoadedM
                     L.experts_down.desc = Tensor::from_shape({E, H, dn_list[0].desc.shape[1]}, DType::F32, Backend::CPU);
                     out.cfg.moe.intermediate_size = static_cast<int>(gu_list[0].desc.shape[0]);
                 }
+                if (L.experts_down.storage.empty()) L.experts_down = req(p + "ffn_down_exps.weight");
                 const int I = out.cfg.moe.intermediate_size;
                 if (L.experts_gate_up.desc.ndim != 3 || L.experts_gate_up.desc.shape[0] != E ||
-                    L.experts_gate_up.desc.shape[1] != 2 * I || L.experts_gate_up.desc.shape[2] != H ||
+                    L.experts_gate_up.desc.shape[1] != (L.experts_up.storage.empty() ? 2 * I : I) ||
+                    L.experts_gate_up.desc.shape[2] != H ||
                     L.experts_down.desc.ndim != 3 || L.experts_down.desc.shape[0] != E ||
                     L.experts_down.desc.shape[1] != H || L.experts_down.desc.shape[2] != I) {
                     throw std::runtime_error("Invalid GGUF expert FFN shapes: " + p);
+                }
+                for (const auto* weight : {&L.experts_gate_up, &L.experts_up, &L.experts_down}) {
+                    if (weight->desc.dtype == DType::I32) {
+                        throw std::runtime_error("Unsupported GGUF expert weight dtype: " + p);
+                    }
                 }
                 if (gf.find_tensor(p + "ffn_gate_shexp.weight") && gf.find_tensor(p + "ffn_up_shexp.weight") && gf.find_tensor(p + "ffn_down_shexp.weight")) {
                     L.has_shared = true;

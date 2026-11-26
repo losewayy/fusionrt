@@ -20,7 +20,7 @@ struct LoadedLayerRaw {
     // GDN extras
     HostTensor z_proj, a_proj, b_proj, conv_w, conv_bias, A_log, dt_bias, gdn_norm_w;
     // MoE extras
-    HostTensor router_w, experts_gate_up, experts_down, shared_gate_up, shared_down;
+    HostTensor router_w, experts_gate_up, experts_up, experts_down, shared_gate_up, shared_down;
     bool has_shared = false;
 };
 

@@ -11,6 +11,7 @@
 #include "fusionrt/vulkan_backend.h"
 #endif
 #include <algorithm>
+#include <charconv>
 #include <chrono>
 #include <cstdlib>
 #include <filesystem>
@@ -44,6 +45,8 @@ void print_usage() {
               << "  fusionrt serve --model <path> [--host 127.0.0.1] [--port 8080] [--max-seq 4096] [--slots 1] [--profile <json>]\n"
               << "  fusionrt bench-model --model <path> [--pp 128] [--tg 64] [--decode-prefix 0] [--ubatch 512] [--reps 5] [--graph] [--profile-ops <json>]\n"
               << "  CUDA run, chat, serve, inspect and bench-model accept --kv-type {f32|f16|q8_0}.\n"
+              << "  CUDA placement options: --kv-vram-mb <MiB> (0: auto), --host-kv-mb <MiB> (0: disabled),\n"
+              << "                          --moe-gpu-experts <n> (-1: auto).\n"
               << "  fusionrt bench [--suite all|fusions|blocks|vulkan] [--output <path>] [--vk-device 0]\n";
 }
 
@@ -99,6 +102,43 @@ DType parse_kv_type(const std::string& value) {
     if (value == "q8_0") return DType::Q8_0;
     throw std::invalid_argument("Expected f32, f16 or q8_0 for --kv-type");
 }
+
+struct CudaPlacementOptions {
+    static constexpr size_t mib = 1024 * 1024;
+    size_t vram = 0, host = 0;
+    int experts = -1;
+    bool specified = false;
+
+    bool parse(std::string_view option, std::string_view value) {
+        if (option != "--kv-vram-mb" && option != "--host-kv-mb" && option != "--moe-gpu-experts") return false;
+        const char* end = value.data() + value.size();
+        auto read = [&](auto& number) {
+            const auto result = std::from_chars(value.data(), end, number);
+            if (result.ec != std::errc{} || result.ptr != end) {
+                throw std::invalid_argument("Invalid integer for " + std::string(option));
+            }
+        };
+        if (option == "--moe-gpu-experts") {
+            read(experts);
+            if (experts < -1) throw std::invalid_argument("Expected --moe-gpu-experts >= -1");
+        } else {
+            size_t mb = 0;
+            read(mb);
+            if (mb > std::numeric_limits<size_t>::max() / mib) throw std::invalid_argument("KV budget is too large");
+            (option == "--kv-vram-mb" ? vram : host) = mb * mib;
+        }
+        specified = true;
+        return true;
+    }
+
+#ifdef FUSIONRT_ENABLE_CUDA
+    void apply(FusionModel& model) const {
+        model.set_kv_vram_budget_bytes(vram);
+        model.set_kv_host_budget_bytes(host);
+        model.set_moe_gpu_experts(experts);
+    }
+#endif
+};
 
 bool is_gguf(const std::string& path) {
     return utf8_path(path).extension() == ".gguf";
@@ -198,6 +238,7 @@ int cmd_daily(const std::string& cmd, int argc, char** argv) {
     sampling.top_p = 0.9f;
     sampling.repeat_penalty = 1.1f;
     DType kv_dtype = DType::F32;
+    CudaPlacementOptions placement;
     for (int i = 2; i < argc; ++i) {
         const std::string arg = argv[i];
         if (arg == "--graph" || arg == "--no-graph") {
@@ -210,6 +251,7 @@ int cmd_daily(const std::string& cmd, int argc, char** argv) {
         else if (arg == "--max-seq") max_seq = std::stoi(value);
         else if (arg == "--kv-type") kv_dtype = parse_kv_type(value);
         else if (arg == "--profile") profile = value;
+        else if (placement.parse(arg, value)) continue;
         else if (cmd == "serve" && arg == "--host") host = value;
         else if (cmd == "serve" && arg == "--port") port = std::stoi(value);
         else if (cmd == "serve" && arg == "--slots") {
@@ -231,6 +273,7 @@ int cmd_daily(const std::string& cmd, int argc, char** argv) {
     ctx.set_kv_dtype(kv_dtype);
     FusionModel model(HybridModelConfig{});
     model.set_num_slots(slots);
+    placement.apply(model);
     load_cuda_model(ctx, model, path, max_seq, profile);
     const bool use_graph = graph.value_or(model.recommended_cuda_graph());
     if (cmd == "inspect") {
@@ -274,6 +317,7 @@ int cmd_daily(const std::string& cmd, int argc, char** argv) {
                   << " kv_cache_dtype=" << dtype_name(kv_dtype) << " kv_cache_bytes=" << mem.kv_bytes
                   << " kv_cache_pages=" << mem.kv_pages
                   << " kv_cache_reserved_bytes=" << mem.kv_reserved_bytes
+                  << " host_kv_bytes=" << mem.host_kv_bytes << " host_kv_pages=" << mem.host_kv_pages
                   << " weight_arena_reserved_bytes=" << ctx.weight_arena().capacity()
                   << " ssm_cache_bytes=" << mem.ssm_bytes
                   << " persistent_bytes=" << mem.persistent_bytes
@@ -295,6 +339,7 @@ int cmd_bench_model(int argc, char** argv) {
     DType kv_dtype = DType::F32;
     std::optional<bool> graph_option;
     std::string profile, profile_ops;
+    CudaPlacementOptions placement;
     auto parse_int = [](const std::string& arg) {
         size_t end = 0;
         int value = std::stoi(arg, &end);
@@ -313,6 +358,7 @@ int cmd_bench_model(int argc, char** argv) {
         else if (a == "--ubatch" && i + 1 < argc) ubatch = parse_int(argv[++i]);
         else if (a == "--decode-prefix" && i + 1 < argc) decode_prefix = parse_int(argv[++i]);
         else if (a == "--reps" && i + 1 < argc) reps = parse_int(argv[++i]);
+        else if (i + 1 < argc && placement.parse(a, argv[i + 1])) ++i;
         else throw std::invalid_argument("Unknown or incomplete bench-model option: " + a);
     }
     if (path.empty() || reps == 0 || (pp == 0 && tg == 0)) {
@@ -325,6 +371,7 @@ int cmd_bench_model(int argc, char** argv) {
     CudaContext ctx(0, is_gguf(path) ? 0 : estimate_arena_mb(path), 256);
     ctx.set_kv_dtype(kv_dtype);
     FusionModel model(HybridModelConfig{});
+    placement.apply(model);
     ctx.set_prefill_batch(ubatch);
     const auto load_start = std::chrono::steady_clock::now();
     load_cuda_model(ctx, model, path, std::max(pp, decode_prefix + tg), profile);
@@ -368,6 +415,7 @@ int cmd_run(int argc, char** argv) {
     int vk_dev = 0;
     std::optional<bool> graph_option;
     std::optional<DType> kv_dtype;
+    CudaPlacementOptions placement;
     SamplingParams sampling;
     std::string profile, profile_ops, layer_trace;
     bool stream = false, sampling_set = false;
@@ -396,6 +444,7 @@ int cmd_run(int argc, char** argv) {
         else if (a == "--chat") chat_mode = true;
         else if (a == "--ignore-eos") ignore_eos = true;
         else if (a == "--chatml") use_chatml = true;
+        else if (i + 1 < argc && placement.parse(a, argv[i + 1])) ++i;
         else if (i + 1 < argc && parse_sampling(a, argv[i + 1], sampling)) {
             ++i;
             sampling_set = true;
@@ -403,6 +452,7 @@ int cmd_run(int argc, char** argv) {
     }
     sampling.validate();
     if (kv_dtype && backend_s != "cuda") throw std::invalid_argument("--kv-type requires the CUDA backend");
+    if (placement.specified && backend_s != "cuda") throw std::invalid_argument("Placement options require the CUDA backend");
     if (steps < 0 || max_seq <= 0) throw std::invalid_argument("Invalid --steps or --max-seq");
 
     DType wdt = DType::F32;
@@ -436,6 +486,7 @@ int cmd_run(int argc, char** argv) {
         return 1;
 #else
         CudaContext ctx(0, is_gguf(model_path) ? 0 : weight_mb, 256);
+        placement.apply(model);
         if (kv_dtype) ctx.set_kv_dtype(*kv_dtype);
         if (!model_path.empty()) {
             load_cuda_model(ctx, model, model_path, max_seq, profile);

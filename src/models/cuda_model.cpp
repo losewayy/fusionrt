@@ -1,6 +1,7 @@
 #include "model_loader.h"
 
 #ifdef FUSIONRT_ENABLE_CUDA
+#include "../core/cpu_moe.h"
 #include "fusionrt/cuda_kernels.h"
 
 #include <algorithm>
@@ -21,8 +22,6 @@ namespace {
 
 constexpr int kPrefillCarrySlots = 8;
 constexpr int kMaxDecodeSplits = 128;
-
-float silu_host(float x) { return x / (1.0f + std::exp(-x)); }
 
 struct ProfAccum {
     bool enabled = false;
@@ -249,7 +248,12 @@ void dispatch_add_rmsnorm_linear(CudaContext& ctx, const float* a, const float* 
 }  // namespace
 
 void CudaSparseMoELayer::forward_cuda(CudaContext& ctx, Tensor& x_in_out, bool use_fused) const {
-    size_t mark = ctx.scratch_arena().mark();
+    auto& arena = ctx.scratch_arena();
+    struct ResetMoEScratch {
+        CudaArena& arena;
+        size_t mark;
+        ~ResetMoEScratch() { arena.reset(mark); }
+    } reset{arena, arena.mark()};
     int H = cfg.hidden_size;
     int I = cfg.intermediate_size;
     int E = cfg.num_experts;
@@ -272,67 +276,31 @@ void CudaSparseMoELayer::forward_cuda(CudaContext& ctx, Tensor& x_in_out, bool u
     cuda_ops::moe_topk_router_f32(logits.ptr<float>(), topk_idx.ptr<int>(), topk_w.ptr<float>(),
                                   E, K, cfg.norm_topk_prob, ctx.stream());
 
-    Tensor moe_out = cuda_scratch(ctx, {H});
-    FUSIONRT_CUDA_CHECK(cudaMemsetAsync(moe_out.ptr(), 0, moe_out.nbytes(), ctx.stream()));
+    float* host_x = nullptr;
+    float* host_out = nullptr;
+    float* host_weights = nullptr;
+    int32_t* host_indices = nullptr;
+    if (gpu_E < E) {
+        host_x = ctx.moe_transfer_buffer((2 * H + K) * sizeof(float) + K * sizeof(int32_t));
+        host_out = host_x + H;
+        host_weights = host_out + H;
+        host_indices = reinterpret_cast<int32_t*>(host_weights + K);
+        const auto stream = ctx.stream();
+        FUSIONRT_CUDA_CHECK(cudaMemcpyAsync(host_x, x_norm.ptr(), x_norm.nbytes(), cudaMemcpyDeviceToHost, stream));
+        FUSIONRT_CUDA_CHECK(cudaMemcpyAsync(host_weights, topk_w.ptr(), topk_w.nbytes(), cudaMemcpyDeviceToHost, stream));
+        FUSIONRT_CUDA_CHECK(cudaMemcpyAsync(host_indices, topk_idx.ptr(), topk_idx.nbytes(), cudaMemcpyDeviceToHost, stream));
+        FUSIONRT_CUDA_CHECK(cudaEventRecord(ctx.moe_input_ready(), stream));
+    }
 
-    if (gpu_E == E) {
+    Tensor moe_out = cuda_scratch(ctx, {H});
+    if (gpu_E > 0) {
         Tensor scratch_inter = cuda_scratch(ctx, {K, I});
-        cuda_ops::moe_indexed_swiglu_gemv_f32(
-            x_norm.ptr<float>(), topk_idx.ptr<int>(), gpu_gate_up_w.ptr<float>(), gpu_down_w.ptr<float>(),
-            topk_w.ptr<float>(), moe_out.ptr<float>(), scratch_inter.ptr<float>(), H, I, K, ctx.stream());
+        cuda_ops::moe_indexed_swiglu_gemv(
+            x_norm.ptr<float>(), topk_idx.ptr<int>(), gpu_gate_up_w.ptr(), gpu_gate_up_w.dtype,
+            gpu_up_w.data ? gpu_up_w.ptr() : nullptr, gpu_up_w.dtype, gpu_down_w.ptr(), gpu_down_w.dtype,
+            topk_w.ptr<float>(), moe_out.ptr<float>(), scratch_inter.ptr<float>(), H, I, K, gpu_E, ctx.stream());
     } else {
-        HostTensor h_idx = ctx.download(topk_idx);
-        HostTensor h_wt = ctx.download(topk_w);
-        HostTensor h_x = ctx.download(x_norm);
-        std::vector<float> acc_host(static_cast<size_t>(H), 0.0f);
-        std::vector<int> gpu_slots;
-        for (int s = 0; s < K; ++s) {
-            int e = h_idx.data<int32_t>()[s];
-            float wt = h_wt.data<float>()[s];
-            if (e < gpu_E) {
-                gpu_slots.push_back(s);
-            } else {
-                int cpu_e = e - gpu_E;
-                const float* gu_w = cpu_gate_up_w.data<float>() + static_cast<size_t>(cpu_e) * (2 * I) * H;
-                const float* d_w = cpu_down_w.data<float>() + static_cast<size_t>(cpu_e) * H * I;
-                const float* xp = h_x.data<float>();
-                std::vector<float> act(static_cast<size_t>(I), 0.0f);
-                for (int c = 0; c < I; ++c) {
-                    const float* wg = gu_w + static_cast<size_t>(c) * H;
-                    const float* wu = gu_w + static_cast<size_t>(I + c) * H;
-                    float g_acc = 0.0f, u_acc = 0.0f;
-                    for (int i = 0; i < H; ++i) {
-                        g_acc += xp[i] * wg[i];
-                        u_acc += xp[i] * wu[i];
-                    }
-                    act[c] = silu_host(g_acc) * u_acc;
-                }
-                for (int h_i = 0; h_i < H; ++h_i) {
-                    const float* wd = d_w + static_cast<size_t>(h_i) * I;
-                    float d_acc = 0.0f;
-                    for (int c = 0; c < I; ++c) d_acc += act[c] * wd[c];
-                    acc_host[h_i] += d_acc * wt;
-                }
-            }
-        }
-        if (!gpu_slots.empty()) {
-            int gk = static_cast<int>(gpu_slots.size());
-            HostTensor h_gidx = HostTensor::create({gk}, DType::I32);
-            HostTensor h_gwt = HostTensor::create({gk}, DType::F32);
-            for (int i = 0; i < gk; ++i) {
-                h_gidx.data<int32_t>()[i] = h_idx.data<int32_t>()[gpu_slots[i]];
-                h_gwt.data<float>()[i] = h_wt.data<float>()[gpu_slots[i]];
-            }
-            Tensor d_gidx = ctx.upload(h_gidx, false);
-            Tensor d_gwt = ctx.upload(h_gwt, false);
-            Tensor scratch_inter = cuda_scratch(ctx, {gk, I});
-            cuda_ops::moe_indexed_swiglu_gemv_f32(
-                x_norm.ptr<float>(), d_gidx.ptr<int>(), gpu_gate_up_w.ptr<float>(), gpu_down_w.ptr<float>(),
-                d_gwt.ptr<float>(), moe_out.ptr<float>(), scratch_inter.ptr<float>(), H, I, gk, ctx.stream());
-        }
-        HostTensor h_gpu_out = ctx.download(moe_out);
-        for (int i = 0; i < H; ++i) h_gpu_out.data<float>()[i] += acc_host[i];
-        ctx.upload_into(h_gpu_out, moe_out);
+        FUSIONRT_CUDA_CHECK(cudaMemsetAsync(moe_out.ptr(), 0, moe_out.nbytes(), ctx.stream()));
     }
 
     if (cfg.has_shared_expert) {
@@ -345,8 +313,26 @@ void CudaSparseMoELayer::forward_cuda(CudaContext& ctx, Tensor& x_in_out, bool u
         cuda_ops::add_residual_f32(moe_out.ptr<float>(), sh_down.ptr<float>(), moe_out.ptr<float>(), H, ctx.stream());
     }
 
+    if (host_x) {
+        // The event covers only the inputs. Hot and shared experts can run while the CPU works.
+        FUSIONRT_CUDA_CHECK(cudaEventSynchronize(ctx.moe_input_ready()));
+        std::fill_n(host_out, H, 0.0f);
+        bool has_cold = false;
+        for (int s = 0; s < K; ++s) {
+            const int expert = host_indices[s];
+            if (expert < gpu_E) continue;
+            has_cold = true;
+            cpu_moe_accumulate(cpu_gate_up_w, cpu_up_w, cpu_down_w, expert - gpu_E,
+                                host_x, host_weights[s], host_out);
+        }
+        if (has_cold) {
+            Tensor cold_out = cuda_scratch(ctx, {H});
+            FUSIONRT_CUDA_CHECK(cudaMemcpyAsync(cold_out.ptr(), host_out, cold_out.nbytes(),
+                                                cudaMemcpyHostToDevice, ctx.stream()));
+            cuda_ops::add_residual_f32(moe_out.ptr<float>(), cold_out.ptr<float>(), moe_out.ptr<float>(), H, ctx.stream());
+        }
+    }
     cuda_ops::add_residual_f32(x_in_out.ptr<float>(), moe_out.ptr<float>(), x_in_out.ptr<float>(), H, ctx.stream());
-    ctx.scratch_arena().reset(mark);
 }
 
 void CudaSparseMoELayer::forward_prefill_cuda(CudaContext& ctx, Tensor& x_in_out, int M, bool use_fused) const {
@@ -527,7 +513,8 @@ void FusionModel::init_synthetic(CudaContext& ctx, uint64_t seed) {
             L.cfg.hidden_size = H;
             int I = L.cfg.intermediate_size;
             int E = L.cfg.num_experts;
-            int gE = std::min(E, L.cfg.gpu_resident_experts);
+            const int gE = std::clamp(moe_gpu_experts_override_ < 0 ? L.cfg.gpu_resident_experts :
+                                      moe_gpu_experts_override_, 0, E);
             int cE = E - gE;
             L.cfg.gpu_resident_experts = gE;
 
@@ -556,7 +543,7 @@ void FusionModel::init_synthetic(CudaContext& ctx, uint64_t seed) {
     rebuild_cuda_ir();
 }
 
-static bool upload_raw_model_to_cuda(CudaContext& ctx, const LoadedModelRaw& raw,
+static bool upload_raw_model_to_cuda(CudaContext& ctx, LoadedModelRaw& raw, int resident_experts,
                                      HybridModelConfig& cfg_out,
                                      Tensor& tok_emb, Tensor& final_norm, Tensor& lm_head,
                                      Tensor& hidden_buf, Tensor& logits_buf,
@@ -586,16 +573,38 @@ static bool upload_raw_model_to_cuda(CudaContext& ctx, const LoadedModelRaw& raw
     gdn_layers.clear();
     moe_layers.clear();
 
-    auto upload_moe = [&](const LoadedLayerRaw& lr) {
+    auto upload_moe = [&](LoadedLayerRaw& lr) {
         CudaSparseMoELayer L;
         L.cfg = cfg_out.moe;
         L.cfg.has_shared_expert = lr.has_shared;
-        L.cfg.num_experts = L.cfg.gpu_resident_experts = static_cast<int>(lr.router_w.desc.shape[0]);
+        L.cfg.num_experts = static_cast<int>(lr.router_w.desc.shape[0]);
+        const int resident = std::min(resident_experts, L.cfg.num_experts);
+        L.cfg.gpu_resident_experts = resident;
         L.cfg.intermediate_size = static_cast<int>(lr.experts_down.desc.shape[2]);
         L.norm_w = ctx.upload(lr.mlp_norm.storage.empty() ? lr.attn_norm : lr.mlp_norm, true);
         L.router_w = ctx.upload(lr.router_w, true);
-        L.gpu_gate_up_w = ctx.upload(lr.experts_gate_up, true);
-        L.gpu_down_w = ctx.upload(lr.experts_down, true);
+        auto split = [&](HostTensor& weights, Tensor& gpu, HostTensor& cpu) {
+            if (weights.storage.empty()) return;
+            const auto& shape = weights.desc.shape;
+            const auto type = weights.desc.dtype;
+            if (resident == 0) {
+                cpu = std::move(weights);
+                return;
+            }
+            gpu = ctx.weight_arena().alloc_tensor({resident, shape[1], shape[2]}, type);
+            const size_t hot_bytes = gpu.nbytes();
+            FUSIONRT_CUDA_CHECK(cudaMemcpyAsync(gpu.ptr(), weights.storage.data(), hot_bytes,
+                                                cudaMemcpyHostToDevice, ctx.stream()));
+            ctx.synchronize();
+            if (resident < shape[0]) {
+                cpu = HostTensor::create({shape[0] - resident, shape[1], shape[2]}, type);
+                std::memcpy(cpu.storage.data(), weights.storage.data() + hot_bytes, cpu.storage.size());
+            }
+            weights = {};
+        };
+        split(lr.experts_gate_up, L.gpu_gate_up_w, L.cpu_gate_up_w);
+        split(lr.experts_up, L.gpu_up_w, L.cpu_up_w);
+        split(lr.experts_down, L.gpu_down_w, L.cpu_down_w);
         if (lr.has_shared) {
             L.cfg.shared_intermediate_size = static_cast<int>(lr.shared_down.desc.shape[1]);
             L.shared_gate_up_w = ctx.upload(lr.shared_gate_up, true);
@@ -605,7 +614,7 @@ static bool upload_raw_model_to_cuda(CudaContext& ctx, const LoadedModelRaw& raw
         return static_cast<int>(moe_layers.size() - 1);
     };
 
-    for (const auto& lr : raw.layers) {
+    for (auto& lr : raw.layers) {
         layer_kinds.push_back(lr.kind);
         if (lr.kind == 0) {
             CudaDenseGQALayer L;
@@ -691,7 +700,7 @@ static bool upload_raw_model_to_cuda(CudaContext& ctx, const LoadedModelRaw& raw
     return true;
 }
 
-static size_t gguf_cuda_arena_bytes(const LoadedModelRaw& raw, const CostHardware& hw) {
+static size_t cuda_model_arena_bytes(const LoadedModelRaw& raw, const CostHardware& hw, int resident_experts) {
     size_t bytes = 0;
     auto reserve = [&](size_t n) { bytes += (n + 255) & ~size_t{255}; };
     auto weight = [&](const HostTensor& t, bool is_vocab_head = false) {
@@ -715,25 +724,97 @@ static size_t gguf_cuda_arena_bytes(const LoadedModelRaw& raw, const CostHardwar
                              &l.attn_post_norm, &l.ffn_post_norm,
                              &l.gate, &l.up, &l.down, &l.z_proj, &l.a_proj, &l.b_proj,
                              &l.conv_w, &l.conv_bias, &l.A_log, &l.dt_bias, &l.gdn_norm_w,
-                             &l.router_w, &l.experts_gate_up, &l.experts_down, &l.shared_gate_up, &l.shared_down}) {
+                             &l.router_w, &l.shared_gate_up, &l.shared_down}) {
             weight(*t);
+        }
+        for (const auto* t : {&l.experts_gate_up, &l.experts_up, &l.experts_down}) {
+            if (t->storage.empty()) continue;
+            const auto experts = static_cast<size_t>(t->desc.shape[0]);
+            reserve(t->storage.size() / experts * std::min(experts, static_cast<size_t>(resident_experts)));
         }
         if (l.kind == 1) weight(l.qkv_proj);
     }
     return bytes;
 }
 
+static int place_cuda_experts(CudaContext& ctx, LoadedModelRaw& raw, int override_count,
+                              size_t kv_budget, int slots, bool owns_arena) {
+    int experts = 0;
+    size_t expert_bytes = 0;
+    for (const auto& layer : raw.layers) {
+        if (layer.router_w.storage.empty()) continue;
+        const int count = static_cast<int>(layer.router_w.desc.shape[0]);
+        experts = std::max(experts, count);
+        expert_bytes = std::max(expert_bytes, (layer.experts_gate_up.storage.size() +
+                                layer.experts_up.storage.size() + layer.experts_down.storage.size()) / count);
+    }
+    if (experts == 0) return 0;
+
+    int resident = std::min(override_count, experts);
+    if (resident < 0) {
+        size_t free_bytes = 0, total_bytes = 0;
+        FUSIONRT_CUDA_CHECK(cudaMemGetInfo(&free_bytes, &total_bytes));
+        const auto& arena = ctx.weight_arena();
+        if (owns_arena) free_bytes += arena.capacity();
+        const size_t profile_bytes = static_cast<size_t>(std::min(static_cast<double>(total_bytes),
+            ctx.device_profile().vram_total_mb * 1024.0 * 1024.0));
+        const size_t scratch = ctx.scratch_arena().capacity();
+        const auto& cfg = raw.cfg.dense;
+        size_t kv = 0, page_table_bytes = 0;
+        const size_t pages = 1 + (cfg.max_seq_len - 1) / kKvPageTokens;
+        for (const auto& layer : raw.layers) {
+            if (layer.kind != 0 || layer.kv_source_layer >= 0) continue;
+            const int heads = layer.kv_heads > 0 ? layer.kv_heads : cfg.num_key_value_heads;
+            const int dim = layer.head_dim > 0 ? layer.head_dim : cfg.head_dim;
+            kv += pages * 2 * row_nbytes(ctx.kv_dtype(), kKvPageTokens * heads * dim);
+            page_table_bytes += (pages * sizeof(uint8_t*) + 255) & ~size_t{255};
+        }
+        kv *= static_cast<size_t>(slots);
+        if (kv_budget > 0) kv = std::min(kv, kv_budget);
+        kv += page_table_bytes * slots;
+        const size_t after_scratch = profile_bytes - std::min(profile_bytes, scratch);
+        const size_t vram = std::min(after_scratch, free_bytes);
+        const size_t available = owns_arena ? vram - std::min(vram, kv) :
+            std::min(after_scratch - std::min(after_scratch, kv), arena.capacity() - arena.used());
+        // The arena estimate includes shared weights and per-tensor alignment.
+        int lo = 0, hi = experts;
+        while (lo < hi) {
+            const int candidate = lo + (hi - lo + 1) / 2;
+            if (cuda_model_arena_bytes(raw, ctx.cost_hardware(), candidate) <= available) lo = candidate;
+            else hi = candidate - 1;
+        }
+        resident = lo;
+    }
+    raw.cfg.moe.gpu_resident_experts = std::min(resident, raw.cfg.moe.num_experts);
+    const auto preferred = select_cold_expert_path(ctx.cost_hardware(), expert_bytes);
+    std::clog << "MoE placement gpu_resident=" << resident << " cpu_cold=" << experts - resident;
+    if (resident < experts) {
+        std::clog << " cold_path=cpu_in_place";
+        if (preferred == ColdExpertPath::PcieStream) std::clog << " cost_preference=pcie_stream";
+    }
+    std::clog << '\n';
+    return resident;
+}
+
+void FusionModel::set_moe_gpu_experts(int count) {
+    if (count < -1) throw std::invalid_argument("Expected --moe-gpu-experts >= -1");
+    moe_gpu_experts_override_ = count;
+}
+
 bool FusionModel::load_gguf(CudaContext& ctx, const std::string& path, std::string* err, int max_seq_override) {
     LoadedModelRaw raw;
     if (!parse_gguf_model_raw(path, max_seq_override, raw, err)) return false;
     release_cuda_sessions();
-    if (ctx.weight_arena().capacity() == 0 || owned_gguf_arena_ == &ctx) {
-        const size_t bytes = gguf_cuda_arena_bytes(raw, ctx.cost_hardware());
+    const bool owns_arena = ctx.weight_arena().capacity() == 0 || owned_gguf_arena_ == &ctx;
+    const int resident = place_cuda_experts(ctx, raw, moe_gpu_experts_override_,
+                                           cuda_kv_pool_.vram_budget_bytes(), num_slots(), owns_arena);
+    if (owns_arena) {
+        const size_t bytes = cuda_model_arena_bytes(raw, ctx.cost_hardware(), resident);
         if (ctx.weight_arena().capacity() != bytes) ctx.weight_arena().init(bytes);
         else ctx.weight_arena().reset();
         owned_gguf_arena_ = &ctx;
     }
-    if (!upload_raw_model_to_cuda(ctx, raw, cfg_, tok_embeddings_, final_norm_w_, lm_head_w_,
+    if (!upload_raw_model_to_cuda(ctx, raw, resident, cfg_, tok_embeddings_, final_norm_w_, lm_head_w_,
                                     cuda_workspace_.hidden, cuda_workspace_.logits, cuda_workspace_.token_ids, cuda_workspace_.position, cuda_workspace_.kv_length,
                                     layer_kinds_, layer_indices_, dense_layers_, gdn_layers_, moe_layers_)) {
         return false;
@@ -748,7 +829,9 @@ bool FusionModel::load_safetensors(CudaContext& ctx, const std::string& path, st
     LoadedModelRaw raw;
     if (!parse_safetensors_model_raw(path, max_seq_override, raw, err)) return false;
     release_cuda_sessions();
-    if (!upload_raw_model_to_cuda(ctx, raw, cfg_, tok_embeddings_, final_norm_w_, lm_head_w_,
+    const int resident = place_cuda_experts(ctx, raw, moe_gpu_experts_override_,
+                                           cuda_kv_pool_.vram_budget_bytes(), num_slots(), false);
+    if (!upload_raw_model_to_cuda(ctx, raw, resident, cfg_, tok_embeddings_, final_norm_w_, lm_head_w_,
                                     cuda_workspace_.hidden, cuda_workspace_.logits, cuda_workspace_.token_ids, cuda_workspace_.position, cuda_workspace_.kv_length,
                                     layer_kinds_, layer_indices_, dense_layers_, gdn_layers_, moe_layers_)) {
         return false;
@@ -840,7 +923,21 @@ void FusionModel::reset_kv_and_state(CudaContext& ctx) {
 
 void FusionModel::ensure_cuda_kv(CudaContext& ctx, int first_write, int tokens) {
     auto& slot = cuda_session();
-    cuda_kv_pool_.ensure(ctx, slot.kv, slot.pages, first_write, tokens);
+    if (cuda_kv_pool_.host_budget_bytes() == 0 || cuda_slots_.size() == 1) {
+        cuda_kv_pool_.ensure(ctx, slot.kv, slot.pages, first_write, tokens);
+        return;
+    }
+    std::vector<CudaSession*> paused;
+    for (const auto& candidate : cuda_slots_) {
+        if (candidate && candidate.get() != &slot) paused.push_back(candidate.get());
+    }
+    std::sort(paused.begin(), paused.end(), [](const CudaSession* a, const CudaSession* b) {
+        return a->last_used < b->last_used;
+    });
+    std::vector<CudaKvPool::Table*> victims;
+    victims.reserve(paused.size());
+    for (auto* candidate : paused) victims.push_back(&candidate->pages);
+    cuda_kv_pool_.ensure(ctx, slot.kv, slot.pages, first_write, tokens, victims);
 }
 
 void FusionModel::save_cuda_checkpoint(CudaContext& ctx, int tokens, bool logits) {
@@ -1483,8 +1580,10 @@ static void decode_argmax(CudaContext& ctx, const Tensor& logits, Tensor& token,
     arena.reset(mark);
 }
 
-static bool can_use_cuda_graph(const HybridModelConfig& cfg) {
-    return cfg.arch != "moe" || cfg.moe.gpu_resident_experts == cfg.moe.num_experts;
+static bool can_use_cuda_graph(const std::vector<CudaSparseMoELayer>& layers) {
+    return std::all_of(layers.begin(), layers.end(), [](const auto& layer) {
+        return layer.cfg.gpu_resident_experts == layer.cfg.num_experts;
+    });
 }
 
 static void embed_tokens(CudaContext& ctx, const Tensor& table, const Tensor& ids, Tensor& hidden,
@@ -1524,7 +1623,7 @@ static void run_forward_token_step_cuda(
         }
     };
 
-    if (use_graph && can_use_cuda_graph(cfg)) {
+    if (use_graph && can_use_cuda_graph(moe_layers)) {
         // The generation graph advances both counters after it writes the next token.
         if (first_step || !with_argmax) {
             int kv_len = pos + 1;
@@ -1616,6 +1715,8 @@ ModelMemory FusionModel::cuda_cache_memory() const {
     result.kv_pages = cuda_kv_pool_.pages();
     result.kv_bytes = cuda_kv_pool_.bytes();
     result.kv_reserved_bytes = cuda_kv_pool_.reserved_bytes();
+    result.host_kv_bytes = cuda_kv_pool_.host_bytes();
+    result.host_kv_pages = cuda_kv_pool_.host_pages();
     std::unordered_set<const GdnSnapshot*> counted;
     for (const auto& slot : cuda_slots_) {
         if (!slot) continue;
@@ -1652,7 +1753,8 @@ ModelMemory FusionModel::inspect_cuda(CudaContext& ctx) {
                &l.gate_proj, &l.up_proj, &l.down_proj});
     }
     for (const auto& l : moe_layers_) {
-        count({&l.norm_w, &l.router_w, &l.gpu_gate_up_w, &l.gpu_down_w, &l.shared_gate_up_w, &l.shared_down_w});
+        count({&l.norm_w, &l.router_w, &l.gpu_gate_up_w, &l.gpu_up_w, &l.gpu_down_w,
+               &l.shared_gate_up_w, &l.shared_down_w});
     }
 
     const int rows = prefill_batch_limit(ctx);
@@ -1938,7 +2040,7 @@ std::vector<int32_t> FusionModel::generate_cuda(CudaContext& ctx, const std::vec
                                     pos++, use_fused, use_graph, greedy, first_step, options.op_trace, timer.get());
     };
     auto td0 = std::chrono::high_resolution_clock::now();
-    if (greedy && use_graph && can_use_cuda_graph(cfg_) && !options.on_token && stop_eos_id < 0 && max_new_tokens > 1 &&
+    if (greedy && use_graph && can_use_cuda_graph(moe_layers_) && !options.on_token && stop_eos_id < 0 && max_new_tokens > 1 &&
         static_cast<int64_t>(pos) + max_new_tokens <= cuda_workspace_.token_ids.shape[0]) {
         // Graph replay feeds the next greedy step and records IDs on the device.
         int first_pos = pos;
@@ -2020,7 +2122,7 @@ std::vector<GenerationStats> FusionModel::bench_model_cuda(CudaContext& ctx, int
         FUSIONRT_CUDA_CHECK(cudaMemcpyAsync(host_logits.get(), cuda_workspace_.logits.ptr(), logits_bytes,
                                            cudaMemcpyDeviceToHost, ctx.stream()));
     };
-    use_graph = use_graph && can_use_cuda_graph(cfg_);
+    use_graph = use_graph && can_use_cuda_graph(moe_layers_);
     reset_kv_and_state(ctx);
 
     if (pp > 0) {
