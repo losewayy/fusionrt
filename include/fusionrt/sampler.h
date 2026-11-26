@@ -1,12 +1,16 @@
 #pragma once
 
 #include <cstdint>
+#include <array>
 #include <random>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 namespace fusionrt {
+
+class BpeTokenizer;
 
 struct SamplingParams {
     float temperature = 0.0f;
@@ -22,8 +26,60 @@ struct SamplingParams {
 };
 
 struct Sampler {
+    using Distribution = std::vector<std::pair<double, int32_t>>;
+
+    static Distribution distribution(const float* logits, int vocab_size,
+                                     const std::vector<int32_t>& recent_tokens, const SamplingParams& params);
+    static int32_t draw(const Distribution& distribution, std::mt19937_64& rng);
     static int32_t sample(const float* logits, int vocab_size, const std::vector<int32_t>& recent_tokens,
                           const SamplingParams& params, std::mt19937_64& rng);
+};
+
+class JsonGrammarState {
+public:
+    explicit JsonGrammarState(bool object_only = false);
+    bool consume(std::string_view bytes);
+    bool complete() const;
+    bool sealed() const;
+
+private:
+    friend class JsonConstraint;
+    enum class Expect : uint8_t { value, object_root, key_or_end, key, colon, item_or_end, object_end, array_end, done };
+    enum class Lex : uint8_t { syntax, string, escape, hex, low_slash, low_u, low_hex, literal,
+                               minus, zero, integer, dot, fraction, exponent, exponent_sign, exponent_digits };
+
+    std::vector<Expect> stack_;
+    Lex lex_ = Lex::syntax;
+    std::string_view literal_;
+    uint16_t hex_ = 0;
+    uint8_t hex_digits_ = 0;
+    uint8_t utf8_left_ = 0, utf8_min_ = 0x80, utf8_max_ = 0xbf;
+    bool key_ = false;
+
+    bool advance(unsigned char c);
+    bool advance(std::string_view bytes);
+    void value_done();
+    bool number_complete() const;
+    std::string closing_suffix() const;
+    bool operator==(const JsonGrammarState&) const = default;
+};
+
+class JsonConstraint {
+public:
+    explicit JsonConstraint(const BpeTokenizer& tokenizer, int vocab_size, bool object_only = false);
+    JsonGrammarState initial_state() const { return JsonGrammarState(object_only_); }
+    void mask(float* logits, const JsonGrammarState& state, int remaining_tokens) const;
+    bool accept(JsonGrammarState& state, int32_t id) const;
+    bool is_end(int32_t id) const { return end_[id]; }
+
+private:
+    bool can_finish(std::string_view suffix, int budget) const;
+
+    std::vector<std::string> pieces_;
+    std::vector<bool> end_;
+    std::array<std::vector<int32_t>, 256> by_first_byte_;
+    std::array<bool, 256> single_byte_{};
+    bool object_only_;
 };
 
 class Utf8StreamDecoder {

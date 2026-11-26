@@ -35,6 +35,10 @@ public:
     std::string format_chat_messages(const std::vector<ChatMessage>& msgs,
                                      bool add_generation_prompt = true) const;
     bool is_end_of_generation(int32_t id) const;
+    bool has_compatible_vocab(const BpeTokenizer& other) const {
+        return eos_id_ == other.eos_id_ && id_to_token_ == other.id_to_token_ &&
+               gpt2_byte_bpe_ == other.gpt2_byte_bpe_ && sentencepiece_ == other.sentencepiece_;
+    }
     ChatFormat chat_format() const;
     std::string_view chat_template() const { return chat_template_; }
 

@@ -1,5 +1,6 @@
 #include "fusionrt/bench.h"
 #include "fusionrt/gguf.h"
+#include "fusionrt/json.h"
 #include "fusionrt/models.h"
 #include "fusionrt/safetensors.h"
 #include "fusionrt/server.h"
@@ -40,6 +41,7 @@ void print_usage() {
               << "               [--steps 16] [--max-seq 4096] [--graph|--no-graph] [--unfused] [--stream]\n"
               << "               [--temp 0] [--top-k 40] [--top-p 0.95] [--min-p 0.05] [--repeat-penalty 1] [--seed 42]\n"
               << "               [--profile <json>] [--profile-ops <json>] [--trace-layers <json>]\n"
+              << "               [--json-grammar] [--spec-ngram <k> | --draft-model <gguf> [--draft-tokens 4]]\n"
               << "  fusionrt inspect --model <path> [--max-seq 4096]\n"
               << "  fusionrt chat --model <path> [--system <text>] [--temp 0.7] [--max-tokens 512]\n"
               << "  fusionrt serve --model <path> [--host 127.0.0.1] [--port 8080] [--max-seq 4096] [--slots 1] [--profile <json>]\n"
@@ -409,8 +411,10 @@ int cmd_run(int argc, char** argv) {
     std::string dtype_s = "f32";
     std::string backend_s = "cuda";
     std::string model_path;
+    std::string draft_path;
     std::string prompt = "Hello fusionrt";
     int steps = 16;
+    int spec_ngram = 0, draft_tokens = 4;
     int max_seq = 4096;
     int vk_dev = 0;
     std::optional<bool> graph_option;
@@ -418,7 +422,7 @@ int cmd_run(int argc, char** argv) {
     CudaPlacementOptions placement;
     SamplingParams sampling;
     std::string profile, profile_ops, layer_trace;
-    bool stream = false, sampling_set = false;
+    bool stream = false, sampling_set = false, json_grammar = false, draft_tokens_set = false;
     bool use_fused = true;
     bool chat_mode = false;
     bool ignore_eos = false;
@@ -431,6 +435,13 @@ int cmd_run(int argc, char** argv) {
         else if (a == "--backend" && i + 1 < argc) backend_s = argv[++i];
         else if (a == "--vk-device" && i + 1 < argc) vk_dev = std::stoi(argv[++i]);
         else if (a == "--model" && i + 1 < argc) model_path = argv[++i];
+        else if (a == "--json-grammar") json_grammar = true;
+        else if (a == "--spec-ngram" && i + 1 < argc) spec_ngram = std::stoi(argv[++i]);
+        else if (a == "--draft-model" && i + 1 < argc) draft_path = argv[++i];
+        else if (a == "--draft-tokens" && i + 1 < argc) {
+            draft_tokens = std::stoi(argv[++i]);
+            draft_tokens_set = true;
+        }
         else if (a == "--prompt" && i + 1 < argc) prompt = argv[++i];
         else if (a == "--steps" && i + 1 < argc) steps = std::stoi(argv[++i]);
         else if (a == "--max-seq" && i + 1 < argc) max_seq = std::stoi(argv[++i]);
@@ -454,6 +465,15 @@ int cmd_run(int argc, char** argv) {
     if (kv_dtype && backend_s != "cuda") throw std::invalid_argument("--kv-type requires the CUDA backend");
     if (placement.specified && backend_s != "cuda") throw std::invalid_argument("Placement options require the CUDA backend");
     if (steps < 0 || max_seq <= 0) throw std::invalid_argument("Invalid --steps or --max-seq");
+    if (spec_ngram < 0 || draft_tokens <= 0 || (draft_tokens_set && draft_path.empty())) {
+        throw std::invalid_argument("Expected --spec-ngram >= 0 and --draft-tokens > 0 with --draft-model");
+    }
+    if (!draft_path.empty() && (!is_gguf(draft_path) || model_path.empty() || spec_ngram > 0)) {
+        throw std::invalid_argument("--draft-model requires a GGUF draft, a target model, and no --spec-ngram");
+    }
+    if ((json_grammar || spec_ngram > 0 || !draft_path.empty()) && (backend_s != "cuda" || chat_mode)) {
+        throw std::invalid_argument("JSON grammar and speculative decoding require non-interactive CUDA run");
+    }
 
     DType wdt = DType::F32;
     if (dtype_s == "q8") wdt = DType::Q8_0;
@@ -495,6 +515,18 @@ int cmd_run(int argc, char** argv) {
             model.set_device_profile(ctx, DeviceProfile::load(profile));
         }
         load_tok_if_present();
+        std::unique_ptr<FusionModel> draft;
+        if (!draft_path.empty()) {
+            BpeTokenizer draft_tok;
+            if (!load_tokenizer(draft_tok, draft_path) || !tok.has_compatible_vocab(draft_tok)) {
+                throw std::invalid_argument("Draft tokenizer must have the same vocabulary and EOS as the target");
+            }
+            draft = std::make_unique<FusionModel>(HybridModelConfig{});
+            std::string error;
+            if (!draft->load_gguf(ctx, draft_path, &error, max_seq, true)) {
+                throw std::runtime_error("Error loading draft model: " + error);
+            }
+        }
         const bool use_graph = graph_option.value_or(model.recommended_cuda_graph()) &&
                                sampling.greedy() && profile_ops.empty();
         const bool stop_on_eos = !model_path.empty() && !ignore_eos;
@@ -510,8 +542,14 @@ int cmd_run(int argc, char** argv) {
         OpTrace op_trace;
         LayerTrace trace;
         Utf8StreamDecoder utf8;
+        std::optional<JsonConstraint> constraint;
+        if (json_grammar) constraint.emplace(tok, model.config().vocab_size);
         GenerationOptions options;
         options.sampling = sampling;
+        options.json_constraint = constraint ? &*constraint : nullptr;
+        options.spec_ngram = spec_ngram;
+        options.draft_model = draft.get();
+        options.draft_tokens = draft_tokens;
         options.op_trace = profile_ops.empty() ? nullptr : &op_trace;
         options.layer_trace = layer_trace.empty() ? nullptr : &trace;
         if (stream || stop_on_eos) {
@@ -539,12 +577,20 @@ int cmd_run(int argc, char** argv) {
                   << " prefill_ms=" << st.prefill_ms
                   << " prefill_tok/s=" << st.prefill_tok_per_s
                   << " decode_ms=" << st.decode_ms
-                  << " decode_tok/s=" << st.decode_tok_per_s << "\n";
+                  << " decode_tok/s=" << st.decode_tok_per_s;
+        if (spec_ngram > 0 || draft) {
+            const double rate = st.spec_proposed ? static_cast<double>(st.spec_accepted) / st.spec_proposed : 0.0;
+            std::cout << " spec_proposed=" << st.spec_proposed << " spec_accepted=" << st.spec_accepted
+                      << " accept_rate=" << rate;
+        }
+        std::cout << '\n';
         std::cout << "output_ids:";
         for (int32_t id : out_ids) std::cout << " " << id;
         std::cout << "\n";
         std::vector<int32_t> gen_only(out_ids.begin() + static_cast<std::ptrdiff_t>(prompt_ids.size()), out_ids.end());
-        std::cout << "output_text: " << tok.decode(gen_only) << "\n";
+        const auto output_text = tok.decode(gen_only);
+        if (constraint) (void)JsonValue::parse(output_text);
+        std::cout << "output_text: " << output_text << "\n";
         return 0;
 #endif
     } else if (backend_s == "vulkan") {

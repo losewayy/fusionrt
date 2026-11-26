@@ -82,6 +82,8 @@ struct GenerationStats {
     double prefill_tok_per_s = 0.0;
     double decode_tok_per_s = 0.0;
     int prefilled_tokens = 0;
+    int spec_proposed = 0;
+    int spec_accepted = 0;
 };
 
 struct OpTiming {
@@ -104,12 +106,18 @@ struct LayerTrace {
     void write(const std::string& path, const std::string& model) const;
 };
 
+class FusionModel;
+
 struct GenerationOptions {
     SamplingParams sampling;
     bool reuse_prefix = false;
     std::function<bool(int32_t)> on_token;  // Return false to stop.
     OpTrace* op_trace = nullptr;
     LayerTrace* layer_trace = nullptr;
+    const JsonConstraint* json_constraint = nullptr;
+    int spec_ngram = 0;
+    FusionModel* draft_model = nullptr;
+    int draft_tokens = 4;
 };
 
 struct ModelMemory {
@@ -266,7 +274,8 @@ public:
     void set_kv_host_budget_bytes(size_t bytes) { cuda_kv_pool_.set_kv_host_budget_bytes(bytes); }
     void set_moe_gpu_experts(int count);
     void init_synthetic(CudaContext& ctx, uint64_t seed = 42);
-    bool load_gguf(CudaContext& ctx, const std::string& path, std::string* err = nullptr, int max_seq_override = 0);
+    bool load_gguf(CudaContext& ctx, const std::string& path, std::string* err = nullptr,
+                   int max_seq_override = 0, bool own_weights = false);
     bool load_safetensors(CudaContext& ctx, const std::string& path, std::string* err = nullptr, int max_seq_override = 0);
 
     void reset_kv_and_state(CudaContext& ctx);
@@ -316,6 +325,7 @@ private:
     std::vector<size_t> layer_indices_;
 
 #ifdef FUSIONRT_ENABLE_CUDA
+    CudaArena gguf_weights_;
     Tensor tok_embeddings_;
     Tensor final_norm_w_;
     Tensor lm_head_w_;
@@ -377,6 +387,9 @@ private:
     std::vector<float> prefill_cuda_impl(CudaContext& ctx, const int32_t* token_ids, int count,
                                          int start_pos, bool use_fused, LayerTrace* layer_trace = nullptr,
                                          OpTrace* op_trace = nullptr, bool save_prefix_checkpoints = false);
+    void verify_cuda(CudaContext& ctx, const std::vector<int32_t>& input, int pos, bool use_fused,
+                     std::vector<float>& logits, std::vector<int32_t>& argmax, bool greedy,
+                     bool retain_last_logits);
 
 #endif
 

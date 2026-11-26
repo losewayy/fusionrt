@@ -284,6 +284,37 @@ AgentRequest parse_request(const JsonObject& obj, Protocol protocol) {
         throw std::invalid_argument("Expected conversation input");
     }
     parse_tools(req, obj, protocol);
+    if (protocol != Protocol::messages) {
+        const auto* format = &field(obj, "response_format");
+        bool nested_schema = true;
+        if (protocol == Protocol::responses && format->is_null() && !field(obj, "text").is_null()) {
+            format = &field(object(field(obj, "text"), "text"), "format");
+            nested_schema = false;
+        }
+        if (!format->is_null()) {
+            const auto& config = object(*format, "response format");
+            const auto type = identifier(config, "type");
+            if (type == "json_object" || type == "json_schema") {
+                auto instruction = std::string("Respond with a single JSON object.");
+                req.generation.json = JsonMode::object;
+                if (type == "json_schema") {
+                    const auto& schema_format = nested_schema && !field(config, "json_schema").is_null()
+                        ? object(field(config, "json_schema"), "json_schema") : config;
+                    const auto& schema = field(schema_format, "schema");
+                    const auto& root = field(object(schema, "schema"), "type");
+                    if (!root.is_string() || root.as_string() != "object") req.generation.json = JsonMode::value;
+                    instruction = "Respond with a single JSON value matching this schema: " + schema.dump(0);
+                }
+                if (!req.generation.stops.empty() || req.choice == Choice::required || req.choice == Choice::named) {
+                    throw std::invalid_argument("JSON response formats cannot be combined with stop sequences or required tools");
+                }
+                req.choice = Choice::none;
+                req.messages.insert(req.messages.begin(), {Role::system, {std::move(instruction)}});
+            } else if (type != "text") {
+                throw std::invalid_argument("Unsupported response format: " + type);
+            }
+        }
+    }
     match_results(req);
     return req;
 }

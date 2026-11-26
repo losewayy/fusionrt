@@ -250,7 +250,8 @@ struct Completion {
 template<class Emit>
 Completion generate(CudaContext& ctx, FusionModel& model, const BpeTokenizer& tokenizer,
                     const std::vector<int32_t>& prompt, const agent::GenerationParams& params,
-                    int context, bool graph, bool reuse_prefix, Emit emit) {
+                    int context, bool graph, bool reuse_prefix, Emit emit,
+                    const JsonConstraint* constraint = nullptr) {
     StopBuffer stop{params.stops, {}, false};
     Utf8StreamDecoder utf8;
     Completion completion;
@@ -258,6 +259,7 @@ Completion generate(CudaContext& ctx, FusionModel& model, const BpeTokenizer& to
     GenerationOptions opts;
     opts.sampling = params.sampling;
     opts.reuse_prefix = reuse_prefix;
+    opts.json_constraint = constraint;
     opts.on_token = [&](int32_t id) {
         if (tokenizer.is_end_of_generation(id)) {
             completion.finish = agent::Finish::stop;
@@ -273,7 +275,7 @@ Completion generate(CudaContext& ctx, FusionModel& model, const BpeTokenizer& to
               << " cached_tokens=" << stats.prompt_tokens - stats.prefilled_tokens
               << " prefill_ms=" << stats.prefill_ms << std::endl;
     if (connected && !stop.matched && emit(stop.push(utf8.finish())) && !stop.matched) emit(stop.pending);
-    if (stop.matched) completion.finish = agent::Finish::stop;
+    if (stop.matched || constraint) completion.finish = agent::Finish::stop;
     return completion;
 }
 
@@ -323,7 +325,7 @@ void complete(SocketHandle fd, CudaContext& ctx, FusionModel& model, const BpeTo
 void complete_agent(SocketHandle fd, CudaContext& ctx, FusionModel& model, const BpeTokenizer& tokenizer,
                     const std::string& name, agent::Protocol protocol, const agent::AgentRequest& request,
                     const agent::AgentPrompt& rendered, const std::vector<int32_t>& prompt,
-                    int context, bool graph, uint64_t request_id) {
+                    int context, bool graph, uint64_t request_id, const JsonConstraint* constraint) {
     const int64_t created = std::time(nullptr);
     const char* prefix = protocol == agent::Protocol::chat ? "chatcmpl-" :
                          protocol == agent::Protocol::responses ? "resp_" : "msg_";
@@ -341,9 +343,10 @@ void complete_agent(SocketHandle fd, CudaContext& ctx, FusionModel& model, const
     try {
         const auto completion = generate(ctx, model, tokenizer, prompt, request.generation, context, graph, true,
             [&](const std::string& text) {
-                parser.push(text);
+                if (constraint) response.text(text);
+                else parser.push(text);
                 return response.connected();
-            });
+            }, constraint);
         if (!response.connected()) return;
         parser.finish();
         if ((request.choice == agent::Choice::required || request.choice == agent::Choice::named) &&
@@ -392,6 +395,7 @@ void serve_http(CudaContext& ctx, FusionModel& model, const BpeTokenizer& tokeni
     StopHandler stop_handler;
     uint64_t request_id = 0;
     const auto& cfg = model.config();
+    std::optional<JsonConstraint> json_value, json_object;
     const std::string& arch = cfg.model_architecture.empty() ? cfg.arch : cfg.model_architecture;
     std::cout << "fusionrt listening on " << host << ':' << port << '\n' << std::flush;
     while (!StopHandler::stopping) {
@@ -451,8 +455,15 @@ void serve_http(CudaContext& ctx, FusionModel& model, const BpeTokenizer& tokeni
                     const auto input = agent::parse_request(obj, *protocol);
                     const auto rendered = agent::render_prompt(input, tokenizer);
                     const auto prompt = encode_prompt(tokenizer, rendered.text, context);
+                    const JsonConstraint* constraint = nullptr;
+                    if (input.generation.json != agent::JsonMode::none) {
+                        const bool object_only = input.generation.json == agent::JsonMode::object;
+                        auto& cached = object_only ? json_object : json_value;
+                        if (!cached) cached.emplace(tokenizer, cfg.vocab_size, object_only);
+                        constraint = &*cached;
+                    }
                     complete_agent(fd, ctx, model, tokenizer, model_name, *protocol, input, rendered, prompt,
-                                   context, use_graph, ++request_id);
+                                   context, use_graph, ++request_id, constraint);
                 } else {
                     const auto& text = agent::field(obj, "prompt");
                     if (!text.is_string()) throw std::invalid_argument("prompt must be a string");

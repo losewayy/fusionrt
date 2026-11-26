@@ -120,6 +120,10 @@ AgentPrompt render_prompt(const AgentRequest& req, const BpeTokenizer& tokenizer
     }
     prompt.llama_calls = llama && !req.tools.empty() && req.choice != Choice::none;
     prompt.open_thought = prompt.text.ends_with("<think>\n");
+    if (prompt.open_thought && req.generation.json != JsonMode::none) {
+        prompt.text += "\n</think>\n\n";
+        prompt.open_thought = false;
+    }
     if (req.choice == Choice::required || req.choice == Choice::named) {
         if (prompt.open_thought) {
             prompt.text += "\n</think>\n\n";

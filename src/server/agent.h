@@ -35,12 +35,14 @@ struct Message {
 };
 
 enum class Choice { automatic, none, required, named };
+enum class JsonMode { none, value, object };
 
 struct GenerationParams {
     int max_tokens = 512;
     SamplingParams sampling;
     std::vector<std::string> stops;
     bool stream = false;
+    JsonMode json = JsonMode::none;
 };
 
 struct AgentRequest {

@@ -1955,6 +1955,118 @@ void test_phase2_loaders_prefill_and_vulkan_e2e(CudaContext& cuda_ctx) {
 }
 #endif
 
+void test_stage7a_json() {
+    std::cout << "Testing incremental JSON grammar and constrained sampling...\n";
+    auto check = [](bool passed, const char* error) {
+        if (!passed) throw std::runtime_error(error);
+    };
+    JsonGrammarState state;
+    const std::vector<std::string> pieces = {
+        " \r\n{\"utf8\":\"\xf0\x9f", "\x98\x83", "\\ud83d", "\\ude03",
+        "\",\"list\":[-0.3e", "+2,true,false,null,{},[]]}\t"
+    };
+    std::string valid;
+    for (const auto& piece : pieces) {
+        check(!state.complete() && state.consume(piece), "A valid JSON token split was rejected");
+        valid += piece;
+    }
+    check(state.complete() && JsonValue::parse(valid).is_object(), "Completed JSON object");
+    for (const std::string_view invalid : {"[1,]", "{\"a\":}", "{\"a\":1,}", "00", "1 2",
+                                           "\"\\udc00\"", "\"\\ud800x\"", "\"\xed\xa0\x80\"", "\vnull"}) {
+        JsonGrammarState fresh;
+        check(!fresh.consume(invalid) && fresh.consume("null") && fresh.complete(),
+              "Invalid JSON token must be rejected without changing state");
+    }
+    for (const std::string_view partial : {"1.", "1e-", "-", "[true", "\"\\ud800\\u", "\"\xe2"}) {
+        JsonGrammarState prefix;
+        check(prefix.consume(partial) && !prefix.complete(), "Incomplete JSON prefix");
+    }
+
+    BpeTokenizer tok;
+    tok.init_byte_fallback();
+    const JsonConstraint constraint(tok, tok.vocab_size(), true);
+    const auto invalid = tok.encode("]", false).front();
+    std::vector<float> logits(tok.vocab_size());
+    std::uniform_real_distribution<float> score(-20, 20);
+    for (uint64_t seed = 0; seed < 48; ++seed) {
+        auto grammar = constraint.initial_state();
+        std::mt19937_64 rng(seed);
+        SamplingParams params;
+        params.temperature = seed % 2 ? 0.7f : 0.0f;
+        std::vector<int32_t> ids;
+        for (int budget = 32; budget > 0 && !grammar.sealed(); --budget) {
+            for (auto& logit : logits) logit = score(rng);
+            logits[tok.eos_id()] = logits[invalid] = std::numeric_limits<float>::infinity();
+            constraint.mask(logits.data(), grammar, budget);
+            const auto token = Sampler::sample(logits.data(), tok.vocab_size(), ids, params, rng);
+            check(constraint.accept(grammar, token), "Sampler chose a masked JSON token");
+            ids.push_back(token);
+        }
+        check(grammar.complete() && JsonValue::parse(tok.decode(ids)).is_object(), "Constrained sample must parse");
+    }
+
+    using agent::JsonMode;
+    using agent::Protocol;
+    const auto parse = [](std::string_view json, Protocol protocol) {
+        return agent::parse_request(JsonValue::parse(std::string(json)).as_object(), protocol).generation.json;
+    };
+    check(parse(R"({"messages":[{"role":"user","content":"test"}],"response_format":{"type":"json_object"}})",
+                Protocol::chat) == JsonMode::object, "Chat JSON object format");
+    check(parse(R"({"input":"test","response_format":{"type":"json_schema","json_schema":{"schema":{"type":"object"}}}})",
+                Protocol::responses) == JsonMode::object, "Responses JSON schema format");
+    check(parse(R"({"input":"test","text":{"format":{"type":"json_schema","schema":{"type":"array"}}}})",
+                Protocol::responses) == JsonMode::value, "Responses native text format");
+}
+
+#ifdef FUSIONRT_ENABLE_CUDA
+void test_stage7a_speculative() {
+    std::cout << "Testing prompt lookup and draft model CUDA token parity...\n";
+    CudaContext ctx(0, 32, 32);
+    HybridModelConfig cfg;
+    cfg.vocab_size = 8;
+    cfg.num_layers = 4;
+    cfg.dense.hidden_size = cfg.gdn.hidden_size = 128;
+    cfg.dense.intermediate_size = cfg.gdn.intermediate_size = 192;
+    cfg.dense.num_attention_heads = cfg.dense.num_key_value_heads = 2;
+    cfg.gdn.num_k_heads = cfg.gdn.num_v_heads = 2;
+    cfg.dense.max_seq_len = 256;
+    std::vector<int32_t> prompt;
+    for (int32_t a = 0; a < cfg.vocab_size; ++a) {
+        for (int32_t b = 0; b < cfg.vocab_size; ++b) {
+            prompt.push_back(a);
+            prompt.push_back(b);
+        }
+    }
+    constexpr int steps = 40;
+    for (const char* arch : {"dense", "hybrid"}) {
+        const auto mark = ctx.weight_arena().mark();
+        {
+            cfg.arch = arch;
+            FusionModel target(cfg);
+            target.init_synthetic(ctx, 505);
+            const auto baseline = target.generate_cuda(ctx, prompt, steps, true, true);
+            GenerationOptions options;
+            options.spec_ngram = 4;
+            GenerationStats stats;
+            const auto actual = target.generate_cuda(ctx, prompt, steps, true, true, &stats, false, 0, -1, options);
+            if (actual != baseline || stats.spec_proposed == 0 || stats.spec_accepted == stats.spec_proposed) {
+                throw std::runtime_error(std::string(arch) + " prompt lookup must exercise rejection and match greedy IDs");
+            }
+
+            FusionModel draft(cfg);
+            draft.init_synthetic(ctx, 505);
+            options.spec_ngram = 0;
+            options.draft_model = &draft;
+            const auto drafted = target.generate_cuda(ctx, prompt, steps, true, true, &stats, false, 0, -1, options);
+            if (drafted != baseline || stats.spec_accepted == 0) {
+                throw std::runtime_error(std::string(arch) + " draft model must accept proposals and match greedy IDs");
+            }
+        }
+        ctx.weight_arena().reset(mark);
+    }
+}
+#endif
+
 void test_wave3() {
     std::cout << "Testing sampling, UTF-8, device profile, GGUF biases and prefix reuse...\n";
     auto check = [](bool passed, const char* error) {
@@ -2577,7 +2689,9 @@ int main() {
         test_phase2_loaders_prefill_and_vulkan_e2e(cuda_ctx);
 #endif
         test_wave3();
+        test_stage7a_json();
 #ifdef FUSIONRT_ENABLE_CUDA
+        test_stage7a_speculative();
         test_chunked_prefill_and_k_quant_gdn();
         test_cuda_session_slots();
         test_tiered_cuda_kv();
