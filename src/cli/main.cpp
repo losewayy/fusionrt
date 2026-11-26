@@ -42,7 +42,7 @@ void print_usage() {
               << "               [--temp 0] [--top-k 40] [--top-p 0.95] [--min-p 0.05] [--repeat-penalty 1] [--seed 42]\n"
               << "               [--profile <json>] [--profile-ops <json>] [--trace-layers <json>]\n"
               << "               [--json-grammar] [--spec-ngram <k> | --draft-model <gguf> [--draft-tokens 4]]\n"
-              << "  fusionrt inspect --model <path> [--max-seq 4096]\n"
+              << "  fusionrt inspect --model <path> [--max-seq 4096] [--device-memory]\n"
               << "  fusionrt chat --model <path> [--system <text>] [--temp 0.7] [--max-tokens 512]\n"
               << "  fusionrt serve --model <path> [--host 127.0.0.1] [--port 8080] [--max-seq 4096] [--slots 1] [--profile <json>]\n"
               << "  fusionrt bench-model --model <path> [--pp 128] [--tg 64] [--decode-prefix 0] [--ubatch 512] [--reps 5] [--graph] [--profile-ops <json>]\n"
@@ -224,17 +224,32 @@ int interactive_chat(CudaContext& ctx, FusionModel& model, const BpeTokenizer& t
 }
 #endif
 
+struct WeightSummary {
+    std::map<DType, std::pair<uint64_t, uint64_t>> by_type;
+    uint64_t parameters = 0, bytes = 0;
+
+    void add(DType type, const std::vector<int64_t>& shape, uint64_t size) {
+        const auto count = std::accumulate(shape.begin(), shape.end(), uint64_t{1}, std::multiplies<>{});
+        parameters += count;
+        bytes += size;
+        auto& entry = by_type[type];
+        entry.first += count;
+        entry.second += size;
+    }
+
+    void print() const {
+        std::cout << "parameters=" << parameters << " weight_bytes=" << bytes << '\n';
+        for (const auto& [type, amounts] : by_type) {
+            std::cout << "  " << dtype_name(type) << " parameters=" << amounts.first << " bytes=" << amounts.second << '\n';
+        }
+    }
+};
+
 int cmd_daily(const std::string& cmd, int argc, char** argv) {
-#ifndef FUSIONRT_ENABLE_CUDA
-    (void)cmd;
-    (void)argc;
-    (void)argv;
-    std::cerr << "CUDA backend was not enabled in this build.\n";
-    return 1;
-#else
     std::string path, system, profile, host = "127.0.0.1";
     int max_seq = 4096, steps = 512, port = 8080, slots = 1;
     std::optional<bool> graph;
+    bool inspect_device = false;
     SamplingParams sampling;
     sampling.temperature = 0.7f;
     sampling.top_p = 0.9f;
@@ -245,6 +260,10 @@ int cmd_daily(const std::string& cmd, int argc, char** argv) {
         const std::string arg = argv[i];
         if (arg == "--graph" || arg == "--no-graph") {
             graph = arg == "--graph";
+            continue;
+        }
+        if (cmd == "inspect" && arg == "--device-memory") {
+            inspect_device = true;
             continue;
         }
         if (i + 1 >= argc) throw std::invalid_argument("Missing value for " + arg);
@@ -271,6 +290,45 @@ int cmd_daily(const std::string& cmd, int argc, char** argv) {
         throw std::invalid_argument("Expected --model and positive context, generation length and port");
     }
     sampling.validate();
+    GgufFile header;
+    const bool inspect_gguf = cmd == "inspect" && is_gguf(path);
+    if (inspect_gguf && !inspect_device) {
+        const auto start = std::chrono::steady_clock::now();
+        std::string error;
+        if (!header.load(path, &error, false)) throw std::runtime_error(error);
+        const auto arch = header.get_string("general.architecture", "llama");
+        const auto prefix = arch + ".";
+        const auto hidden = header.get_int(prefix + "embedding_length");
+        const auto heads = header.get_int(prefix + "attention.head_count");
+        const auto experts = header.get_int(prefix + "expert_count");
+        const auto qk_norm = header.find_tensor("blk.0.attn_q_norm.weight") && header.find_tensor("blk.0.attn_k_norm.weight");
+        std::cout << "model=" << model_filename(path) << " architecture=" << arch
+                  << " layout=" << (experts ? "moe" : header.find_tensor("blk.0.ssm_conv1d.weight") ? "hybrid" : "dense")
+                  << " layers=" << header.get_int(prefix + "block_count") << " max_seq=" << max_seq
+                  << " trained_context=" << header.get_int(prefix + "context_length") << '\n'
+                  << "gguf_version=" << header.version() << " file_bytes=" << header.file_bytes()
+                  << " tensors=" << header.tensors().size() << " hidden_size=" << hidden
+                  << " attention_heads=" << heads << " kv_heads=" << header.get_int(prefix + "attention.head_count_kv", heads)
+                  << " head_dim=" << header.get_int(prefix + "attention.key_length", hidden / std::max<int64_t>(1, heads))
+                  << " qk_norm=" << (qk_norm ? "true" : "false")
+                  << " rope_theta=" << header.get_float(prefix + "rope.freq_base", 10000.0) << '\n';
+        if (experts) {
+            std::cout << "experts=" << experts << " top_k=" << header.get_int(prefix + "expert_used_count")
+                      << " expert_width=" << header.get_int(prefix + "expert_feed_forward_length")
+                      << " norm_topk_prob=" << (header.get_bool(prefix + "expert_weights_norm",
+                             header.get_bool(prefix + "norm_topk_prob", true)) ? "true" : "false") << '\n';
+        }
+        WeightSummary sizes;
+        for (const auto& tensor : header.tensors()) sizes.add(tensor.dtype, tensor.shape, tensor.nbytes);
+        sizes.print();
+        std::cout << "inspect_ms=" << std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - start).count() << '\n';
+        return 0;
+    }
+#ifndef FUSIONRT_ENABLE_CUDA
+    std::cerr << "CUDA backend was not enabled in this build.\n";
+    return 1;
+#else
     CudaContext ctx(0, is_gguf(path) ? 0 : estimate_arena_mb(path), 256);
     ctx.set_kv_dtype(kv_dtype);
     FusionModel model(HybridModelConfig{});
@@ -279,35 +337,22 @@ int cmd_daily(const std::string& cmd, int argc, char** argv) {
     load_cuda_model(ctx, model, path, max_seq, profile);
     const bool use_graph = graph.value_or(model.recommended_cuda_graph());
     if (cmd == "inspect") {
-        std::map<DType, std::pair<uint64_t, uint64_t>> breakdown;
-        uint64_t parameters = 0, disk_bytes = 0;
-        auto count = [&](DType dtype, const std::vector<int64_t>& shape, uint64_t bytes) {
-            const auto size = std::accumulate(shape.begin(), shape.end(), uint64_t{1}, std::multiplies<>{});
-            parameters += size;
-            disk_bytes += bytes;
-            auto& entry = breakdown[dtype];
-            entry.first += size;
-            entry.second += bytes;
-        };
+        WeightSummary sizes;
         std::string err;
-        if (is_gguf(path)) {
-            GgufFile gguf;
-            if (!gguf.load(path, &err)) throw std::runtime_error(err);
-            for (const auto& t : gguf.tensors()) count(t.dtype, t.shape, t.nbytes);
+        if (inspect_gguf) {
+            if (!header.load(path, &err, false)) throw std::runtime_error(err);
+            for (const auto& t : header.tensors()) sizes.add(t.dtype, t.shape, t.nbytes);
         } else {
             SafetensorsFile sf;
             if (!sf.load(path, &err)) throw std::runtime_error(err);
-            for (const auto& t : sf.tensors()) count(t.dtype, t.shape, t.end - t.begin);
+            for (const auto& t : sf.tensors()) sizes.add(t.dtype, t.shape, t.end - t.begin);
         }
         const auto& cfg = model.config();
         const auto mem = model.inspect_cuda(ctx);
         std::cout << "model=" << model_filename(path)
                   << " architecture=" << (cfg.model_architecture.empty() ? cfg.arch : cfg.model_architecture)
-                  << " layout=" << cfg.arch << " layers=" << cfg.num_layers << " max_seq=" << cfg.dense.max_seq_len
-                  << "\nparameters=" << parameters << " weight_bytes=" << disk_bytes << '\n';
-        for (const auto& [dtype, amounts] : breakdown) {
-            std::cout << "  " << dtype_name(dtype) << " parameters=" << amounts.first << " bytes=" << amounts.second << '\n';
-        }
+                  << " layout=" << cfg.arch << " layers=" << cfg.num_layers << " max_seq=" << cfg.dense.max_seq_len << '\n';
+        sizes.print();
         size_t device_weight_bytes = 0;
         for (const auto& [dtype, bytes] : mem.weight_bytes) {
             device_weight_bytes += bytes;
@@ -506,6 +551,7 @@ int cmd_run(int argc, char** argv) {
         return 1;
 #else
         CudaContext ctx(0, is_gguf(model_path) ? 0 : weight_mb, 256);
+        const auto load_start = std::chrono::steady_clock::now();
         placement.apply(model);
         if (kv_dtype) ctx.set_kv_dtype(*kv_dtype);
         if (!model_path.empty()) {
@@ -530,6 +576,8 @@ int cmd_run(int argc, char** argv) {
         const bool use_graph = graph_option.value_or(model.recommended_cuda_graph()) &&
                                sampling.greedy() && profile_ops.empty();
         const bool stop_on_eos = !model_path.empty() && !ignore_eos;
+        const double load_ms = std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - load_start).count();
         if (chat_mode) {
             return interactive_chat(ctx, model, tok, "", sampling, steps, use_fused, use_graph, stop_on_eos);
         }
@@ -573,6 +621,7 @@ int cmd_run(int argc, char** argv) {
                   << " graph=" << (use_graph ? "true" : "false")
                   << " ir_ops=" << ir_st.raw_nodes << "->" << ir_st.opt_nodes
                   << " prompt_toks=" << prompt_ids.size()
+                  << " load_ms=" << load_ms
                   << " gen_toks=" << st.generated_tokens
                   << " prefill_ms=" << st.prefill_ms
                   << " prefill_tok/s=" << st.prefill_tok_per_s

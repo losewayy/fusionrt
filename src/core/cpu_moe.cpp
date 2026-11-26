@@ -132,14 +132,14 @@ void cpu_moe_accumulate(const HostTensor& gate, const HostTensor& up, const Host
                         int expert, const float* input, float weight, float* output, CpuMoeMode mode) {
     const int hidden = static_cast<int>(down.desc.shape[1]);
     const int inter = static_cast<int>(down.desc.shape[2]);
-    const bool packed = up.storage.empty();
+    const bool packed = up.bytes().empty();
     const size_t gate_stride = row_nbytes(gate.desc.dtype, hidden);
     const size_t up_stride = packed ? gate_stride : row_nbytes(up.desc.dtype, hidden);
     const size_t down_stride = row_nbytes(down.desc.dtype, inter);
     const size_t first_row = static_cast<size_t>(expert) * inter;
-    const auto* gate_data = gate.storage.data() + first_row * (packed ? 2 : 1) * gate_stride;
-    const auto* up_data = packed ? gate_data + inter * gate_stride : up.storage.data() + first_row * up_stride;
-    const auto* down_data = down.storage.data() + static_cast<size_t>(expert) * hidden * down_stride;
+    const auto* gate_data = gate.bytes().data() + first_row * (packed ? 2 : 1) * gate_stride;
+    const auto* up_data = packed ? gate_data + inter * gate_stride : up.bytes().data() + first_row * up_stride;
+    const auto* down_data = down.bytes().data() + static_cast<size_t>(expert) * hidden * down_stride;
     const auto gate_dot = row_dot(gate.desc.dtype, mode);
     const auto up_dot = packed ? gate_dot : row_dot(up.desc.dtype, mode);
     const auto down_dot = row_dot(down.desc.dtype, mode);

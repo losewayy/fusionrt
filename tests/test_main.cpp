@@ -252,6 +252,20 @@ void test_quant_and_io() {
     if (!gf.load(gguf_path, &err)) throw std::runtime_error("GGUF load failed: " + err);
     HostTensor gf_w = gf.read_tensor("test.weight");
     expect_close(std::vector<float>(gf_w.data<float>(), gf_w.data<float>() + 512), ref, 1e-6, 1e-6, "GGUF v3 roundtrip");
+    {
+        GgufFile file;
+        if (!file.load(gguf_path, &err, false)) throw std::runtime_error(err);
+        auto view = file.view_tensor("test.weight");
+        const auto* bytes = view.bytes().data();
+        const size_t row_bytes = view.bytes().size() / view.desc.shape[0];
+        const auto slice = view.slice_dim0(1, 1);
+        file = {};
+        view = {};
+        if (!slice.storage.empty() || slice.bytes().data() != bytes + row_bytes ||
+            std::memcmp(slice.bytes().data(), gf_w.bytes().data() + row_bytes, row_bytes) != 0) {
+            throw std::runtime_error("GGUF mapped slice must retain its owner and alias file bytes");
+        }
+    }
 
     BpeTokenizer tok;
     if (!tok.load_from_gguf(gf)) throw std::runtime_error("Tokenizer load from GGUF failed");
@@ -286,6 +300,7 @@ void test_quant_and_io() {
         if (gtok.decode(gids) != "<|im_start|>hello o") {
             throw std::runtime_error("GPT2 byte BPE decode mismatch: " + gtok.decode(gids));
         }
+        ggf = {};
         std::filesystem::remove(gpt2_path);
 
         gmeta["tokenizer.ggml.pre"] = std::string("smollm");
@@ -298,6 +313,7 @@ void test_quant_and_io() {
             gtok.encode("a's\n\n12\n\na") != std::vector<int32_t>{0, 3, 5, 6, 7, 4, 4, 0}) {
             throw std::runtime_error("SmolLM pre-tokenization mismatch");
         }
+        ggf = {};
         std::filesystem::remove(gpt2_path);
     }
 
@@ -308,6 +324,7 @@ void test_quant_and_io() {
     if (!sf.load(st_path, &err)) throw std::runtime_error("Safetensors load failed: " + err);
     HostTensor sf_w = sf.read_tensor("test.weight");
     expect_close(std::vector<float>(sf_w.data<float>(), sf_w.data<float>() + 512), ref, 1e-6, 1e-6, "Safetensors roundtrip");
+    gf = {};
     std::filesystem::remove(gguf_path);
     std::filesystem::remove(st_path);
 }
@@ -2167,6 +2184,7 @@ void test_wave3() {
     check(layer.q_bias.data && layer.k_bias.data && layer.v_bias.data && layer.cfg.rope_neox &&
           layer.cfg.partial_rotary_factor == 0.5f && layer.cfg.rope_theta == 12345.0f, "Qwen2 metadata and QKV biases");
     weights.emplace_back("output.weight", q_emb);
+    gguf = {};
     load(untied);
     const std::vector<int32_t> prefix{1, 2, 3}, branched{1, 2, 5, 6};
     untied.reset_kv_and_state(ctx);
@@ -2394,6 +2412,14 @@ HostTensor moe_test_weights(std::vector<int64_t> shape, DType dtype, std::mt1993
             for (auto& scale : block.scales) scale = static_cast<uint8_t>(rng());
             for (auto& q : block.qs) q = static_cast<uint8_t>(rng());
         }
+    } else if (dtype == DType::Q6_K) {
+        for (size_t i = 0; i < result.storage.size() / sizeof(BlockQ6_K); ++i) {
+            auto& block = result.data<BlockQ6_K>()[i];
+            block.d = fp32_to_fp16(0.000023f);
+            for (auto& scale : block.scales) scale = static_cast<int8_t>(rng());
+            for (auto& q : block.ql) q = static_cast<uint8_t>(rng());
+            for (auto& q : block.qh) q = static_cast<uint8_t>(rng());
+        }
     } else if (dtype == DType::Q4_0) {
         for (size_t i = 0; i < result.storage.size() / sizeof(BlockQ4_0); ++i) {
             auto& block = result.data<BlockQ4_0>()[i];
@@ -2418,14 +2444,16 @@ void test_cuda_native_quantized_moe() {
         ~Fixture() { std::error_code ec; std::filesystem::remove(path, ec); }
     } fixture;
     CudaContext ctx(0, 0, 32);
-    FusionModel model(HybridModelConfig{});
-    const std::map<std::string, GgufMetaValue> meta{
+    std::map<std::string, GgufMetaValue> meta{
         {"general.architecture", std::string("qwen3moe")}, {"qwen3moe.block_count", uint32_t{1}},
         {"qwen3moe.embedding_length", uint32_t{H}}, {"qwen3moe.attention.head_count", uint32_t{8}},
         {"qwen3moe.attention.head_count_kv", uint32_t{2}}, {"qwen3moe.feed_forward_length", uint32_t{I}},
         {"qwen3moe.expert_count", uint32_t{E}}, {"qwen3moe.expert_used_count", uint32_t{2}}
     };
-    for (const auto dtype : {DType::Q4_0, DType::Q4_K, DType::F32}) {
+    for (const auto dtype : {DType::Q4_0, DType::Q4_K, DType::Q6_K, DType::F32}) {
+        FusionModel model(HybridModelConfig{});
+        const bool normalize = dtype != DType::Q6_K;
+        meta["qwen3moe.expert_weights_norm"] = normalize;
         std::mt19937_64 rng(841);
         auto embeddings = rand_f32({V, H}, rng, 0.1f);
         for (int t = 0; t < V; ++t) embeddings.data<float>()[t * H] = 0.35f;
@@ -2437,6 +2465,7 @@ void test_cuda_native_quantized_moe() {
             {"token_embd.weight", std::move(embeddings)}, {"output_norm.weight", make_ones_f32({H})},
             {"blk.0.attn_norm.weight", make_ones_f32({H})}, {"blk.0.ffn_norm.weight", make_ones_f32({H})},
             {"blk.0.attn_q.weight", rand_f32({H, H}, rng)}, {"blk.0.attn_k.weight", rand_f32({64, H}, rng)},
+            {"blk.0.attn_q_norm.weight", make_ones_f32({32})}, {"blk.0.attn_k_norm.weight", make_ones_f32({32})},
             {"blk.0.attn_v.weight", rand_f32({64, H}, rng)}, {"blk.0.attn_output.weight", HostTensor({H, H}, DType::F32)},
             {"blk.0.ffn_gate_inp.weight", std::move(router)},
             {"blk.0.ffn_gate_shexp.weight", rand_f32({I, H}, rng, 0.035f)},
@@ -2444,15 +2473,16 @@ void test_cuda_native_quantized_moe() {
             {"blk.0.ffn_down_shexp.weight", rand_f32({H, I}, rng, 0.035f)},
             {"blk.0.ffn_down_exps.weight", moe_test_weights({E, H, I}, dtype, rng)}
         };
-        const bool split = dtype == DType::Q4_K;
-        const auto up_type = split ? DType::Q8_0 : dtype;
+        const bool split = dtype == DType::Q4_K || dtype == DType::Q6_K;
+        const auto gate_type = dtype == DType::Q6_K ? DType::Q4_K : dtype;
+        const auto up_type = dtype == DType::Q4_K ? DType::Q8_0 : gate_type;
         weights.emplace_back(split ? "blk.0.ffn_gate_exps.weight" : "blk.0.ffn_gate_up_exps.weight",
-                             moe_test_weights({E, split ? I : 2 * I, H}, dtype, rng));
+                             moe_test_weights({E, split ? I : 2 * I, H}, gate_type, rng));
         if (split) weights.emplace_back("blk.0.ffn_up_exps.weight", moe_test_weights({E, I, H}, up_type, rng));
         std::string error;
         if (!GgufFile::write_v3(fixture.path.string(), meta, weights, &error)) throw std::runtime_error(error);
 
-        const size_t gate_bytes = (split ? I : 2 * I) * row_nbytes(dtype, H);
+        const size_t gate_bytes = (split ? I : 2 * I) * row_nbytes(gate_type, H);
         const size_t down_bytes = H * row_nbytes(dtype, I);
         const size_t up_bytes = split ? I * row_nbytes(up_type, H) : 0;
         auto load = [&](int expert_override, int expected) {
@@ -2461,15 +2491,17 @@ void test_cuda_native_quantized_moe() {
             const auto& layer = model.moe_layers().at(0);
             const int cold = E - expected;
             if (!layer.cfg.has_shared_expert || layer.cfg.top_k != 2 ||
+                layer.cfg.norm_topk_prob != normalize || !model.config().dense.qk_norm ||
                 model.config().moe.gpu_resident_experts != expected || layer.cfg.gpu_resident_experts != expected ||
-                layer.gpu_gate_up_w.dtype != dtype || layer.gpu_down_w.dtype != dtype ||
+                layer.gpu_gate_up_w.dtype != gate_type || layer.gpu_down_w.dtype != dtype ||
                 layer.gpu_gate_up_w.nbytes() != expected * gate_bytes ||
                 layer.gpu_down_w.nbytes() != expected * down_bytes ||
                 layer.gpu_up_w.nbytes() != expected * up_bytes ||
-                layer.cpu_gate_up_w.storage.size() != cold * gate_bytes ||
-                layer.cpu_down_w.storage.size() != cold * down_bytes ||
-                layer.cpu_up_w.storage.size() != cold * up_bytes ||
-                (cold && (layer.cpu_gate_up_w.desc.dtype != dtype || layer.cpu_down_w.desc.dtype != dtype)) ||
+                layer.cpu_gate_up_w.bytes().size() != cold * gate_bytes ||
+                layer.cpu_down_w.bytes().size() != cold * down_bytes ||
+                layer.cpu_up_w.bytes().size() != cold * up_bytes ||
+                !layer.cpu_gate_up_w.storage.empty() || !layer.cpu_down_w.storage.empty() || !layer.cpu_up_w.storage.empty() ||
+                (cold && (layer.cpu_gate_up_w.desc.dtype != gate_type || layer.cpu_down_w.desc.dtype != dtype)) ||
                 (split && (layer.gpu_up_w.dtype != up_type || (cold && layer.cpu_up_w.desc.dtype != up_type)))) {
                 throw std::runtime_error("MoE placement or native expert dtype/byte count is incorrect");
             }
@@ -2510,6 +2542,7 @@ void test_cuda_native_quantized_moe() {
         std::cout << "  [PASS] Native " << dtype_name(dtype) << " MoE 8x top-2 + shared: gpu_resident=3 cpu_cold=5"
                   << " prefill(M=8) rel_l2=" << compare(gpu.first, hybrid.first)
                   << " decode(M=1) rel_l2=" << compare(gpu.second, hybrid.second) << '\n';
+        ctx.weight_arena().release();
     }
 }
 
@@ -2518,7 +2551,7 @@ void test_cpu_quantized_moe_speed() {
     std::mt19937_64 rng(161);
     const auto input = rand_f32({width}, rng, 0.25f);
     const HostTensor no_separate_up;
-    for (const auto dtype : {DType::Q4_0, DType::Q4_K}) {
+    for (const auto dtype : {DType::Q4_0, DType::Q4_K, DType::Q6_K}) {
         const auto gate_up = moe_test_weights({1, 2 * width, width}, dtype, rng);
         const auto down = moe_test_weights({1, width, width}, dtype, rng);
         auto run = [&](CpuMoeMode mode, std::vector<float>& output) {

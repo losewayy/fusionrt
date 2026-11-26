@@ -32,7 +32,7 @@ static void upload_raw_model_to_vulkan(VkContext& ctx, const LoadedModelRaw& raw
         return ctx.upload(ht, true);
     };
 
-    const bool tied = raw.lm_head_w.storage.empty();
+    const bool tied = raw.lm_head_w.bytes().empty();
     tok_emb = ctx.upload(
         (raw.tok_embeddings.desc.dtype == DType::Q4_1 || raw.tok_embeddings.desc.dtype == DType::Q4_K ||
          raw.tok_embeddings.desc.dtype == DType::Q5_K || raw.tok_embeddings.desc.dtype == DType::Q6_K ||
@@ -59,17 +59,17 @@ static void upload_raw_model_to_vulkan(VkContext& ctx, const LoadedModelRaw& raw
         L.cfg.has_shared_expert = lr.has_shared;
         L.cfg.num_experts = L.cfg.gpu_resident_experts = static_cast<int>(lr.router_w.desc.shape[0]);
         L.cfg.intermediate_size = static_cast<int>(lr.experts_down.desc.shape[2]);
-        L.norm_w = ctx.upload(to_f32_host(lr.mlp_norm.storage.empty() ? lr.attn_norm : lr.mlp_norm), true);
+        L.norm_w = ctx.upload(to_f32_host(lr.mlp_norm.bytes().empty() ? lr.attn_norm : lr.mlp_norm), true);
         L.router_w = ctx.upload(to_f32_host(lr.router_w), true);
         auto gate = to_f32_host(lr.experts_gate_up);
-        if (!lr.experts_up.storage.empty()) {
+        if (!lr.experts_up.bytes().empty()) {
             const auto up = to_f32_host(lr.experts_up);
             const int E = L.cfg.num_experts, I = L.cfg.intermediate_size;
             auto packed = HostTensor::create({E, 2 * I, H}, DType::F32);
-            const size_t bytes = gate.storage.size() / E;
+            const size_t bytes = gate.bytes().size() / E;
             for (int e = 0; e < E; ++e) {
-                std::memcpy(packed.storage.data() + (2 * e) * bytes, gate.storage.data() + e * bytes, bytes);
-                std::memcpy(packed.storage.data() + (2 * e + 1) * bytes, up.storage.data() + e * bytes, bytes);
+                std::memcpy(packed.storage.data() + (2 * e) * bytes, gate.bytes().data() + e * bytes, bytes);
+                std::memcpy(packed.storage.data() + (2 * e + 1) * bytes, up.bytes().data() + e * bytes, bytes);
             }
             gate = std::move(packed);
         }
@@ -100,10 +100,10 @@ static void upload_raw_model_to_vulkan(VkContext& ctx, const LoadedModelRaw& raw
                 L.k_proj = upload_vk_weight(lr.k_proj);
                 L.v_proj = upload_vk_weight(lr.v_proj);
             }
-            if (!lr.q_bias.storage.empty()) L.q_bias = ctx.upload(lr.q_bias, true);
-            if (!lr.k_bias.storage.empty()) L.k_bias = ctx.upload(lr.k_bias, true);
-            if (!lr.v_bias.storage.empty()) L.v_bias = ctx.upload(lr.v_bias, true);
-            if (L.cfg.qk_norm && !lr.q_norm.storage.empty()) {
+            if (!lr.q_bias.bytes().empty()) L.q_bias = ctx.upload(lr.q_bias, true);
+            if (!lr.k_bias.bytes().empty()) L.k_bias = ctx.upload(lr.k_bias, true);
+            if (!lr.v_bias.bytes().empty()) L.v_bias = ctx.upload(lr.v_bias, true);
+            if (L.cfg.qk_norm && !lr.q_norm.bytes().empty()) {
                 L.q_norm_w = ctx.upload(to_f32_host(lr.q_norm), true);
                 L.k_norm_w = ctx.upload(to_f32_host(lr.k_norm), true);
             } else {
@@ -111,11 +111,11 @@ static void upload_raw_model_to_vulkan(VkContext& ctx, const LoadedModelRaw& raw
                 L.k_norm_w = dummy_norm;
             }
             L.o_proj = upload_vk_weight(lr.o_proj);
-            if (!lr.router_w.storage.empty()) {
+            if (!lr.router_w.bytes().empty()) {
                 L.moe_index = upload_moe(lr);
             } else {
                 L.mlp_norm_w = ctx.upload(to_f32_host(lr.mlp_norm), true);
-                L.gate_up_proj = lr.gate_up.storage.empty()
+                L.gate_up_proj = lr.gate_up.bytes().empty()
                     ? ctx.upload(concat_rows_same_dtype({to_f32_host(lr.gate), to_f32_host(lr.up)}), true)
                     : upload_vk_weight(lr.gate_up);
                 L.down_proj = upload_vk_weight(lr.down);
@@ -139,7 +139,7 @@ static void upload_raw_model_to_vulkan(VkContext& ctx, const LoadedModelRaw& raw
             L.norm_w = ctx.upload(to_f32_host(lr.gdn_norm_w), true);
             L.o_proj = upload_vk_weight(lr.o_proj);
             L.mlp_norm_w = ctx.upload(to_f32_host(lr.mlp_norm), true);
-            L.gate_up_proj = lr.gate_up.storage.empty()
+            L.gate_up_proj = lr.gate_up.bytes().empty()
                     ? ctx.upload(concat_rows_same_dtype({to_f32_host(lr.gate), to_f32_host(lr.up)}), true)
                     : upload_vk_weight(lr.gate_up);
             L.down_proj = upload_vk_weight(lr.down);
@@ -238,7 +238,7 @@ bool FusionModel::load_gguf_vulkan(VkContext& ctx, const std::string& path, std:
         if (err) *err = "Gemma 4 GGUF requires the CUDA backend";
         return false;
     }
-    if (!raw.rope_factors.storage.empty()) {
+    if (!raw.rope_factors.bytes().empty()) {
         if (err) *err = "Vulkan does not support GGUF RoPE frequency factors";
         return false;
     }

@@ -5,6 +5,7 @@
 #include "fusionrt/cuda_kernels.h"
 
 #include <algorithm>
+#include <bit>
 #include <chrono>
 #include <cmath>
 #include <cstdlib>
@@ -14,6 +15,9 @@
 #include <thread>
 #include <tuple>
 #include <unordered_set>
+#ifdef _WIN32
+#include <dxgi1_4.h>
+#endif
 
 namespace fusionrt {
 using namespace model_io;
@@ -561,9 +565,9 @@ static bool upload_raw_model_to_cuda(CudaContext& ctx, CudaArena& arena, LoadedM
                                      std::vector<CudaGatedDeltaNetLayer>& gdn_layers,
                                      std::vector<CudaSparseMoELayer>& moe_layers) {
     cfg_out = raw.cfg;
-    const Tensor rope_factors = raw.rope_factors.storage.empty() ? Tensor{} : upload_cuda_weight(ctx, arena, raw.rope_factors);
+    const Tensor rope_factors = raw.rope_factors.bytes().empty() ? Tensor{} : upload_cuda_weight(ctx, arena, raw.rope_factors);
     int H = cfg_out.dense.hidden_size;
-    const bool tied = raw.lm_head_w.storage.empty();
+    const bool tied = raw.lm_head_w.bytes().empty();
     tok_emb = tied ? upload_cuda_matrix(ctx, arena, raw.tok_embeddings, true) :
                     upload_cuda_weight(ctx, arena, raw.tok_embeddings);
     final_norm = upload_cuda_weight(ctx, arena, raw.final_norm_w);
@@ -589,10 +593,10 @@ static bool upload_raw_model_to_cuda(CudaContext& ctx, CudaArena& arena, LoadedM
         const int resident = std::min(resident_experts, L.cfg.num_experts);
         L.cfg.gpu_resident_experts = resident;
         L.cfg.intermediate_size = static_cast<int>(lr.experts_down.desc.shape[2]);
-        L.norm_w = upload_cuda_weight(ctx, arena, lr.mlp_norm.storage.empty() ? lr.attn_norm : lr.mlp_norm);
+        L.norm_w = upload_cuda_weight(ctx, arena, lr.mlp_norm.bytes().empty() ? lr.attn_norm : lr.mlp_norm);
         L.router_w = upload_cuda_weight(ctx, arena, lr.router_w);
         auto split = [&](HostTensor& weights, Tensor& gpu, HostTensor& cpu) {
-            if (weights.storage.empty()) return;
+            if (weights.bytes().empty()) return;
             const auto& shape = weights.desc.shape;
             const auto type = weights.desc.dtype;
             if (resident == 0) {
@@ -601,13 +605,10 @@ static bool upload_raw_model_to_cuda(CudaContext& ctx, CudaArena& arena, LoadedM
             }
             gpu = arena.alloc_tensor({resident, shape[1], shape[2]}, type);
             const size_t hot_bytes = gpu.nbytes();
-            FUSIONRT_CUDA_CHECK(cudaMemcpyAsync(gpu.ptr(), weights.storage.data(), hot_bytes,
+            FUSIONRT_CUDA_CHECK(cudaMemcpyAsync(gpu.ptr(), weights.bytes().data(), hot_bytes,
                                                 cudaMemcpyHostToDevice, ctx.stream()));
             ctx.synchronize();
-            if (resident < shape[0]) {
-                cpu = HostTensor::create({shape[0] - resident, shape[1], shape[2]}, type);
-                std::memcpy(cpu.storage.data(), weights.storage.data() + hot_bytes, cpu.storage.size());
-            }
+            if (resident < shape[0]) cpu = weights.slice_dim0(resident, shape[0] - resident);
             weights = {};
         };
         split(lr.experts_gate_up, L.gpu_gate_up_w, L.cpu_gate_up_w);
@@ -644,11 +645,11 @@ static bool upload_raw_model_to_cuda(CudaContext& ctx, CudaArena& arena, LoadedM
             }
             if (L.sliding_window == 0) L.rope_factors = rope_factors;
             L.attn_norm_w = upload_cuda_weight(ctx, arena, lr.attn_norm);
-            if (!lr.attn_post_norm.storage.empty()) L.attn_post_norm_w = upload_cuda_weight(ctx, arena, lr.attn_post_norm);
-            if (!lr.ffn_post_norm.storage.empty()) L.ffn_post_norm_w = upload_cuda_weight(ctx, arena, lr.ffn_post_norm);
+            if (!lr.attn_post_norm.bytes().empty()) L.attn_post_norm_w = upload_cuda_weight(ctx, arena, lr.attn_post_norm);
+            if (!lr.ffn_post_norm.bytes().empty()) L.ffn_post_norm_w = upload_cuda_weight(ctx, arena, lr.ffn_post_norm);
             if (L.kv_source_layer >= 0) {
                 L.q_proj = upload_cuda_matrix(ctx, arena, lr.q_proj);
-            } else if (lr.v_proj.storage.empty()) {
+            } else if (lr.v_proj.bytes().empty()) {
                 std::array<Tensor, 2> packs;
                 upload_projections(ctx, arena, {&lr.q_proj, &lr.k_proj}, {&L.q_proj, &L.k_proj}, packs);
                 std::move(packs.begin(), packs.end(), L.projection_packs.begin());
@@ -656,19 +657,19 @@ static bool upload_raw_model_to_cuda(CudaContext& ctx, CudaArena& arena, LoadedM
                 upload_projections(ctx, arena, {&lr.q_proj, &lr.k_proj, &lr.v_proj},
                                    {&L.q_proj, &L.k_proj, &L.v_proj}, L.projection_packs);
             }
-            if (!lr.q_bias.storage.empty()) L.q_bias = upload_cuda_weight(ctx, arena, lr.q_bias);
-            if (!lr.k_bias.storage.empty()) L.k_bias = upload_cuda_weight(ctx, arena, lr.k_bias);
-            if (!lr.v_bias.storage.empty()) L.v_bias = upload_cuda_weight(ctx, arena, lr.v_bias);
-            if (L.cfg.qk_norm && !lr.q_norm.storage.empty()) {
+            if (!lr.q_bias.bytes().empty()) L.q_bias = upload_cuda_weight(ctx, arena, lr.q_bias);
+            if (!lr.k_bias.bytes().empty()) L.k_bias = upload_cuda_weight(ctx, arena, lr.k_bias);
+            if (!lr.v_bias.bytes().empty()) L.v_bias = upload_cuda_weight(ctx, arena, lr.v_bias);
+            if (L.cfg.qk_norm && !lr.q_norm.bytes().empty()) {
                 L.q_norm_w = upload_cuda_weight(ctx, arena, lr.q_norm);
-                if (!lr.k_norm.storage.empty()) L.k_norm_w = upload_cuda_weight(ctx, arena, lr.k_norm);
+                if (!lr.k_norm.bytes().empty()) L.k_norm_w = upload_cuda_weight(ctx, arena, lr.k_norm);
             }
             L.o_proj = upload_cuda_matrix(ctx, arena, lr.o_proj);
-            if (!lr.router_w.storage.empty()) {
+            if (!lr.router_w.bytes().empty()) {
                 L.moe_index = upload_moe(lr);
             } else {
                 L.mlp_norm_w = upload_cuda_weight(ctx, arena, lr.mlp_norm);
-                if (!lr.gate_up.storage.empty()) {
+                if (!lr.gate_up.bytes().empty()) {
                     L.gate_up_proj = upload_cuda_matrix(ctx, arena, lr.gate_up);
                 } else {
                     L.gate_proj = upload_cuda_matrix(ctx, arena, lr.gate);
@@ -691,7 +692,7 @@ static bool upload_raw_model_to_cuda(CudaContext& ctx, CudaArena& arena, LoadedM
             L.norm_w = upload_cuda_weight(ctx, arena, lr.gdn_norm_w);
             L.o_proj = upload_cuda_matrix(ctx, arena, lr.o_proj);
             L.mlp_norm_w = upload_cuda_weight(ctx, arena, lr.mlp_norm);
-            if (!lr.gate_up.storage.empty()) {
+            if (!lr.gate_up.bytes().empty()) {
                 L.gate_up_proj = upload_cuda_matrix(ctx, arena, lr.gate_up);
             } else {
                 L.gate_proj = upload_cuda_matrix(ctx, arena, lr.gate);
@@ -712,12 +713,12 @@ static size_t cuda_model_arena_bytes(const LoadedModelRaw& raw, const CostHardwa
     size_t bytes = 0;
     auto reserve = [&](size_t n) { bytes += (n + 255) & ~size_t{255}; };
     auto weight = [&](const HostTensor& t, bool is_vocab_head = false) {
-        if (t.storage.empty()) return;
+        if (t.bytes().empty()) return;
         const auto dtype = cuda_matrix_dtype(hw, t, is_vocab_head);
         reserve(t.desc.numel() / dtype_block_size(dtype) * dtype_type_size(dtype));
     };
-    if (raw.lm_head_w.storage.empty()) weight(raw.tok_embeddings, true);
-    else reserve(raw.tok_embeddings.storage.size());
+    if (raw.lm_head_w.bytes().empty()) weight(raw.tok_embeddings, true);
+    else reserve(raw.tok_embeddings.bytes().size());
     for (const auto* t : {&raw.final_norm_w, &raw.rope_factors}) weight(*t);
     weight(raw.lm_head_w, true);
     const auto& d = raw.cfg.dense;
@@ -736,25 +737,49 @@ static size_t cuda_model_arena_bytes(const LoadedModelRaw& raw, const CostHardwa
             weight(*t);
         }
         for (const auto* t : {&l.experts_gate_up, &l.experts_up, &l.experts_down}) {
-            if (t->storage.empty()) continue;
+            if (t->bytes().empty()) continue;
             const auto experts = static_cast<size_t>(t->desc.shape[0]);
-            reserve(t->storage.size() / experts * std::min(experts, static_cast<size_t>(resident_experts)));
+            reserve(t->bytes().size() / experts * std::min(experts, static_cast<size_t>(resident_experts)));
         }
         if (l.kind == 1) weight(l.qkv_proj);
     }
     return bytes;
 }
 
+#ifdef _WIN32
+static size_t wddm_available_vram(int device) {
+    constexpr size_t unknown = static_cast<size_t>(-1);
+    cudaDeviceProp properties{};
+    if (cudaGetDeviceProperties(&properties, device) != cudaSuccess || !properties.luidDeviceNodeMask)
+        return unknown;
+    LUID luid{};
+    static_assert(sizeof(luid) == sizeof(properties.luid));
+    std::memcpy(&luid, properties.luid, sizeof(luid));
+    IDXGIFactory4* factory = nullptr;
+    if (FAILED(CreateDXGIFactory1(IID_PPV_ARGS(&factory)))) return unknown;
+    IDXGIAdapter3* adapter = nullptr;
+    const auto found = factory->EnumAdapterByLuid(luid, IID_PPV_ARGS(&adapter));
+    factory->Release();
+    if (FAILED(found)) return unknown;
+    DXGI_QUERY_VIDEO_MEMORY_INFO memory{};
+    const auto queried = adapter->QueryVideoMemoryInfo(std::countr_zero(properties.luidDeviceNodeMask),
+        DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &memory);
+    adapter->Release();
+    if (FAILED(queried) || !memory.Budget) return unknown;
+    return static_cast<size_t>(memory.Budget - std::min(memory.Budget, memory.CurrentUsage));
+}
+#endif
+
 static int place_cuda_experts(CudaContext& ctx, LoadedModelRaw& raw, int override_count,
                               size_t kv_budget, int slots, bool owns_arena, size_t reclaim_bytes = 0) {
     int experts = 0;
     size_t expert_bytes = 0;
     for (const auto& layer : raw.layers) {
-        if (layer.router_w.storage.empty()) continue;
+        if (layer.router_w.bytes().empty()) continue;
         const int count = static_cast<int>(layer.router_w.desc.shape[0]);
         experts = std::max(experts, count);
-        expert_bytes = std::max(expert_bytes, (layer.experts_gate_up.storage.size() +
-                                layer.experts_up.storage.size() + layer.experts_down.storage.size()) / count);
+        expert_bytes = std::max(expert_bytes, (layer.experts_gate_up.bytes().size() +
+                                layer.experts_up.bytes().size() + layer.experts_down.bytes().size()) / count);
     }
     if (experts == 0) return 0;
 
@@ -762,6 +787,9 @@ static int place_cuda_experts(CudaContext& ctx, LoadedModelRaw& raw, int overrid
     if (resident < 0) {
         size_t free_bytes = 0, total_bytes = 0;
         FUSIONRT_CUDA_CHECK(cudaMemGetInfo(&free_bytes, &total_bytes));
+#ifdef _WIN32
+        free_bytes = std::min(free_bytes, wddm_available_vram(ctx.info().device_id));
+#endif
         free_bytes += reclaim_bytes;
         const auto& arena = ctx.weight_arena();
         const size_t profile_bytes = static_cast<size_t>(std::min(static_cast<double>(total_bytes),
@@ -780,6 +808,12 @@ static int place_cuda_experts(CudaContext& ctx, LoadedModelRaw& raw, int overrid
         kv *= static_cast<size_t>(slots);
         if (kv_budget > 0) kv = std::min(kv, kv_budget);
         kv += page_table_bytes * slots;
+#ifdef _WIN32
+        if (cuda_model_arena_bytes(raw, ctx.cost_hardware(), experts) > free_bytes - std::min(free_bytes, kv)) {
+            // Leave room for graphics and driver allocations when weights must be split.
+            free_bytes -= std::min(free_bytes, size_t{512} * 1024 * 1024);
+        }
+#endif
         const size_t after_scratch = profile_bytes - std::min(profile_bytes, scratch);
         const size_t vram = std::min(after_scratch, free_bytes);
         const size_t available = owns_arena ? vram - std::min(vram, kv) :

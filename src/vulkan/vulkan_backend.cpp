@@ -482,7 +482,7 @@ Tensor VkContext::upload(const HostTensor& ht, bool persistent) {
         size_t chunk = std::min<size_t>(nbytes - off, static_cast<size_t>(chunk_cap));
         staging_arena_.reset();
         VkDeviceSize st_off = staging_arena_.alloc(chunk);
-        std::memcpy(static_cast<uint8_t*>(staging_arena_.mapped()) + st_off, ht.storage.data() + off, chunk);
+        std::memcpy(static_cast<uint8_t*>(staging_arena_.mapped()) + st_off, ht.bytes().data() + off, chunk);
         copy_buffer(staging_arena_.buffer(), st_off,
                     reinterpret_cast<VkBuffer>(dst.vk_buffer), dst.vk_offset + off, chunk);
     }

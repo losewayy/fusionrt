@@ -5,11 +5,75 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <limits>
 #include <stdexcept>
+#ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#else
+#include <fcntl.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <unistd.h>
+#endif
 
 namespace fusionrt {
 
 namespace {
+
+std::shared_ptr<const uint8_t> map_file(const std::filesystem::path& path, size_t& size) {
+#ifdef _WIN32
+    const HANDLE file = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_DELETE, nullptr,
+                                    OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (file == INVALID_HANDLE_VALUE) throw std::runtime_error("Cannot open GGUF file");
+    LARGE_INTEGER length{};
+    HANDLE mapping = nullptr;
+    if (GetFileSizeEx(file, &length) && length.QuadPart > 0 &&
+        static_cast<uint64_t>(length.QuadPart) <= std::numeric_limits<size_t>::max()) {
+        mapping = CreateFileMappingW(file, nullptr, PAGE_READONLY, 0, 0, nullptr);
+    }
+    CloseHandle(file);
+    if (!mapping) throw std::runtime_error("Cannot create GGUF file mapping");
+    const auto* data = static_cast<const uint8_t*>(MapViewOfFile(mapping, FILE_MAP_READ, 0, 0, 0));
+    CloseHandle(mapping);
+    if (!data) throw std::runtime_error("Cannot map GGUF file");
+    size = static_cast<size_t>(length.QuadPart);
+    return {data, [](const uint8_t* ptr) { UnmapViewOfFile(ptr); }};
+#else
+    const int file = open(path.c_str(), O_RDONLY | O_CLOEXEC);
+    if (file < 0) throw std::runtime_error("Cannot open GGUF file");
+    struct stat statbuf{};
+    void* data = MAP_FAILED;
+    if (fstat(file, &statbuf) == 0 && statbuf.st_size > 0 &&
+        static_cast<uint64_t>(statbuf.st_size) <= std::numeric_limits<size_t>::max()) {
+        data = mmap(nullptr, static_cast<size_t>(statbuf.st_size), PROT_READ, MAP_PRIVATE, file, 0);
+    }
+    close(file);
+    if (data == MAP_FAILED) throw std::runtime_error("Cannot map GGUF file");
+    size = static_cast<size_t>(statbuf.st_size);
+    return {static_cast<const uint8_t*>(data), [size](const uint8_t* ptr) {
+        munmap(const_cast<uint8_t*>(ptr), size);
+    }};
+#endif
+}
+
+class GgufReader {
+public:
+    explicit GgufReader(std::span<const uint8_t> bytes) : remaining_(bytes) {}
+    size_t remaining() const { return remaining_.size(); }
+    std::span<const uint8_t> take(uint64_t count) {
+        if (count > remaining_.size()) throw std::runtime_error("Unexpected EOF reading GGUF");
+        const auto n = static_cast<size_t>(count);
+        const auto result = remaining_.first(n);
+        remaining_ = remaining_.subspan(n);
+        return result;
+    }
+
+private:
+    std::span<const uint8_t> remaining_;
+};
 
 enum class GgufValType : uint32_t {
     UINT8 = 0,
@@ -73,11 +137,9 @@ uint32_t dtype_to_ggml(DType dt) {
 }
 
 template <typename T>
-T read_le(std::ifstream& ifs) {
+T read_le(GgufReader& input) {
     T val{};
-    if (!ifs.read(reinterpret_cast<char*>(&val), sizeof(T))) {
-        throw std::runtime_error("Unexpected EOF reading GGUF");
-    }
+    std::memcpy(&val, input.take(sizeof(T)).data(), sizeof(T));
     return val;
 }
 
@@ -86,13 +148,9 @@ void write_le(std::ofstream& ofs, const T& val) {
     ofs.write(reinterpret_cast<const char*>(&val), sizeof(T));
 }
 
-std::string read_str(std::ifstream& ifs) {
-    uint64_t len = read_le<uint64_t>(ifs);
-    std::string s(static_cast<size_t>(len), '\0');
-    if (len > 0 && !ifs.read(s.data(), static_cast<std::streamsize>(len))) {
-        throw std::runtime_error("Unexpected EOF reading GGUF string");
-    }
-    return s;
+std::string read_str(GgufReader& input) {
+    const auto bytes = input.take(read_le<uint64_t>(input));
+    return {reinterpret_cast<const char*>(bytes.data()), bytes.size()};
 }
 
 void write_str(std::ofstream& ofs, const std::string& s) {
@@ -101,9 +159,37 @@ void write_str(std::ofstream& ofs, const std::string& s) {
     if (len > 0) ofs.write(s.data(), static_cast<std::streamsize>(len));
 }
 
-void skip_gguf_val(std::ifstream& ifs, uint32_t vtype);
+void skip_gguf_val(GgufReader& input, uint32_t type) {
+    constexpr std::array<uint8_t, 13> widths{1, 1, 2, 2, 4, 4, 4, 1, 0, 0, 8, 8, 8};
+    if (type == static_cast<uint32_t>(GgufValType::STRING)) {
+        input.take(read_le<uint64_t>(input));
+    } else if (type == static_cast<uint32_t>(GgufValType::ARRAY)) {
+        const auto element = read_le<uint32_t>(input);
+        const auto count = read_le<uint64_t>(input);
+        if (element >= widths.size() || element == static_cast<uint32_t>(GgufValType::ARRAY))
+            throw std::runtime_error("Invalid GGUF array type");
+        if (const auto width = widths[element]) {
+            if (count > input.remaining() / width) throw std::runtime_error("Truncated GGUF array");
+            input.take(count * width);
+        } else {
+            for (uint64_t i = 0; i < count; ++i) skip_gguf_val(input, element);
+        }
+    } else {
+        if (type >= widths.size()) throw std::runtime_error("Unsupported GGUF value type");
+        input.take(widths[type]);
+    }
+}
 
-GgufMetaValue read_gguf_val(std::ifstream& ifs, uint32_t vtype) {
+template <typename T>
+std::vector<T> read_array(GgufReader& input, uint64_t n) {
+    if (n > input.remaining() / sizeof(T)) throw std::runtime_error("Truncated GGUF array");
+    const auto bytes = input.take(n * sizeof(T));
+    std::vector<T> result(static_cast<size_t>(n));
+    if (n) std::memcpy(result.data(), bytes.data(), bytes.size());
+    return result;
+}
+
+GgufMetaValue read_gguf_val(GgufReader& ifs, uint32_t vtype) {
     switch (static_cast<GgufValType>(vtype)) {
         case GgufValType::UINT8: return read_le<uint8_t>(ifs);
         case GgufValType::INT8: return read_le<int8_t>(ifs);
@@ -121,26 +207,22 @@ GgufMetaValue read_gguf_val(std::ifstream& ifs, uint32_t vtype) {
             uint32_t elem_type = read_le<uint32_t>(ifs);
             uint64_t n = read_le<uint64_t>(ifs);
             if (elem_type == static_cast<uint32_t>(GgufValType::STRING)) {
+                if (n > ifs.remaining() / sizeof(uint64_t)) throw std::runtime_error("Truncated GGUF string array");
                 std::vector<std::string> arr;
                 arr.reserve(static_cast<size_t>(n));
                 for (uint64_t i = 0; i < n; ++i) arr.push_back(read_str(ifs));
                 return arr;
             } else if (elem_type == static_cast<uint32_t>(GgufValType::BOOL)) {
+                if (n > ifs.remaining()) throw std::runtime_error("Truncated GGUF boolean array");
                 std::vector<bool> arr(static_cast<size_t>(n));
                 for (uint64_t i = 0; i < n; ++i) arr[i] = read_le<uint8_t>(ifs) != 0;
                 return arr;
             } else if (elem_type == static_cast<uint32_t>(GgufValType::INT32)) {
-                std::vector<int32_t> arr(static_cast<size_t>(n));
-                if (n > 0) ifs.read(reinterpret_cast<char*>(arr.data()), static_cast<std::streamsize>(n * 4));
-                return arr;
+                return read_array<int32_t>(ifs, n);
             } else if (elem_type == static_cast<uint32_t>(GgufValType::UINT32)) {
-                std::vector<uint32_t> arr(static_cast<size_t>(n));
-                if (n > 0) ifs.read(reinterpret_cast<char*>(arr.data()), static_cast<std::streamsize>(n * 4));
-                return arr;
+                return read_array<uint32_t>(ifs, n);
             } else if (elem_type == static_cast<uint32_t>(GgufValType::FLOAT32)) {
-                std::vector<float> arr(static_cast<size_t>(n));
-                if (n > 0) ifs.read(reinterpret_cast<char*>(arr.data()), static_cast<std::streamsize>(n * 4));
-                return arr;
+                return read_array<float>(ifs, n);
             } else {
                 for (uint64_t i = 0; i < n; ++i) skip_gguf_val(ifs, elem_type);
                 return uint64_t(n);
@@ -148,10 +230,6 @@ GgufMetaValue read_gguf_val(std::ifstream& ifs, uint32_t vtype) {
         }
     }
     throw std::runtime_error("Unsupported GGUF value type: " + std::to_string(vtype));
-}
-
-void skip_gguf_val(std::ifstream& ifs, uint32_t vtype) {
-    (void)read_gguf_val(ifs, vtype);
 }
 
 void write_gguf_val(std::ofstream& ofs, const GgufMetaValue& mv) {
@@ -226,28 +304,15 @@ void write_gguf_val(std::ofstream& ofs, const GgufMetaValue& mv) {
 
 }  // namespace
 
-bool GgufFile::load(const std::string& path, std::string* err) {
+bool GgufFile::load(const std::string& path, std::string* err, bool read_tokenizer) {
+    *this = GgufFile{};
     try {
-        path_ = path;
-        metadata_.clear();
-        tensors_.clear();
-        tensor_index_.clear();
-
-        std::ifstream ifs(std::filesystem::path(std::u8string(path.begin(), path.end())), std::ios::binary);
-        if (!ifs) {
-            if (err) *err = "Cannot open GGUF file: " + path;
-            return false;
-        }
-        char magic[4]{};
-        ifs.read(magic, 4);
-        if (std::memcmp(magic, "GGUF", 4) != 0) {
-            if (err) *err = "Invalid GGUF magic";
-            return false;
-        }
+        auto mapping = map_file(std::filesystem::path(std::u8string(path.begin(), path.end())), file_bytes_);
+        GgufReader ifs({mapping.get(), file_bytes_});
+        if (std::memcmp(ifs.take(4).data(), "GGUF", 4) != 0) throw std::runtime_error("Invalid GGUF magic");
         version_ = read_le<uint32_t>(ifs);
         if (version_ < 2 || version_ > 3) {
-            if (err) *err = "Unsupported GGUF version: " + std::to_string(version_);
-            return false;
+            throw std::runtime_error("Unsupported GGUF version: " + std::to_string(version_));
         }
         uint64_t n_tensors = read_le<uint64_t>(ifs);
         uint64_t n_kv = read_le<uint64_t>(ifs);
@@ -255,36 +320,60 @@ bool GgufFile::load(const std::string& path, std::string* err) {
         for (uint64_t i = 0; i < n_kv; ++i) {
             std::string key = read_str(ifs);
             uint32_t vtype = read_le<uint32_t>(ifs);
-            metadata_[key] = read_gguf_val(ifs, vtype);
+            if (!read_tokenizer && key.starts_with("tokenizer.")) skip_gguf_val(ifs, vtype);
+            else metadata_.insert_or_assign(std::move(key), read_gguf_val(ifs, vtype));
         }
 
-        alignment_ = static_cast<uint64_t>(get_int("general.alignment", 32));
-        if (alignment_ == 0) alignment_ = 32;
+        auto alignment = get_int("general.alignment", 32);
+        if (alignment == 0) alignment = 32;
+        if (alignment <= 0 || alignment > static_cast<int64_t>(file_bytes_))
+            throw std::runtime_error("Invalid GGUF alignment");
+        alignment_ = static_cast<uint64_t>(alignment);
 
+        constexpr size_t min_tensor_header = sizeof(uint64_t) * 3 + sizeof(uint32_t) * 2;
+        if (n_tensors > ifs.remaining() / min_tensor_header) throw std::runtime_error("Truncated GGUF tensor table");
         tensors_.reserve(static_cast<size_t>(n_tensors));
         for (uint64_t i = 0; i < n_tensors; ++i) {
             GgufTensorInfo info;
             info.name = read_str(ifs);
             uint32_t n_dims = read_le<uint32_t>(ifs);
+            if (n_dims == 0 || n_dims > 4) throw std::runtime_error("Invalid GGUF tensor rank: " + info.name);
             std::vector<int64_t> ne(n_dims);
+            uint64_t elements = 1;
             for (uint32_t d = 0; d < n_dims; ++d) {
-                ne[d] = static_cast<int64_t>(read_le<uint64_t>(ifs));
+                const auto dim = read_le<uint64_t>(ifs);
+                if (dim == 0 || dim > static_cast<uint64_t>(std::numeric_limits<int64_t>::max()) / elements)
+                    throw std::runtime_error("Invalid GGUF tensor shape: " + info.name);
+                elements *= dim;
+                ne[d] = static_cast<int64_t>(dim);
             }
             // GGUF stores innermost dim first (ne[0]); convert to row-major outer -> inner
             info.shape.assign(ne.rbegin(), ne.rend());
             uint32_t ttype = read_le<uint32_t>(ifs);
             info.dtype = ggml_to_dtype(ttype);
             info.offset = read_le<uint64_t>(ifs);
-            Tensor tmp = Tensor::from_shape(info.shape, info.dtype, Backend::CPU);
-            info.nbytes = tmp.nbytes();
+            const size_t block = dtype_block_size(info.dtype);
+            const size_t width = dtype_type_size(info.dtype);
+            if (ne.front() % block != 0 || elements / block > file_bytes_ / width)
+                throw std::runtime_error("Invalid GGUF tensor size: " + info.name);
+            info.nbytes = static_cast<size_t>(elements / block) * width;
             tensor_index_[info.name] = tensors_.size();
             tensors_.push_back(std::move(info));
         }
 
-        uint64_t cur = static_cast<uint64_t>(ifs.tellg());
-        data_offset_ = ((cur + alignment_ - 1) / alignment_) * alignment_;
+        const uint64_t cur = file_bytes_ - ifs.remaining();
+        const uint64_t padding = (alignment_ - cur % alignment_) % alignment_;
+        if (padding > ifs.remaining()) throw std::runtime_error("Truncated GGUF header padding");
+        data_offset_ = cur + padding;
+        const size_t data_bytes = file_bytes_ - data_offset_;
+        for (const auto& info : tensors_) {
+            if (info.offset > data_bytes || info.nbytes > data_bytes - info.offset)
+                throw std::runtime_error("GGUF tensor extends beyond the file: " + info.name);
+        }
+        mapping_ = std::move(mapping);
         return true;
     } catch (const std::exception& e) {
+        *this = GgufFile{};
         if (err) *err = e.what();
         return false;
     }
@@ -297,18 +386,17 @@ const GgufTensorInfo* GgufFile::find_tensor(const std::string& name) const {
 }
 
 HostTensor GgufFile::read_tensor(const std::string& name) const {
+    auto out = view_tensor(name);
+    out.data<uint8_t>();
+    return out;
+}
+
+HostTensor GgufFile::view_tensor(const std::string& name) const {
     const GgufTensorInfo* info = find_tensor(name);
     if (!info) throw std::runtime_error("GGUF tensor not found: " + name);
-    HostTensor ht = HostTensor::create(info->shape, info->dtype);
-    ht.desc.name = name;
-    std::ifstream ifs(std::filesystem::path(std::u8string(path_.begin(), path_.end())), std::ios::binary);
-    if (!ifs) throw std::runtime_error("Cannot reopen GGUF file: " + path_);
-    ifs.seekg(static_cast<std::streamoff>(data_offset_ + info->offset), std::ios::beg);
-    if (info->nbytes > 0 && !ifs.read(reinterpret_cast<char*>(ht.storage.data()),
-                                     static_cast<std::streamsize>(info->nbytes))) {
-        throw std::runtime_error("Failed reading GGUF tensor bytes: " + name);
-    }
-    return ht;
+    auto desc = Tensor::from_shape(info->shape, info->dtype, Backend::CPU);
+    desc.name = name;
+    return HostTensor::mapped(std::move(desc), {mapping_, mapping_.get() + data_offset_ + info->offset});
 }
 
 std::string GgufFile::get_string(const std::string& key, const std::string& def) const {
@@ -420,11 +508,12 @@ bool GgufFile::write_v3(const std::string& path,
 
         for (size_t i = 0; i < tensors.size(); ++i) {
             const auto& ht = tensors[i].second;
-            if (!ht.storage.empty()) {
-                ofs.write(reinterpret_cast<const char*>(ht.storage.data()),
-                          static_cast<std::streamsize>(ht.storage.size()));
+            const auto bytes = ht.bytes();
+            if (!bytes.empty()) {
+                ofs.write(reinterpret_cast<const char*>(bytes.data()),
+                          static_cast<std::streamsize>(bytes.size()));
             }
-            uint64_t sz = ht.storage.size();
+            uint64_t sz = bytes.size();
             uint64_t pad = (((sz + align - 1) / align) * align) - sz;
             for (uint64_t p = 0; p < pad; ++p) ofs.put('\0');
         }

@@ -5,6 +5,7 @@
 #include <cstdint>
 #include <cstring>
 #include <memory>
+#include <span>
 #include <string>
 #include <vector>
 
@@ -134,7 +135,7 @@ struct Tensor {
     }
 };
 
-// Simple host-owned tensor buffer
+// Host tensor with owned storage or a read-only file-backed view.
 struct HostTensor {
     Tensor desc;
     std::vector<uint8_t> storage;
@@ -152,10 +153,42 @@ struct HostTensor {
         ht.desc.data = ht.storage.data();
         return ht;
     }
+    static HostTensor mapped(Tensor desc, std::shared_ptr<const uint8_t> view) {
+        HostTensor ht;
+        ht.desc = std::move(desc);
+        ht.mapped_ = std::move(view);
+        return ht;
+    }
+    std::span<const uint8_t> bytes() const {
+        return mapped_ ? std::span<const uint8_t>(mapped_.get(), desc.nbytes()) :
+                         std::span<const uint8_t>(storage);
+    }
+    HostTensor slice_dim0(int64_t start, int64_t count) const {
+        auto slice = desc.slice_dim0(start, count);
+        const auto part = bytes().subspan(slice.byte_offset, slice.nbytes());
+        slice.byte_offset = 0;
+        if (mapped_) return mapped(std::move(slice), {mapped_, part.data()});
+        HostTensor out;
+        out.desc = std::move(slice);
+        out.storage.assign(part.begin(), part.end());
+        out.desc.data = out.storage.data();
+        return out;
+    }
     template <typename T>
-    T* data() { return reinterpret_cast<T*>(storage.data()); }
+    T* data() {
+        if (mapped_) {
+            const auto view = bytes();
+            storage.assign(view.begin(), view.end());
+            mapped_.reset();
+            desc.data = storage.data();
+        }
+        return reinterpret_cast<T*>(storage.data());
+    }
     template <typename T>
-    const T* data() const { return reinterpret_cast<const T*>(storage.data()); }
+    const T* data() const { return reinterpret_cast<const T*>(bytes().data()); }
+
+private:
+    std::shared_ptr<const uint8_t> mapped_;
 };
 
 // Host quantization / conversion utilities for tests & weight loading

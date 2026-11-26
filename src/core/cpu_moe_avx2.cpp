@@ -72,6 +72,37 @@ float dot_q4_k(const uint8_t* row, const float* input, int cols) {
     return horizontal_sum(sum);
 }
 
+float dot_q6_k(const uint8_t* row, const float* input, int cols) {
+    const auto* blocks = reinterpret_cast<const BlockQ6_K*>(row);
+    const auto low_mask = _mm_set1_epi8(15);
+    const auto high_mask = _mm_set1_epi8(3);
+    const auto bias = _mm_set1_epi8(32);
+    __m256 lo_sum = _mm256_setzero_ps(), hi_sum = _mm256_setzero_ps();
+    for (int i = 0; i < cols; i += 256) {
+        const auto& block = blocks[i / 256];
+        const float d = fp16_to_fp32(block.d);
+        for (int sub = 0; sub < 16; ++sub) {
+            const int half = sub / 8;
+            const int part = (sub / 2) % 4;
+            const int lane = (sub % 2) * 16;
+            const auto* ql = block.ql + half * 64 + (part % 2) * 32 + lane;
+            const auto* qh = block.qh + half * 32 + lane;
+            auto low = _mm_loadu_si128(reinterpret_cast<const __m128i*>(ql));
+            const auto high = _mm_loadu_si128(reinterpret_cast<const __m128i*>(qh));
+            if (part >= 2) low = _mm_srli_epi16(low, 4);
+            const auto high_bits = _mm_and_si128(_mm_srl_epi16(high, _mm_cvtsi32_si128(part * 2)), high_mask);
+            const auto values = _mm_sub_epi8(_mm_or_si128(_mm_and_si128(low, low_mask), _mm_slli_epi16(high_bits, 4)), bias);
+            const auto scale = _mm256_set1_ps(d * static_cast<float>(block.scales[sub]));
+            const auto lo = _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(values));
+            const auto hi = _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_srli_si128(values, 8)));
+            const float* x = input + i + sub * 16;
+            lo_sum = _mm256_fmadd_ps(_mm256_mul_ps(lo, scale), _mm256_loadu_ps(x), lo_sum);
+            hi_sum = _mm256_fmadd_ps(_mm256_mul_ps(hi, scale), _mm256_loadu_ps(x + 8), hi_sum);
+        }
+    }
+    return horizontal_sum(_mm256_add_ps(lo_sum, hi_sum));
+}
+
 float dot_q8_0(const uint8_t* row, const float* input, int cols) {
     const auto* blocks = reinterpret_cast<const BlockQ8_0*>(row);
     __m256 sum = _mm256_setzero_ps();
@@ -96,6 +127,7 @@ CpuMoeDot cpu_moe_avx2_dot(DType dtype) {
         case DType::F32: return dot_f32;
         case DType::Q4_0: return dot_q4_0;
         case DType::Q4_K: return dot_q4_k;
+        case DType::Q6_K: return dot_q6_k;
         case DType::Q8_0: return dot_q8_0;
         default: break;
     }

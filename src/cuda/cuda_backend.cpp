@@ -584,7 +584,7 @@ Tensor CudaContext::upload(const HostTensor& ht, bool persistent) {
         std::vector<int64_t>(ht.desc.shape.begin(), ht.desc.shape.begin() + ht.desc.ndim),
         ht.desc.dtype, ht.desc.name);
     if (ht.desc.nbytes() > 0) {
-        FUSIONRT_CUDA_CHECK(cudaMemcpyAsync(dst.ptr(), ht.storage.data(), ht.desc.nbytes(),
+        FUSIONRT_CUDA_CHECK(cudaMemcpyAsync(dst.ptr(), ht.bytes().data(), ht.desc.nbytes(),
                                             cudaMemcpyHostToDevice, stream_));
         FUSIONRT_CUDA_CHECK(cudaStreamSynchronize(stream_));
     }
@@ -596,7 +596,7 @@ void CudaContext::upload_into(const HostTensor& ht, Tensor& dst) {
         throw std::runtime_error("upload_into size mismatch");
     }
     if (ht.desc.nbytes() > 0) {
-        FUSIONRT_CUDA_CHECK(cudaMemcpyAsync(dst.ptr(), ht.storage.data(), ht.desc.nbytes(),
+        FUSIONRT_CUDA_CHECK(cudaMemcpyAsync(dst.ptr(), ht.bytes().data(), ht.desc.nbytes(),
                                             cudaMemcpyHostToDevice, stream_));
         FUSIONRT_CUDA_CHECK(cudaStreamSynchronize(stream_));
     }

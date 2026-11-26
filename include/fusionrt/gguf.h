@@ -30,7 +30,7 @@ struct GgufTensorInfo {
 
 class GgufFile {
 public:
-    bool load(const std::string& path, std::string* err = nullptr);
+    bool load(const std::string& path, std::string* err = nullptr, bool read_tokenizer = true);
 
     uint32_t version() const { return version_; }
     uint64_t alignment() const { return alignment_; }
@@ -39,6 +39,8 @@ public:
 
     const GgufTensorInfo* find_tensor(const std::string& name) const;
     HostTensor read_tensor(const std::string& name) const;
+    HostTensor view_tensor(const std::string& name) const;
+    size_t file_bytes() const { return file_bytes_; }
 
     std::string get_string(const std::string& key, const std::string& def = "") const;
     int64_t get_int(const std::string& key, int64_t def = 0) const;
@@ -55,7 +57,8 @@ public:
                          std::string* err = nullptr);
 
 private:
-    std::string path_;
+    std::shared_ptr<const uint8_t> mapping_;
+    size_t file_bytes_ = 0;
     uint32_t version_ = 0;
     uint64_t alignment_ = 32;
     uint64_t data_offset_ = 0;

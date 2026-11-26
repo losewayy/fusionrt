@@ -148,7 +148,7 @@ if(FUSIONRT_ENABLE_CUDA)
         CUDA::cublas
     )
     if(WIN32)
-        target_link_libraries(fusionrt_core PRIVATE ws2_32)
+        target_link_libraries(fusionrt_core PRIVATE ws2_32 dxgi)
     endif()
     if(TARGET CUDA::nvml)
         target_link_libraries(fusionrt_core PUBLIC CUDA::nvml)

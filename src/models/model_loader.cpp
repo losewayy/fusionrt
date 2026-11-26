@@ -93,13 +93,13 @@ HostTensor concat_rows_same_dtype(const std::vector<HostTensor>& parts) {
             throw std::runtime_error("concat_rows_same_dtype: incompatible tensor shapes/dtypes");
         }
         total_rows += p.desc.shape[0];
-        total_bytes += p.storage.size();
+        total_bytes += p.bytes().size();
     }
     HostTensor out = HostTensor::create({total_rows, cols}, dt);
     size_t off = 0;
     for (const auto& p : parts) {
-        std::memcpy(out.storage.data() + off, p.storage.data(), p.storage.size());
-        off += p.storage.size();
+        std::memcpy(out.storage.data() + off, p.bytes().data(), p.bytes().size());
+        off += p.bytes().size();
     }
     return out;
 }
@@ -110,33 +110,33 @@ HostTensor to_f32_host(const HostTensor& ht) {
     HostTensor out = HostTensor::create(dims, DType::F32);
     int64_t n = ht.desc.numel();
     if (ht.desc.dtype == DType::F16) {
-        convert_f16_to_f32(reinterpret_cast<const uint16_t*>(ht.storage.data()), out.data<float>(), n);
+        convert_f16_to_f32(reinterpret_cast<const uint16_t*>(ht.bytes().data()), out.data<float>(), n);
     } else if (ht.desc.dtype == DType::BF16) {
-        convert_bf16_to_f32(reinterpret_cast<const uint16_t*>(ht.storage.data()), out.data<float>(), n);
+        convert_bf16_to_f32(reinterpret_cast<const uint16_t*>(ht.bytes().data()), out.data<float>(), n);
     } else {
         int64_t cols = dims.back();
         int64_t rows = n / cols;
         int64_t nb = cols / 32;
         if (ht.desc.dtype == DType::Q8_0) {
-            const auto* src = reinterpret_cast<const BlockQ8_0*>(ht.storage.data());
+            const auto* src = reinterpret_cast<const BlockQ8_0*>(ht.bytes().data());
             for (int64_t r = 0; r < rows; ++r) dequantize_row_q8_0(src + r * nb, out.data<float>() + r * cols, cols);
         } else if (ht.desc.dtype == DType::Q4_0) {
-            const auto* src = reinterpret_cast<const BlockQ4_0*>(ht.storage.data());
+            const auto* src = reinterpret_cast<const BlockQ4_0*>(ht.bytes().data());
             for (int64_t r = 0; r < rows; ++r) dequantize_row_q4_0(src + r * nb, out.data<float>() + r * cols, cols);
         } else if (ht.desc.dtype == DType::Q4_1) {
-            const auto* src = reinterpret_cast<const BlockQ4_1*>(ht.storage.data());
+            const auto* src = reinterpret_cast<const BlockQ4_1*>(ht.bytes().data());
             for (int64_t r = 0; r < rows; ++r) dequantize_row_q4_1(src + r * nb, out.data<float>() + r * cols, cols);
         } else if (ht.desc.dtype == DType::Q4_K) {
             int64_t nbk = cols / 256;
-            const auto* src = reinterpret_cast<const BlockQ4_K*>(ht.storage.data());
+            const auto* src = reinterpret_cast<const BlockQ4_K*>(ht.bytes().data());
             for (int64_t r = 0; r < rows; ++r) dequantize_row_q4_k(src + r * nbk, out.data<float>() + r * cols, cols);
         } else if (ht.desc.dtype == DType::Q5_K) {
             int64_t nbk = cols / 256;
-            const auto* src = reinterpret_cast<const BlockQ5_K*>(ht.storage.data());
+            const auto* src = reinterpret_cast<const BlockQ5_K*>(ht.bytes().data());
             for (int64_t r = 0; r < rows; ++r) dequantize_row_q5_k(src + r * nbk, out.data<float>() + r * cols, cols);
         } else if (ht.desc.dtype == DType::Q6_K) {
             int64_t nbk = cols / 256;
-            const auto* src = reinterpret_cast<const BlockQ6_K*>(ht.storage.data());
+            const auto* src = reinterpret_cast<const BlockQ6_K*>(ht.bytes().data());
             for (int64_t r = 0; r < rows; ++r) dequantize_row_q6_k(src + r * nbk, out.data<float>() + r * cols, cols);
         } else if (ht.desc.dtype == DType::Q4_KA) {
             const auto* src = ht.data<BlockQ4_KA>();
@@ -148,11 +148,11 @@ HostTensor to_f32_host(const HostTensor& ht) {
                 dequantize_row_q6_a(src + r * (cols / 256), out.data<float>() + r * cols, cols);
         } else if (ht.desc.dtype == DType::Q4_A) {
             int64_t nsa = cols / 256;
-            const auto* src = reinterpret_cast<const BlockQ4_A*>(ht.storage.data());
+            const auto* src = reinterpret_cast<const BlockQ4_A*>(ht.bytes().data());
             for (int64_t r = 0; r < rows; ++r) dequantize_row_q4_a(src + r * nsa, out.data<float>() + r * cols, cols);
         } else if (ht.desc.dtype == DType::Q8_A) {
             int64_t nsa = cols / 256;
-            const auto* src = reinterpret_cast<const BlockQ8_A*>(ht.storage.data());
+            const auto* src = reinterpret_cast<const BlockQ8_A*>(ht.bytes().data());
             for (int64_t r = 0; r < rows; ++r) dequantize_row_q8_a(src + r * nsa, out.data<float>() + r * cols, cols);
         } else {
             throw std::runtime_error("Unsupported dtype conversion to F32");
@@ -181,7 +181,7 @@ constexpr GgufArchitecture supported_architectures[] = {
 
 bool parse_gguf_model_raw(const std::string& path, int max_seq_override, LoadedModelRaw& out, std::string* err) {
     GgufFile gf;
-    if (!gf.load(path, err)) return false;
+    if (!gf.load(path, err, false)) return false;
 
     const std::string arch = gf.get_string("general.architecture", "llama");
     const auto spec = std::find_if(std::begin(supported_architectures), std::end(supported_architectures),
@@ -233,10 +233,10 @@ bool parse_gguf_model_raw(const std::string& path, int max_seq_override, LoadedM
         return false;
     }
 
-    out.tok_embeddings = gf.read_tensor("token_embd.weight");
-    out.final_norm_w = to_f32_host(gf.read_tensor("output_norm.weight"));
+    out.tok_embeddings = gf.view_tensor("token_embd.weight");
+    out.final_norm_w = to_f32_host(gf.view_tensor("output_norm.weight"));
     if (gf.find_tensor("output.weight")) {
-        out.lm_head_w = gf.read_tensor("output.weight");
+        out.lm_head_w = gf.view_tensor("output.weight");
     }
 
     int64_t emb_vocab = out.tok_embeddings.desc.shape[0];
@@ -298,7 +298,7 @@ bool parse_gguf_model_raw(const std::string& path, int max_seq_override, LoadedM
     out.cfg.dense.partial_rotary_factor = partial_rot;
     out.cfg.dense.rope_neox = spec->rope_neox;
     out.cfg.dense.qk_norm = false;
-    out.cfg.dense.weight_dtype = out.lm_head_w.storage.empty() ? out.tok_embeddings.desc.dtype : out.lm_head_w.desc.dtype;
+    out.cfg.dense.weight_dtype = out.lm_head_w.bytes().empty() ? out.tok_embeddings.desc.dtype : out.lm_head_w.desc.dtype;
 
     out.cfg.gdn.hidden_size = H;
     out.cfg.gdn.intermediate_size = inter;
@@ -316,13 +316,15 @@ bool parse_gguf_model_raw(const std::string& path, int max_seq_override, LoadedM
     out.cfg.moe.intermediate_size = static_cast<int>(get_arch_int("expert_feed_forward_length", inter));
     out.cfg.moe.num_experts = static_cast<int>(get_arch_int("expert_count", 0));
     out.cfg.moe.top_k = static_cast<int>(get_arch_int("expert_used_count", 2));
+    out.cfg.moe.norm_topk_prob = gf.get_bool(prefix + "expert_weights_norm",
+        gf.get_bool(prefix + "norm_topk_prob", out.cfg.moe.norm_topk_prob));
     out.cfg.moe.gpu_resident_experts = out.cfg.moe.num_experts;
     out.cfg.moe.rms_norm_eps = eps;
 
     auto matrix = [](const HostTensor& tensor, int64_t rows, int64_t cols) {
         return tensor.desc.ndim == 2 && tensor.desc.shape[0] == rows && tensor.desc.shape[1] == cols;
     };
-    if ((!out.lm_head_w.storage.empty() && !matrix(out.lm_head_w, emb_vocab, H)) ||
+    if ((!out.lm_head_w.bytes().empty() && !matrix(out.lm_head_w, emb_vocab, H)) ||
         out.final_norm_w.desc.ndim != 1 || out.final_norm_w.desc.shape[0] != H) {
         if (err) *err = "Invalid GGUF output weight or norm shape";
         return false;
@@ -335,7 +337,7 @@ bool parse_gguf_model_raw(const std::string& path, int max_seq_override, LoadedM
         if (!gf.find_tensor(name)) {
             throw std::runtime_error("GGUF missing required tensor: " + name);
         }
-        return gf.read_tensor(name);
+        return gf.view_tensor(name);
     };
 
     auto layer_int = [&](const std::string& suffix, int index, int fallback) -> int {
@@ -474,10 +476,10 @@ bool parse_gguf_model_raw(const std::string& path, int max_seq_override, LoadedM
                     L.experts_down.desc = Tensor::from_shape({E, H, dn_list[0].desc.shape[1]}, DType::F32, Backend::CPU);
                     out.cfg.moe.intermediate_size = static_cast<int>(gu_list[0].desc.shape[0]);
                 }
-                if (L.experts_down.storage.empty()) L.experts_down = req(p + "ffn_down_exps.weight");
+                if (L.experts_down.bytes().empty()) L.experts_down = req(p + "ffn_down_exps.weight");
                 const int I = out.cfg.moe.intermediate_size;
                 if (L.experts_gate_up.desc.ndim != 3 || L.experts_gate_up.desc.shape[0] != E ||
-                    L.experts_gate_up.desc.shape[1] != (L.experts_up.storage.empty() ? 2 * I : I) ||
+                    L.experts_gate_up.desc.shape[1] != (L.experts_up.bytes().empty() ? 2 * I : I) ||
                     L.experts_gate_up.desc.shape[2] != H ||
                     L.experts_down.desc.ndim != 3 || L.experts_down.desc.shape[0] != E ||
                     L.experts_down.desc.shape[1] != H || L.experts_down.desc.shape[2] != I) {
@@ -492,9 +494,9 @@ bool parse_gguf_model_raw(const std::string& path, int max_seq_override, LoadedM
                     L.has_shared = true;
                     out.cfg.moe.has_shared_expert = true;
                     L.shared_gate_up = concat_rows_same_dtype({
-                        gf.read_tensor(p + "ffn_gate_shexp.weight"),
-                        gf.read_tensor(p + "ffn_up_shexp.weight")});
-                    L.shared_down = gf.read_tensor(p + "ffn_down_shexp.weight");
+                        gf.view_tensor(p + "ffn_gate_shexp.weight"),
+                        gf.view_tensor(p + "ffn_up_shexp.weight")});
+                    L.shared_down = gf.view_tensor(p + "ffn_down_shexp.weight");
                     out.cfg.moe.shared_intermediate_size = static_cast<int>(L.shared_down.desc.shape[1]);
                 } else {
                     out.cfg.moe.has_shared_expert = false;
@@ -514,16 +516,16 @@ bool parse_gguf_model_raw(const std::string& path, int max_seq_override, LoadedM
                     (gf.find_tensor(p + "ssm_z.weight") ? req(p + "ssm_z.weight") : req(p + "gdn_z.weight"));
                 L.a_proj = gf.find_tensor(p + "ssm_alpha.weight") ? req(p + "ssm_alpha.weight") : req(p + "gdn_a.weight");
                 L.b_proj = gf.find_tensor(p + "ssm_beta.weight") ? req(p + "ssm_beta.weight") : req(p + "gdn_b.weight");
-                L.conv_w = to_f32_host(gf.find_tensor(p + "ssm_conv1d.weight") ? gf.read_tensor(p + "ssm_conv1d.weight") : req(p + "gdn_conv.weight"));
+                L.conv_w = to_f32_host(gf.find_tensor(p + "ssm_conv1d.weight") ? gf.view_tensor(p + "ssm_conv1d.weight") : req(p + "gdn_conv.weight"));
                 if (gf.find_tensor(p + "ssm_conv1d.bias")) {
-                    L.conv_bias = to_f32_host(gf.read_tensor(p + "ssm_conv1d.bias"));
+                    L.conv_bias = to_f32_host(gf.view_tensor(p + "ssm_conv1d.bias"));
                 } else if (gf.find_tensor(p + "gdn_conv.bias")) {
-                    L.conv_bias = to_f32_host(gf.read_tensor(p + "gdn_conv.bias"));
+                    L.conv_bias = to_f32_host(gf.view_tensor(p + "gdn_conv.bias"));
                 } else {
                     L.conv_bias = make_zeros_f32({L.conv_w.desc.shape[0]});
                 }
                 if (gf.find_tensor(p + "ssm_a")) {
-                    L.A_log = to_f32_host(gf.read_tensor(p + "ssm_a"));
+                    L.A_log = to_f32_host(gf.view_tensor(p + "ssm_a"));
                     float* ap = L.A_log.data<float>();
                     for (int64_t k = 0; k < L.A_log.desc.numel(); ++k) {
                         if (ap[k] < 0.0f) ap[k] = std::log(std::max(-ap[k], 1e-30f));
@@ -531,8 +533,8 @@ bool parse_gguf_model_raw(const std::string& path, int max_seq_override, LoadedM
                 } else {
                     L.A_log = to_f32_host(req(p + "gdn_a_log"));
                 }
-                L.dt_bias = to_f32_host(gf.find_tensor(p + "ssm_dt.bias") ? gf.read_tensor(p + "ssm_dt.bias") : req(p + "gdn_dt_bias"));
-                L.gdn_norm_w = to_f32_host(gf.find_tensor(p + "ssm_norm.weight") ? gf.read_tensor(p + "ssm_norm.weight") : req(p + "gdn_norm.weight"));
+                L.dt_bias = to_f32_host(gf.find_tensor(p + "ssm_dt.bias") ? gf.view_tensor(p + "ssm_dt.bias") : req(p + "gdn_dt_bias"));
+                L.gdn_norm_w = to_f32_host(gf.find_tensor(p + "ssm_norm.weight") ? gf.view_tensor(p + "ssm_norm.weight") : req(p + "gdn_norm.weight"));
                 L.o_proj = gf.find_tensor(p + "ssm_out.weight") ? req(p + "ssm_out.weight") : req(p + "attn_output.weight");
             } else {
                 L.kind = 0;
@@ -561,7 +563,7 @@ bool parse_gguf_model_raw(const std::string& path, int max_seq_override, LoadedM
                 const int q_dim = layer_nq * layer_hd;
                 const int kv_dim = layer_nkv * layer_hd;
                 if (gf.find_tensor(p + "attn_qkv.weight")) {
-                    L.qkv_proj = gf.read_tensor(p + "attn_qkv.weight");
+                    L.qkv_proj = gf.view_tensor(p + "attn_qkv.weight");
                     // Split q, k, v host slices for unfused/Vulkan paths
                     if (L.qkv_proj.desc.ndim != 2 || L.qkv_proj.desc.shape[1] != H ||
                         L.qkv_proj.desc.shape[0] != q_dim + 2 * kv_dim) {
@@ -569,12 +571,12 @@ bool parse_gguf_model_raw(const std::string& path, int max_seq_override, LoadedM
                     }
                     size_t row_b = row_nbytes(L.qkv_proj.desc.dtype, H);
                     L.q_proj = HostTensor::create({q_dim, H}, L.qkv_proj.desc.dtype);
-                    std::memcpy(L.q_proj.storage.data(), L.qkv_proj.storage.data(), static_cast<size_t>(q_dim) * row_b);
+                    std::memcpy(L.q_proj.storage.data(), L.qkv_proj.bytes().data(), static_cast<size_t>(q_dim) * row_b);
                     if (owns_kv) {
                         L.k_proj = HostTensor::create({kv_dim, H}, L.qkv_proj.desc.dtype);
                         L.v_proj = HostTensor::create({kv_dim, H}, L.qkv_proj.desc.dtype);
-                        std::memcpy(L.k_proj.storage.data(), L.qkv_proj.storage.data() + static_cast<size_t>(q_dim) * row_b, static_cast<size_t>(kv_dim) * row_b);
-                        std::memcpy(L.v_proj.storage.data(), L.qkv_proj.storage.data() + static_cast<size_t>(q_dim + kv_dim) * row_b, static_cast<size_t>(kv_dim) * row_b);
+                        std::memcpy(L.k_proj.storage.data(), L.qkv_proj.bytes().data() + static_cast<size_t>(q_dim) * row_b, static_cast<size_t>(kv_dim) * row_b);
+                        std::memcpy(L.v_proj.storage.data(), L.qkv_proj.bytes().data() + static_cast<size_t>(q_dim + kv_dim) * row_b, static_cast<size_t>(kv_dim) * row_b);
                     }
                 } else {
                     L.q_proj = req(p + "attn_q.weight");
@@ -586,7 +588,7 @@ bool parse_gguf_model_raw(const std::string& path, int max_seq_override, LoadedM
                     if (L.gated_q_attn) out.cfg.dense.gated_q_attn = true;
                     if (!matrix(L.q_proj, L.gated_q_attn ? 2 * q_dim : q_dim, H) ||
                         (owns_kv && !matrix(L.k_proj, kv_dim, H)) ||
-                        (!L.v_proj.storage.empty() && !matrix(L.v_proj, kv_dim, H))) {
+                        (!L.v_proj.bytes().empty() && !matrix(L.v_proj, kv_dim, H))) {
                         throw std::runtime_error("Invalid GGUF QKV projection shapes: " + p);
                     }
                 }
@@ -601,7 +603,7 @@ bool parse_gguf_model_raw(const std::string& path, int max_seq_override, LoadedM
                 };
                 L.q_bias = bias("attn_q.bias", L.q_proj.desc.shape[0]);
                 if (owns_kv) L.k_bias = bias("attn_k.bias", L.k_proj.desc.shape[0]);
-                if (!L.v_proj.storage.empty()) L.v_bias = bias("attn_v.bias", L.v_proj.desc.shape[0]);
+                if (!L.v_proj.bytes().empty()) L.v_bias = bias("attn_v.bias", L.v_proj.desc.shape[0]);
                 const bool has_q_norm = gf.find_tensor(p + "attn_q_norm.weight") != nullptr;
                 const bool has_k_norm = gf.find_tensor(p + "attn_k_norm.weight") != nullptr;
                 if (gemma4) {
@@ -611,14 +613,18 @@ bool parse_gguf_model_raw(const std::string& path, int max_seq_override, LoadedM
                 } else if (has_q_norm != has_k_norm) throw std::runtime_error("Incomplete GGUF Q/K normalization: " + p);
                 if (!gemma4 && has_q_norm) {
                     out.cfg.dense.qk_norm = true;
-                    L.q_norm = to_f32_host(gf.read_tensor(p + "attn_q_norm.weight"));
-                    L.k_norm = to_f32_host(gf.read_tensor(p + "attn_k_norm.weight"));
+                    L.q_norm = to_f32_host(gf.view_tensor(p + "attn_q_norm.weight"));
+                    L.k_norm = to_f32_host(gf.view_tensor(p + "attn_k_norm.weight"));
+                    if (L.q_norm.desc.ndim != 1 || L.k_norm.desc.ndim != 1 ||
+                        L.q_norm.desc.shape[0] != layer_hd || L.k_norm.desc.shape[0] != layer_hd) {
+                        throw std::runtime_error("Invalid GGUF Q/K normalization shape: " + p);
+                    }
                 }
                 L.o_proj = req(p + "attn_output.weight");
                 if (!matrix(L.o_proj, H, q_dim)) throw std::runtime_error("Invalid GGUF attention output shape: " + p);
             }
             if (has_moe) continue;
-            L.mlp_norm = to_f32_host(!gemma4 && gf.find_tensor(p + "post_attention_norm.weight") ? gf.read_tensor(p + "post_attention_norm.weight") : req(p + "ffn_norm.weight"));
+            L.mlp_norm = to_f32_host(!gemma4 && gf.find_tensor(p + "post_attention_norm.weight") ? gf.view_tensor(p + "post_attention_norm.weight") : req(p + "ffn_norm.weight"));
             if (gemma4 && (L.mlp_norm.desc.ndim != 1 || L.mlp_norm.desc.shape[0] != H)) {
                 throw std::runtime_error("Invalid Gemma 4 FFN norm shape: " + p);
             }
@@ -639,7 +645,7 @@ bool parse_gguf_model_raw(const std::string& path, int max_seq_override, LoadedM
                 }
             }
             L.down = req(p + "ffn_down.weight");
-            const bool valid_gate_up = L.gate_up.storage.empty()
+            const bool valid_gate_up = L.gate_up.bytes().empty()
                 ? matrix(L.gate, layer_inter, H) && matrix(L.up, layer_inter, H)
                 : matrix(L.gate_up, 2 * layer_inter, H);
             if (!valid_gate_up || !matrix(L.down, H, layer_inter)) {
