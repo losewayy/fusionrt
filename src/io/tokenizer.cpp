@@ -213,10 +213,10 @@ std::vector<std::string> pretokenize_bpe(const std::string& text, BpePattern pat
     return chunks;
 }
 
-std::string trim_chat(std::string_view text) {
+std::string_view trim_chat(std::string_view text) {
     const auto first = text.find_first_not_of(" \t\r\n");
-    if (first == std::string_view::npos) return {};
-    return std::string(text.substr(first, text.find_last_not_of(" \t\r\n") - first + 1));
+    if (first == std::string_view::npos) return text.substr(0, 0);
+    return text.substr(first, text.find_last_not_of(" \t\r\n") - first + 1);
 }
 
 std::string chat_date() {
@@ -316,7 +316,7 @@ bool BpeTokenizer::load_from_gguf(const GgufFile& gguf) {
     for (size_t i = 0; i < merges.size(); ++i) {
         merge_ranks_[merges[i]] = static_cast<int>(i);
     }
-    byte_fallback_only_ = !sentencepiece_ && merge_ranks_.empty() && special_tokens_.empty();
+    byte_fallback_only_ = !sentencepiece_ && pretokenizer_ != "gemma4" && merge_ranks_.empty() && special_tokens_.empty();
     return true;
 }
 
@@ -634,15 +634,28 @@ ChatFormat BpeTokenizer::chat_format() const {
 }
 
 std::string BpeTokenizer::format_chat_messages(const std::vector<ChatMessage>& msgs,
-                                               bool add_generation_prompt) const {
+                                               bool add_generation_prompt, std::vector<size_t>* image_offsets) const {
     const auto format = chat_format();
     std::string out;
+    if (image_offsets) image_offsets->clear();
+    auto append_content = [&](const ChatMessage& msg, bool trim = false) {
+        const std::string_view content = trim ? trim_chat(msg.content) : std::string_view(msg.content);
+        if (image_offsets && !msg.image_offsets.empty()) {
+            const auto left = static_cast<size_t>(content.data() - msg.content.data());
+            for (const auto offset : msg.image_offsets) image_offsets->push_back(out.size() + offset - left);
+        }
+        out += content;
+    };
     if (format == ChatFormat::chatml) {
         constexpr std::string_view qwen_system = "You are Qwen, created by Alibaba Cloud. You are a helpful assistant.";
         if (chat_template_.find(qwen_system) != std::string::npos && (msgs.empty() || msgs[0].role != "system")) {
             out += "<|im_start|>system\n" + std::string(qwen_system) + "<|im_end|>\n";
         }
-        for (const auto& msg : msgs) out += "<|im_start|>" + msg.role + "\n" + msg.content + "<|im_end|>\n";
+        for (const auto& msg : msgs) {
+            out += "<|im_start|>" + msg.role + "\n";
+            append_content(msg);
+            out += "<|im_end|>\n";
+        }
         if (add_generation_prompt) {
             out += "<|im_start|>assistant\n";
             if (pretokenizer_ == "qwen35" && chat_template_.find("enable_thinking is true") != std::string::npos) {
@@ -657,18 +670,22 @@ std::string BpeTokenizer::format_chat_messages(const std::vector<ChatMessage>& m
         if (chat_template_.find("Cutting Knowledge Date: December 2023") != std::string::npos) {
             if (!add_bos_default_ && bos_id_ >= 0 && bos_id_ < vocab_size()) out += id_to_token_[bos_id_];
             out += header("system") + "Cutting Knowledge Date: December 2023\nToday Date: " + chat_date() + "\n\n";
-            if (!msgs.empty() && msgs[0].role == "system") out += trim_chat(msgs[begin++].content);
+            if (!msgs.empty() && msgs[0].role == "system") append_content(msgs[begin++], true);
             out += "<|eot_id|>";
         }
         for (; begin < msgs.size(); ++begin) {
-            out += header(msgs[begin].role) + trim_chat(msgs[begin].content) + "<|eot_id|>";
+            out += header(msgs[begin].role);
+            append_content(msgs[begin], true);
+            out += "<|eot_id|>";
         }
         if (add_generation_prompt) out += header("assistant");
     } else if (format == ChatFormat::turn) {
         if (pretokenizer_ == "gemma4") {
             for (const auto& msg : msgs) {
                 out += std::string("<|turn>") + (msg.role == "assistant" ? "model" : msg.role) +
-                       "\n" + trim_chat(msg.content) + "<turn|>\n";
+                       "\n";
+                append_content(msg, true);
+                out += "<turn|>\n";
             }
             if (add_generation_prompt) out += "<|turn>model\n";
             return out;
@@ -680,12 +697,18 @@ std::string BpeTokenizer::format_chat_messages(const std::vector<ChatMessage>& m
                 continue;
             }
             out += std::string("<start_of_turn>") + (msg.role == "assistant" ? "model" : "user") +
-                   "\n" + system + msg.content + "<end_of_turn>\n";
+                   "\n" + system;
+            append_content(msg);
+            out += "<end_of_turn>\n";
             system.clear();
         }
         if (add_generation_prompt) out += "<start_of_turn>model\n";
     } else {
-        for (const auto& msg : msgs) out += msg.role + ": " + msg.content + "\n";
+        for (const auto& msg : msgs) {
+            out += msg.role + ": ";
+            append_content(msg);
+            out += '\n';
+        }
         if (add_generation_prompt) out += "assistant: ";
     }
     return out;

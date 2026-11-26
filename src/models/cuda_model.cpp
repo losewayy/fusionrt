@@ -93,9 +93,9 @@ static PrefillMmq prefill_mmq(DType dtype) {
 
 static bool try_q8_1_linear(CudaContext& ctx, const float* x, const float* res_b,
                             const float* norm_w, float* res_out, const Tensor& w,
-                            float* y, int M, int N, int K, float eps, bool use_fused) {
+                            float* y, int M, int N, int K, float eps, bool allow_mmq) {
     auto gemv = M == 1 ? decode_gemv(w.dtype) : nullptr;
-    auto mmq = M > 1 && M >= ctx.mmq_crossover_m() && use_fused ? prefill_mmq(w.dtype) : nullptr;
+    auto mmq = M > 1 && M >= ctx.mmq_crossover_m() && allow_mmq ? prefill_mmq(w.dtype) : nullptr;
     if (!gemv && !mmq) return false;
     auto& arena = ctx.scratch_arena();
     size_t mark = arena.mark();
@@ -152,9 +152,10 @@ static bool try_cublas_prefill(CudaContext& ctx, const float* x, const float* no
     return true;
 }
 
-void dispatch_linear(CudaContext& ctx, const float* x, const Tensor& w, float* y, int M, int N, int K, bool use_fused) {
-    if (try_q8_1_linear(ctx, x, nullptr, nullptr, nullptr, w, y, M, N, K, 0.0f, use_fused) ||
-        (use_fused && try_cublas_prefill(ctx, x, nullptr, w, y, M, N, K, 0.0f))) {
+void dispatch_linear(CudaContext& ctx, const float* x, const Tensor& w, float* y, int M, int N, int K,
+                     bool use_fused, bool verify = false) {
+    if (try_q8_1_linear(ctx, x, nullptr, nullptr, nullptr, w, y, M, N, K, 0.0f, use_fused || verify) ||
+        (use_fused && !verify && try_cublas_prefill(ctx, x, nullptr, w, y, M, N, K, 0.0f))) {
         return;
     }
     if (w.dtype == DType::F32) {
@@ -197,9 +198,9 @@ void dispatch_linear(CudaContext& ctx, const float* x, const Tensor& w, float* y
 }
 
 void dispatch_rmsnorm_linear(CudaContext& ctx, const float* x, const Tensor& norm_w, const Tensor& w,
-                             float* y, int M, int N, int K, float eps, bool use_fused) {
-    if (try_q8_1_linear(ctx, x, nullptr, norm_w.ptr<float>(), nullptr, w, y, M, N, K, eps, use_fused) ||
-        (use_fused && try_cublas_prefill(ctx, x, norm_w.ptr<float>(), w, y, M, N, K, eps))) {
+                             float* y, int M, int N, int K, float eps, bool use_fused, bool verify) {
+    if (try_q8_1_linear(ctx, x, nullptr, norm_w.ptr<float>(), nullptr, w, y, M, N, K, eps, use_fused || verify) ||
+        (use_fused && !verify && try_cublas_prefill(ctx, x, norm_w.ptr<float>(), w, y, M, N, K, eps))) {
         return;
     }
     if (use_fused) {
@@ -237,16 +238,16 @@ void dispatch_rmsnorm_linear(CudaContext& ctx, const float* x, const Tensor& nor
     }
     Tensor x_norm = cuda_scratch(ctx, {M, K});
     cuda_ops::rmsnorm_f32(x, norm_w.ptr<float>(), x_norm.ptr<float>(), M, K, eps, ctx.stream());
-    dispatch_linear(ctx, x_norm.ptr<float>(), w, y, M, N, K, use_fused);
+    dispatch_linear(ctx, x_norm.ptr<float>(), w, y, M, N, K, use_fused, verify);
 }
 
 void dispatch_add_rmsnorm_linear(CudaContext& ctx, const float* a, const float* b,
                                  const Tensor& norm_w, const Tensor& w,
-                                 float* res_out, float* y, int M, int N, int K, float eps, bool use_fused) {
-    if (try_q8_1_linear(ctx, a, b, norm_w.ptr<float>(), res_out, w, y, M, N, K, eps, use_fused)) return;
+                                 float* res_out, float* y, int M, int N, int K, float eps, bool use_fused, bool verify) {
+    if (try_q8_1_linear(ctx, a, b, norm_w.ptr<float>(), res_out, w, y, M, N, K, eps, use_fused || verify)) return;
     Tensor x_norm = cuda_scratch(ctx, {M, K});
     cuda_ops::add_rmsnorm_f32(a, b, norm_w.ptr<float>(), res_out, x_norm.ptr<float>(), M, K, eps, ctx.stream());
-    dispatch_linear(ctx, x_norm.ptr<float>(), w, y, M, N, K, use_fused);
+    dispatch_linear(ctx, x_norm.ptr<float>(), w, y, M, N, K, use_fused, verify);
 }
 
 }  // namespace
@@ -1301,7 +1302,7 @@ static void execute_ir_graph_cuda(
         const auto ple_mark = ctx.scratch_arena().mark();
         auto projected = cuda_scratch(ctx, {M, cols});
         auto normalized = cuda_scratch(ctx, {M, cols});
-        dispatch_linear(ctx, x_input.ptr<float>(), *g.gemma_inputs.projection, projected.ptr<float>(), M, cols, H, use_fused);
+        dispatch_linear(ctx, x_input.ptr<float>(), *g.gemma_inputs.projection, projected.ptr<float>(), M, cols, H, use_fused, all_logits);
         // Absorb the 1/sqrt(H) projection scale into the RMSNorm epsilon.
         cuda_ops::rmsnorm_f32(projected.ptr<float>(), g.gemma_inputs.norm->ptr<float>(), normalized.ptr<float>(),
                               M * cols / width, width, g.gemma_input_eps * H, ctx.stream());
@@ -1397,7 +1398,7 @@ static void execute_ir_graph_cuda(
                     const bool packed = bufs[node.inputs[0]].dtype == DType::Q8_1;
                     auto project = [&](const Tensor& w, float* out, int cols) {
                         if (!packed) {
-                            dispatch_linear(ctx, in_p, w, out, rows, cols, node.input_cols, use_fused);
+                            dispatch_linear(ctx, in_p, w, out, rows, cols, node.input_cols, use_fused, all_logits);
                         } else if (rows == 1) {
                             decode_gemv(w.dtype)(in_p, w.ptr(), out, cols, node.input_cols,
                                                   ctx.stream(), ctx.preferred_gemv_geometry());
@@ -1426,7 +1427,8 @@ static void execute_ir_graph_cuda(
                 Tensor& out_t = get_out_buf(node.out, node.output_cols, rows);
                 const float* in_p = row_ptr(node.inputs[0], tail_logits);
                 auto fn = [&]() {
-                    dispatch_rmsnorm_linear(ctx, in_p, *node.norm_weight, *node.weight, out_t.ptr<float>(), rows, node.output_cols, node.input_cols, node.norm_eps, use_fused);
+                    dispatch_rmsnorm_linear(ctx, in_p, *node.norm_weight, *node.weight, out_t.ptr<float>(),
+                                            rows, node.output_cols, node.input_cols, node.norm_eps, use_fused, all_logits);
                 };
                 if (pa.enabled && is_lm_head && M > 1) pa.lm_ms += time_cuda_fn(ctx.stream(), fn);
                 else fn();
@@ -1457,7 +1459,7 @@ static void execute_ir_graph_cuda(
                 const float* b_p = row_ptr(node.inputs[1], tail_logits);
                 auto fn = [&]() {
                     dispatch_add_rmsnorm_linear(ctx, a_p, b_p, *node.norm_weight, *node.weight, res_upd_p,
-                                                out_t.ptr<float>(), rows, node.output_cols, node.input_cols, node.norm_eps, use_fused);
+                                                out_t.ptr<float>(), rows, node.output_cols, node.input_cols, node.norm_eps, use_fused, all_logits);
                 };
                 if (pa.enabled && is_lm_head && M > 1) pa.lm_ms += time_cuda_fn(ctx.stream(), fn);
                 else fn();
@@ -1660,7 +1662,7 @@ static void execute_ir_graph_cuda(
                 } else {
                     Tensor act = cuda_scratch(ctx, {rows, node.input_cols});
                     (geglu ? cuda_ops::geglu_interleaved_f32 : cuda_ops::swiglu_interleaved_f32)(gate_up, act.ptr<float>(), rows, node.input_cols, ctx.stream());
-                    dispatch_linear(ctx, act.ptr<float>(), *node.weight, out, rows, node.output_cols, node.input_cols, use_fused);
+                    dispatch_linear(ctx, act.ptr<float>(), *node.weight, out, rows, node.output_cols, node.input_cols, use_fused, all_logits);
                 }
                 arena.reset(scratch_mark);
                 break;
@@ -1850,7 +1852,7 @@ std::vector<float> FusionModel::forward_token_cuda(CudaContext& ctx, int32_t tok
     return std::vector<float>(h_logits.data<float>(), h_logits.data<float>() + cfg_.vocab_size);
 }
 
-int FusionModel::prefill_batch_limit(CudaContext& ctx) const {
+int FusionModel::prefill_batch_limit(CudaContext& ctx, bool verify) const {
     const auto& d = cfg_.dense;
     const auto& g = cfg_.gdn;
     const int q = d.num_attention_heads * d.head_dim;
@@ -1887,7 +1889,8 @@ int FusionModel::prefill_batch_limit(CudaContext& ctx) const {
             static_cast<size_t>(gemma_inputs_.token_embeddings.shape[1]) * layer_rows : 0;
         const size_t live = std::max((kPrefillCarrySlots + 2) * d.hidden_size * layer_rows + layer + ple,
                                     d.hidden_size * layer_rows + 3 * ple) * sizeof(float);
-        if (live + 64 * 1024 <= available) break;
+        const size_t verify_logits = verify ? layer_rows * cfg_.vocab_size * sizeof(float) : 0;
+        if (live + verify_logits + 64 * 1024 <= available) break;
     }
     return rows;
 }
@@ -2185,9 +2188,13 @@ std::vector<float> FusionModel::prefill_cuda_impl(CudaContext& ctx, const int32_
                                                  int start_pos, bool use_fused, LayerTrace* layer_trace,
                                                  OpTrace* op_trace, bool save_prefix_checkpoints,
                                                  std::span<const InputEmbedding> inputs_embeds) {
-    std::vector<int32_t> tokens(token_ids, token_ids + count);
-    for (auto& token : tokens) token = std::clamp(token, int32_t{0}, cfg_.vocab_size - 1);
-    execute_prefill_chunks(ctx, tokens.data(), count, start_pos, use_fused, layer_trace, op_trace, true,
+    std::vector<int32_t> sanitized;
+    if (std::any_of(token_ids, token_ids + count, [&](int32_t id) { return id < 0 || id >= cfg_.vocab_size; })) {
+        sanitized.assign(token_ids, token_ids + count);
+        for (auto& token : sanitized) token = std::clamp(token, int32_t{0}, cfg_.vocab_size - 1);
+        token_ids = sanitized.data();
+    }
+    execute_prefill_chunks(ctx, token_ids, count, start_pos, use_fused, layer_trace, op_trace, true,
                            save_prefix_checkpoints, inputs_embeds);
     HostTensor logits = ctx.download(cuda_workspace_.logits);
     return {logits.data<float>(), logits.data<float>() + cfg_.vocab_size};
@@ -2209,7 +2216,9 @@ void FusionModel::verify_cuda(CudaContext& ctx, const std::vector<int32_t>& inpu
     Tensor ids = cuda_scratch(ctx, {rows}, DType::I32);
     Tensor hidden = cuda_scratch(ctx, {rows, hidden_size});
     Tensor batch_logits = cuda_scratch(ctx, {rows, vocab});
-    FUSIONRT_CUDA_CHECK(cudaMemcpyAsync(ids.ptr(), input.data(), rows * sizeof(int32_t),
+    auto tokens = input;
+    for (auto& token : tokens) token = std::clamp(token, int32_t{0}, vocab - 1);
+    FUSIONRT_CUDA_CHECK(cudaMemcpyAsync(ids.ptr(), tokens.data(), rows * sizeof(int32_t),
                                         cudaMemcpyHostToDevice, ctx.stream()));
     embed_tokens(ctx, tok_embeddings_, ids, hidden, rows, hidden_size, cfg_.embed_scale);
     const auto& ir = use_fused ? fused_ir_graph_ : raw_ir_graph_;
@@ -2288,19 +2297,18 @@ std::vector<int32_t> FusionModel::generate_cuda(CudaContext& ctx, const std::vec
     if (max_new_tokens < 0 || start_pos < 0) throw std::invalid_argument("Invalid generation length or start position");
     auto* draft = options.draft_model;
     const auto* json = options.json_constraint;
+    if (json && json->vocab_size() != static_cast<size_t>(cfg_.vocab_size))
+        throw std::invalid_argument("JSON constraint vocabulary does not match model");
     if (options.spec_ngram < 0 || options.draft_tokens <= 0 || (draft && options.spec_ngram > 0)) {
         throw std::invalid_argument("Choose one speculative decoding mode with a positive token limit");
     }
     if (draft && (draft == this || !draft->cuda_slots_[0] || draft->cfg_.vocab_size != cfg_.vocab_size || keep_state)) {
         throw std::invalid_argument("Draft generation needs a separate CUDA model with matching vocabulary and a fresh prompt");
     }
-    const bool speculative = (draft || options.spec_ngram > 0) && max_new_tokens > 1;
-    if (speculative && options.op_trace) {
-        throw std::invalid_argument("Operation profiling is unavailable during speculative decoding");
-    }
     if (!keep_state) start_pos = 0;
     std::vector<int32_t> tokens = prompt_ids;
     if (tokens.empty()) tokens.push_back(std::min(1, cfg_.vocab_size - 1));
+    for (auto& token : tokens) token = std::clamp(token, int32_t{0}, cfg_.vocab_size - 1);
     const int prompt_len = static_cast<int>(tokens.size());
     const auto embeds = options.inputs_embeds;
     validate_input_embeddings(embeds, prompt_ids.size(), static_cast<int>(tok_embeddings_.shape[1]));
@@ -2311,6 +2319,12 @@ std::vector<int32_t> FusionModel::generate_cuda(CudaContext& ctx, const std::vec
     }
     max_new_tokens = std::min(max_new_tokens, cfg_.dense.max_seq_len - start_pos - prompt_len);
     if (json && max_new_tokens == 0) throw std::invalid_argument("JSON generation needs room for output tokens");
+    const int batch_limit = (draft || options.spec_ngram > 0) && max_new_tokens > 1
+        ? prefill_batch_limit(ctx, true) : 1;
+    const bool speculative = batch_limit >= 2;
+    if (speculative && options.op_trace) {
+        throw std::invalid_argument("Operation profiling is unavailable during speculative decoding");
+    }
     const bool reuse = options.reuse_prefix && !keep_state && embeds.empty();
     if (keep_state) clear_cuda_history();
     else if (!reuse) reset_kv_and_state(ctx);
@@ -2336,7 +2350,7 @@ std::vector<int32_t> FusionModel::generate_cuda(CudaContext& ctx, const std::vec
         return download_argmax_tok();
     };
     auto sample_cpu = [&](float* row, int remaining) {
-        if (json) json->mask(row, grammar, remaining);
+        if (json) json->mask({row, static_cast<size_t>(cfg_.vocab_size)}, grammar, remaining);
         return Sampler::sample(row, cfg_.vocab_size, tokens, options.sampling, rng);
     };
 
@@ -2418,7 +2432,6 @@ std::vector<int32_t> FusionModel::generate_cuda(CudaContext& ctx, const std::vec
             }
         }
     } else {
-        const auto batch_limit = std::max(1, prefill_batch_limit(ctx));
         auto& target_slot = cuda_session();
         CudaSession* draft_slot = draft_pos > 0 ? &draft->cuda_session() : nullptr;
         const size_t draft_ssm = draft_slot ? draft_slot->ssm_bytes : 0;
@@ -2519,7 +2532,7 @@ std::vector<int32_t> FusionModel::generate_cuda(CudaContext& ctx, const std::vec
                     auto* row = rows.data() + static_cast<size_t>(i) * cfg_.vocab_size;
                     if (!stochastic || bonus) next_tok = sample_cpu(row, max_new_tokens - gen_count);
                     else {
-                        if (json) json->mask(row, grammar, max_new_tokens - gen_count);
+                        if (json) json->mask({row, static_cast<size_t>(cfg_.vocab_size)}, grammar, max_new_tokens - gen_count);
                         const auto p = Sampler::distribution(row, cfg_.vocab_size, tokens, options.sampling);
                         const auto proposal = input[i + 1];
                         next_tok = draft ? verify_sample(p, draft_probs[i], proposal, rng) :

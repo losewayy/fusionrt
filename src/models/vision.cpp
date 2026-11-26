@@ -487,6 +487,18 @@ VisionEmbedding VisionEncoder::encode(CudaContext& ctx, const Image& image, int 
 
 VisionPrompt encode_vision_prompt(CudaContext& ctx, const VisionEncoder& encoder, const BpeTokenizer& tokenizer,
                                    std::string_view text, std::span<const Image* const> images, int context) {
+    std::vector<size_t> offsets;
+    for (size_t pos = text.find(image_placeholder); pos != text.npos;
+         pos = text.find(image_placeholder, pos + image_placeholder.size())) {
+        offsets.push_back(pos);
+    }
+    return encode_vision_prompt(ctx, encoder, tokenizer, text, images, offsets, context);
+}
+
+VisionPrompt encode_vision_prompt(CudaContext& ctx, const VisionEncoder& encoder, const BpeTokenizer& tokenizer,
+                                   std::string_view text, std::span<const Image* const> images,
+                                   std::span<const size_t> offsets, int context) {
+    if (offsets.size() != images.size()) throw std::invalid_argument("Image placeholder count does not match images");
     VisionPrompt prompt;
     const bool qwen = qwen_projector(encoder.info().projector);
     const bool gemma = encoder.info().projector.starts_with("gemma");
@@ -498,20 +510,21 @@ VisionPrompt encode_vision_prompt(CudaContext& ctx, const VisionEncoder& encoder
         prompt.tokens.insert(prompt.tokens.end(), ids.begin(), ids.end());
         if (prompt.tokens.size() >= static_cast<size_t>(context)) throw std::invalid_argument("Prompt exceeds model context");
     };
+    size_t consumed = 0;
     for (size_t i = 0; i < images.size(); ++i) {
-        const auto place = text.find(image_placeholder);
-        if (place == std::string_view::npos || !images[i]) throw std::invalid_argument("Image placeholder count does not match images");
-        append(text.substr(0, place), i == 0);
+        const auto place = offsets[i];
+        if (place < consumed || place >= text.size() || !text.substr(place).starts_with(image_placeholder) || !images[i])
+            throw std::invalid_argument("Invalid image placeholder position");
+        append(text.substr(consumed, place - consumed), i == 0);
         if (start >= 0) prompt.tokens.push_back(start);
         prompt.images.push_back(encoder.encode(ctx, *images[i], context - static_cast<int>(prompt.tokens.size()) - (end >= 0)));
         const auto& rows = prompt.images.back().rows;
         prompt.inputs_embeds.push_back({static_cast<int>(prompt.tokens.size()), rows});
         prompt.tokens.insert(prompt.tokens.end(), static_cast<size_t>(rows.shape[0]), pad);
         if (end >= 0) prompt.tokens.push_back(end);
-        text.remove_prefix(place + image_placeholder.size());
+        consumed = place + image_placeholder.size();
     }
-    if (text.find(image_placeholder) != std::string_view::npos) throw std::invalid_argument("Image placeholder count does not match images");
-    append(text, images.empty());
+    append(text.substr(consumed), images.empty());
     return prompt;
 }
 #endif

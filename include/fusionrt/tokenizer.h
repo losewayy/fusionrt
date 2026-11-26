@@ -12,6 +12,7 @@ namespace fusionrt {
 struct ChatMessage {
     std::string role;
     std::string content;
+    std::vector<size_t> image_offsets{};
 };
 
 enum class ChatFormat { plain, chatml, llama, turn };
@@ -33,7 +34,8 @@ public:
     std::string decode(const std::vector<int32_t>& ids) const;
     std::string decode_token(int32_t id) const;
     std::string format_chat_messages(const std::vector<ChatMessage>& msgs,
-                                     bool add_generation_prompt = true) const;
+                                     bool add_generation_prompt = true,
+                                     std::vector<size_t>* image_offsets = nullptr) const;
     bool is_end_of_generation(int32_t id) const;
     bool has_compatible_vocab(const BpeTokenizer& other) const {
         return eos_id_ == other.eos_id_ && id_to_token_ == other.id_to_token_ &&

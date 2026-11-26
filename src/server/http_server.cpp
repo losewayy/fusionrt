@@ -10,15 +10,13 @@
 #include "fusionrt/server.h"
 #include "fusionrt/vision.h"
 #include "agent.h"
+#include "http_request.h"
 
 #include <algorithm>
-#include <charconv>
-#include <cctype>
 #include <csignal>
 #include <ctime>
 #include <iostream>
 #include <optional>
-#include <sstream>
 #include <stdexcept>
 
 namespace fusionrt {
@@ -119,18 +117,7 @@ void reply(SocketHandle fd, const char* status, const JsonValue& body) {
 
 void error(SocketHandle fd, const char* status, const std::string& message,
            std::optional<agent::Protocol> protocol = {}) {
-    const bool anthropic = protocol == agent::Protocol::messages;
-    const char* type = status[0] == '5' ? (anthropic ? "api_error" : "server_error") : "invalid_request_error";
-    JsonObject body{{"error", JsonObject{{"message", message}, {"type", type}}}};
-    if (anthropic) body["type"] = "error";
-    reply(fd, status, body);
-}
-
-std::optional<agent::Protocol> agent_route(std::string_view path) {
-    if (path == "/v1/chat/completions") return agent::Protocol::chat;
-    if (path == "/v1/responses") return agent::Protocol::responses;
-    if (path == "/v1/messages") return agent::Protocol::messages;
-    return std::nullopt;
+    reply(fd, status, http::error_body(status, message, protocol));
 }
 
 struct Request {
@@ -139,9 +126,8 @@ struct Request {
     std::string body;
 };
 
-std::optional<Request> read_request(SocketHandle fd) {
+std::optional<Request> read_request(SocketHandle fd, std::optional<agent::Protocol>& protocol) {
     constexpr size_t max_headers = 16 * 1024;
-    constexpr size_t max_body = 16 * 1024 * 1024;
     std::string data;
     auto receive = [&] {
         char buf[4096];
@@ -156,39 +142,11 @@ std::optional<Request> read_request(SocketHandle fd) {
         if (!receive()) return std::nullopt;
     }
     if (end > max_headers) throw std::invalid_argument("HTTP headers are too large");
-    Request request;
-    std::istringstream headers(data.substr(0, end));
-    std::string first, version;
-    std::getline(headers, first);
-    std::istringstream start(first);
-    if (!(start >> request.method >> request.path >> version) ||
-        (version != "HTTP/1.1" && version != "HTTP/1.0")) {
-        throw std::invalid_argument("Expected an HTTP/1.0 or HTTP/1.1 request");
-    }
-    request.path = request.path.substr(0, request.path.find('?'));
-    size_t length = 0;
-    bool has_length = false;
-    for (std::string line; std::getline(headers, line);) {
-        const size_t colon = line.find(':');
-        if (colon == std::string::npos) throw std::invalid_argument("Invalid HTTP header");
-        std::string name = line.substr(0, colon);
-        std::transform(name.begin(), name.end(), name.begin(), [](unsigned char c) { return std::tolower(c); });
-        if (name == "transfer-encoding") throw std::invalid_argument("Use Content-Length for the request body");
-        if (name != "content-length") continue;
-        const size_t begin = line.find_first_not_of(" \t", colon + 1);
-        const size_t last = line.find_last_not_of(" \t\r");
-        if (has_length || begin == std::string::npos || begin > last) throw std::invalid_argument("Invalid Content-Length");
-        auto [ptr, ec] = std::from_chars(line.data() + begin, line.data() + last + 1, length);
-        if (ec != std::errc{} || ptr != line.data() + last + 1 || length > max_body) {
-            throw std::invalid_argument("Invalid or oversized Content-Length");
-        }
-        has_length = true;
-    }
-    while (data.size() - end - 4 < length) {
+    auto head = http::parse_request_head(std::string_view(data).substr(0, end), protocol);
+    while (data.size() - end - 4 < head.content_length) {
         if (!receive()) throw std::invalid_argument("Incomplete HTTP request body");
     }
-    request.body = data.substr(end + 4, length);
-    return request;
+    return Request{std::move(head.method), std::move(head.path), data.substr(end + 4, head.content_length)};
 }
 
 std::vector<int32_t> encode_prompt(const BpeTokenizer& tokenizer, const std::string& text, int context) {
@@ -251,7 +209,7 @@ struct Completion {
 template<class Emit>
 Completion generate(CudaContext& ctx, FusionModel& model, const BpeTokenizer& tokenizer,
                     const std::vector<int32_t>& prompt, const agent::GenerationParams& params,
-                    int context, bool graph, bool reuse_prefix, Emit emit,
+                    int limit, bool graph, bool reuse_prefix, Emit emit,
                     const JsonConstraint* constraint = nullptr, std::span<const InputEmbedding> embeds = {}) {
     StopBuffer stop{params.stops, {}, false};
     Utf8StreamDecoder utf8;
@@ -270,7 +228,6 @@ Completion generate(CudaContext& ctx, FusionModel& model, const BpeTokenizer& to
         connected = emit(stop.push(utf8.push(tokenizer.decode_token(id))));
         return connected && !stop.matched && !StopHandler::stopping;
     };
-    const int limit = std::min(params.max_tokens, context - static_cast<int>(prompt.size()));
     model.generate_cuda(ctx, prompt, limit, true, graph, &completion.stats, false, 0, -1, opts);
     const auto& stats = completion.stats;
     std::clog << "prompt_tokens=" << stats.prompt_tokens << " prefilled_tokens=" << stats.prefilled_tokens
@@ -292,6 +249,7 @@ void complete(SocketHandle fd, CudaContext& ctx, FusionModel& model, const BpeTo
                           {"choices", JsonArray{std::move(choice)}}};
     };
     auto event = [&](const JsonValue& v) { return send_event(fd, "", v.dump(0)); };
+    const int limit = agent::generation_limit(params, context, prompt.size());
     if (params.stream && !start_stream(fd)) return;
     std::string result;
     bool connected = true;
@@ -303,7 +261,7 @@ void complete(SocketHandle fd, CudaContext& ctx, FusionModel& model, const BpeTo
     };
     Completion completion;
     try {
-        completion = generate(ctx, model, tokenizer, prompt, params, context, graph, true, emit, nullptr, embeds);
+        completion = generate(ctx, model, tokenizer, prompt, params, limit, graph, true, emit, nullptr, embeds);
     } catch (const std::exception& e) {
         if (!params.stream) throw;
         if (connected && event(JsonObject{{"error", JsonObject{{"message", e.what()}, {"type", "server_error"}}}})) {
@@ -333,6 +291,7 @@ void complete_agent(SocketHandle fd, CudaContext& ctx, FusionModel& model, const
     const char* prefix = protocol == agent::Protocol::chat ? "chatcmpl-" :
                          protocol == agent::Protocol::responses ? "resp_" : "msg_";
     const auto id = prefix + std::to_string(created) + "-" + std::to_string(request_id);
+    const int limit = agent::generation_limit(request.generation, context, prompt.size());
     agent::EventSink event;
     if (request.generation.stream) {
         if (!start_stream(fd)) return;
@@ -344,7 +303,7 @@ void complete_agent(SocketHandle fd, CudaContext& ctx, FusionModel& model, const
     agent::ToolParser parser(request, rendered, [&](std::string_view text) { response.text(text); },
                              [&](agent::ToolCall call) { response.call(std::move(call)); });
     try {
-        const auto completion = generate(ctx, model, tokenizer, prompt, request.generation, context, graph, true,
+        const auto completion = generate(ctx, model, tokenizer, prompt, request.generation, limit, graph, true,
             [&](const std::string& text) {
                 if (constraint) response.text(text);
                 else parser.push(text);
@@ -400,7 +359,7 @@ void serve_http(CudaContext& ctx, FusionModel& model, const BpeTokenizer& tokeni
     StopHandler stop_handler;
     uint64_t request_id = 0;
     const auto& cfg = model.config();
-    std::optional<JsonConstraint> json_value, json_object;
+    std::map<JsonRoot, JsonConstraint> json_constraints;
     const std::string& arch = cfg.model_architecture.empty() ? cfg.arch : cfg.model_architecture;
     std::cout << "fusionrt listening on " << host << ':' << port << '\n' << std::flush;
     while (!StopHandler::stopping) {
@@ -428,9 +387,8 @@ void serve_http(CudaContext& ctx, FusionModel& model, const BpeTokenizer& tokeni
         setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, reinterpret_cast<const char*>(&timeout), sizeof(timeout));
         std::optional<agent::Protocol> protocol;
         try {
-            auto req = read_request(fd);
+            auto req = read_request(fd, protocol);
             if (!req) continue;
-            protocol = agent_route(req->path);
             if (req->method == "OPTIONS") {
                 send_all(fd, std::string("HTTP/1.1 204 No Content\r\nConnection: close\r\n") + cors + "\r\n");
             } else if (req->method == "GET" && req->path == "/health") {
@@ -461,13 +419,12 @@ void serve_http(CudaContext& ctx, FusionModel& model, const BpeTokenizer& tokeni
                     const auto rendered = agent::render_prompt(input, tokenizer, preset_images);
                     VisionPrompt prompt;
                     if (rendered.images.empty()) prompt.tokens = encode_prompt(tokenizer, rendered.text, context);
-                    else prompt = encode_vision_prompt(ctx, *vision, tokenizer, rendered.text, rendered.images, context);
+                    else prompt = encode_vision_prompt(ctx, *vision, tokenizer, rendered.text, rendered.images,
+                                                       rendered.image_offsets, context);
                     const JsonConstraint* constraint = nullptr;
-                    if (input.generation.json != agent::JsonMode::none) {
-                        const bool object_only = input.generation.json == agent::JsonMode::object;
-                        auto& cached = object_only ? json_object : json_value;
-                        if (!cached) cached.emplace(tokenizer, cfg.vocab_size, object_only);
-                        constraint = &*cached;
+                    if (input.generation.json) {
+                        const auto root = *input.generation.json;
+                        constraint = &json_constraints.try_emplace(root, tokenizer, cfg.vocab_size, root).first->second;
                     }
                     complete_agent(fd, ctx, model, tokenizer, model_name, *protocol, input, rendered, prompt.tokens,
                                    context, use_graph, ++request_id, constraint, prompt.inputs_embeds);
@@ -479,17 +436,21 @@ void serve_http(CudaContext& ctx, FusionModel& model, const BpeTokenizer& tokeni
                     if (preset_images.empty()) prompt.tokens = encode_prompt(tokenizer, text.as_string(), context);
                     else {
                         std::vector<const Image*> images;
+                        std::vector<size_t> offsets;
                         std::string marked;
                         for (const auto& image : preset_images) {
                             images.push_back(&image);
+                            offsets.push_back(marked.size());
                             marked += image_placeholder;
                         }
-                        prompt = encode_vision_prompt(ctx, *vision, tokenizer, marked + text.as_string(), images, context);
+                        prompt = encode_vision_prompt(ctx, *vision, tokenizer, marked + text.as_string(), images, offsets, context);
                     }
                     complete(fd, ctx, model, tokenizer, model_name, prompt.tokens, params, context, use_graph,
                              ++request_id, prompt.inputs_embeds);
                 }
             } else error(fd, "404 Not Found", "Unknown route", protocol);
+        } catch (const http::PayloadTooLarge& e) {
+            error(fd, http::PayloadTooLarge::status, e.what(), protocol);
         } catch (const std::invalid_argument& e) {
             error(fd, "400 Bad Request", e.what(), protocol);
         } catch (const std::exception& e) {

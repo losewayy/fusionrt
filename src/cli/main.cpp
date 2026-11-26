@@ -6,6 +6,7 @@
 #include "fusionrt/server.h"
 #include "fusionrt/tokenizer.h"
 #include "fusionrt/vision.h"
+#include "cli_args.h"
 #ifdef FUSIONRT_ENABLE_CUDA
 #include "fusionrt/cuda_backend.h"
 #endif
@@ -13,7 +14,6 @@
 #include "fusionrt/vulkan_backend.h"
 #endif
 #include <algorithm>
-#include <charconv>
 #include <chrono>
 #include <cstdlib>
 #include <filesystem>
@@ -30,6 +30,7 @@
 #endif
 
 using namespace fusionrt;
+using fusionrt::cli::parse_integer;
 
 namespace {
 
@@ -116,19 +117,11 @@ struct CudaPlacementOptions {
 
     bool parse(std::string_view option, std::string_view value) {
         if (option != "--kv-vram-mb" && option != "--host-kv-mb" && option != "--moe-gpu-experts") return false;
-        const char* end = value.data() + value.size();
-        auto read = [&](auto& number) {
-            const auto result = std::from_chars(value.data(), end, number);
-            if (result.ec != std::errc{} || result.ptr != end) {
-                throw std::invalid_argument("Invalid integer for " + std::string(option));
-            }
-        };
         if (option == "--moe-gpu-experts") {
-            read(experts);
+            experts = parse_integer(option, value);
             if (experts < -1) throw std::invalid_argument("Expected --moe-gpu-experts >= -1");
         } else {
-            size_t mb = 0;
-            read(mb);
+            const size_t mb = parse_integer<size_t>(option, value);
             if (mb > std::numeric_limits<size_t>::max() / mib) throw std::invalid_argument("KV budget is too large");
             (option == "--kv-vram-mb" ? vram : host) = mb * mib;
         }
@@ -155,14 +148,29 @@ std::string model_filename(const std::string& path) {
     return std::string(name.begin(), name.end());
 }
 
+std::vector<int64_t> per_layer_integers(const GgufFile& file, const std::string& key) {
+    const auto it = file.metadata().find(key);
+    if (it == file.metadata().end()) return {};
+    if (const auto* values = std::get_if<std::vector<int32_t>>(&it->second)) return {values->begin(), values->end()};
+    if (const auto* values = std::get_if<std::vector<uint32_t>>(&it->second)) return {values->begin(), values->end()};
+    if (const auto* values = std::get_if<std::vector<bool>>(&it->second)) return {values->begin(), values->end()};
+    return {};
+}
+
 bool parse_sampling(std::string_view option, const std::string& value, SamplingParams& params) {
+    if (option == "--top-k") {
+        params.top_k = parse_integer(option, value);
+        return true;
+    }
+    if (option == "--seed") {
+        params.seed = parse_integer<uint64_t>(option, value);
+        return true;
+    }
     size_t end = 0;
     if (option == "--temp") params.temperature = std::stof(value, &end);
-    else if (option == "--top-k") params.top_k = std::stoi(value, &end);
     else if (option == "--top-p") params.top_p = std::stof(value, &end);
     else if (option == "--min-p") params.min_p = std::stof(value, &end);
     else if (option == "--repeat-penalty") params.repeat_penalty = std::stof(value, &end);
-    else if (option == "--seed" && !value.starts_with("-")) params.seed = std::stoull(value, &end);
     else return false;
     if (end != value.size()) throw std::invalid_argument("Invalid value for " + std::string(option));
     return true;
@@ -274,21 +282,20 @@ int cmd_daily(const std::string& cmd, int argc, char** argv) {
         if (i + 1 >= argc) throw std::invalid_argument("Missing value for " + arg);
         const std::string value = argv[++i];
         if (arg == "--model") path = value;
-        else if (arg == "--max-seq") max_seq = std::stoi(value);
+        else if (arg == "--max-seq") max_seq = parse_integer(arg, value);
         else if (arg == "--kv-type") kv_dtype = parse_kv_type(value);
         else if (arg == "--profile") profile = value;
         else if (placement.parse(arg, value)) continue;
         else if (cmd == "serve" && arg == "--host") host = value;
-        else if (cmd == "serve" && arg == "--port") port = std::stoi(value);
+        else if (cmd == "serve" && arg == "--port") port = parse_integer(arg, value);
         else if (cmd == "serve" && arg == "--mmproj") mmproj = value;
         else if (cmd == "serve" && arg == "--image") image_paths.push_back(value);
         else if (cmd == "serve" && arg == "--slots") {
-            size_t parsed = 0;
-            slots = std::stoi(value, &parsed);
-            if (parsed != value.size() || slots < 1) throw std::invalid_argument("Expected --slots >= 1");
+            slots = parse_integer(arg, value);
+            if (slots < 1) throw std::invalid_argument("Expected --slots >= 1");
         }
         else if (cmd == "chat" && arg == "--system") system = value;
-        else if (cmd == "chat" && arg == "--max-tokens") steps = std::stoi(value);
+        else if (cmd == "chat" && arg == "--max-tokens") steps = parse_integer(arg, value);
         else if (cmd != "chat" || !parse_sampling(arg, value, sampling)) {
             throw std::invalid_argument("Unknown " + cmd + " option: " + arg);
         }
@@ -318,18 +325,35 @@ int cmd_daily(const std::string& cmd, int argc, char** argv) {
         const auto prefix = arch + ".";
         const auto hidden = header.get_int(prefix + "embedding_length");
         const auto heads = header.get_int(prefix + "attention.head_count");
+        const auto layers = header.get_int(prefix + "block_count");
         const auto experts = header.get_int(prefix + "expert_count");
         const bool mla = arch == "deepseek2";
+        const bool gemma4 = arch == "gemma4";
+        auto layer_kv = gemma4 ? per_layer_integers(header, prefix + "attention.head_count_kv") : std::vector<int64_t>{};
+        const auto swa = gemma4 ? per_layer_integers(header, prefix + "attention.sliding_window_pattern") : std::vector<int64_t>{};
+        const auto shared = gemma4 ? header.get_int(prefix + "attention.shared_kv_layers") : 0;
+        if (!layer_kv.empty()) {
+            if (static_cast<int64_t>(layer_kv.size()) != layers || (!swa.empty() && swa.size() != layer_kv.size()))
+                throw std::invalid_argument("Invalid Gemma 4 per-layer attention metadata");
+            int64_t last_source[2]{};
+            for (size_t i = 0; i < layer_kv.size(); ++i) {
+                const bool sliding = swa.empty() ? header.get_bool(prefix + "attention.sliding_window_pattern", false) : swa[i] != 0;
+                if (static_cast<int64_t>(i) < layers - shared) last_source[sliding] = layer_kv[i];
+                else if (layer_kv[i] == 0) layer_kv[i] = last_source[sliding];
+            }
+        }
+        const auto kv_heads = mla ? 1 : layer_kv.empty() ? header.get_int(prefix + "attention.head_count_kv", heads)
+                                                       : layer_kv.front();
         auto head_dim = header.get_int(prefix + "attention.key_length", hidden / std::max<int64_t>(1, heads));
         if (mla) head_dim = header.get_int(prefix + "attention.key_length_mla", head_dim);
         const auto qk_norm = header.find_tensor("blk.0.attn_q_norm.weight") && header.find_tensor("blk.0.attn_k_norm.weight");
         std::cout << "model=" << model_filename(path) << " architecture=" << arch
                   << " layout=" << (mla ? "mla" : experts ? "moe" : header.find_tensor("blk.0.ssm_conv1d.weight") ? "hybrid" : "dense")
-                  << " layers=" << header.get_int(prefix + "block_count") << " max_seq=" << max_seq
+                  << " layers=" << layers << " max_seq=" << max_seq
                   << " trained_context=" << header.get_int(prefix + "context_length") << '\n'
                   << "gguf_version=" << header.version() << " file_bytes=" << header.file_bytes()
                   << " tensors=" << header.tensors().size() << " hidden_size=" << hidden
-                  << " attention_heads=" << heads << " kv_heads=" << (mla ? 1 : header.get_int(prefix + "attention.head_count_kv", heads))
+                  << " attention_heads=" << heads << " kv_heads=" << kv_heads
                   << " head_dim=" << head_dim
                   << " qk_norm=" << (qk_norm ? "true" : "false")
                   << " rope_theta=" << header.get_float(prefix + "rope.freq_base", 10000.0) << '\n';
@@ -356,19 +380,26 @@ int cmd_daily(const std::string& cmd, int argc, char** argv) {
                       << " expert_groups_used=" << header.get_int(prefix + "expert_group_used_count",
                           header.get_int(prefix + "expert_group_count", 1))
                       << " expert_weights_scale=" << header.get_float(prefix + "expert_weights_scale", 1.0)
-                      << " rope_scaling=" << header.get_string(prefix + "rope.scaling.type", "none") << '\n';
+                      << " rope_scaling=" << header.get_string(prefix + "rope.scaling.type", "none")
+                      << " kv_cache_dtype=" << dtype_name(DType::F32) << '\n';
         }
-        if (arch == "gemma4") {
-            const auto pattern = header.metadata().find(prefix + "attention.sliding_window_pattern");
-            const auto* swa = pattern == header.metadata().end() ? nullptr :
-                std::get_if<std::vector<bool>>(&pattern->second);
-            const auto sliding_layers = swa ? std::count(swa->begin(), swa->end(), true) : 0;
-            std::cout << "global_layers=" << header.get_int(prefix + "block_count") - sliding_layers
+        if (gemma4) {
+            const auto sliding_layers = swa.empty() ? (header.get_bool(prefix + "attention.sliding_window_pattern", false) ? layers : 0)
+                                                    : std::count(swa.begin(), swa.end(), 1);
+            std::cout << "global_layers=" << layers - sliding_layers
                       << " sliding_layers=" << sliding_layers
                       << " sliding_head_dim=" << header.get_int(prefix + "attention.key_length_swa")
                       << " sliding_window=" << header.get_int(prefix + "attention.sliding_window")
-                      << " shared_kv_layers=" << header.get_int(prefix + "attention.shared_kv_layers")
+                      << " shared_kv_layers=" << shared
                       << " ple_width=" << header.get_int(prefix + "embedding_length_per_layer_input") << '\n';
+            if (!layer_kv.empty()) {
+                std::cout << "kv_heads_per_layer=";
+                for (size_t i = 0; i < layer_kv.size(); ++i) {
+                    if (i != 0) std::cout << ',';
+                    std::cout << layer_kv[i];
+                }
+                std::cout << '\n';
+            }
         }
         WeightSummary sizes;
         for (const auto& tensor : header.tensors()) sizes.add(tensor.dtype, tensor.shape, tensor.nbytes);
@@ -413,7 +444,7 @@ int cmd_daily(const std::string& cmd, int argc, char** argv) {
         std::cout << "device_weight_bytes=" << device_weight_bytes << '\n';
         std::cout << model.fused_ir_graph().summary()
                   << "\nstatic_scratch_peak_bytes=" << mem.static_scratch_bytes
-                  << " kv_cache_dtype=" << dtype_name(kv_dtype) << " kv_cache_bytes=" << mem.kv_bytes
+                  << " kv_cache_dtype=" << dtype_name(model.cuda_kv_dtype()) << " kv_cache_bytes=" << mem.kv_bytes
                   << " kv_cache_pages=" << mem.kv_pages
                   << " kv_cache_reserved_bytes=" << mem.kv_reserved_bytes
                   << " host_kv_bytes=" << mem.host_kv_bytes << " host_kv_pages=" << mem.host_kv_pages
@@ -443,10 +474,9 @@ int cmd_bench_model(int argc, char** argv) {
     std::optional<bool> graph_option;
     std::string profile, profile_ops;
     CudaPlacementOptions placement;
-    auto parse_int = [](const std::string& arg) {
-        size_t end = 0;
-        int value = std::stoi(arg, &end);
-        if (end != arg.size() || value < 0) throw std::invalid_argument("Expected a nonnegative integer: " + arg);
+    auto parse_int = [](std::string_view option, std::string_view arg) {
+        const int value = parse_integer(option, arg);
+        if (value < 0) throw std::invalid_argument("Expected a nonnegative integer for " + std::string(option));
         return value;
     };
     for (int i = 2; i < argc; ++i) {
@@ -456,11 +486,11 @@ int cmd_bench_model(int argc, char** argv) {
         else if (a == "--profile-ops" && i + 1 < argc) profile_ops = argv[++i];
         else if (a == "--kv-type" && i + 1 < argc) kv_dtype = parse_kv_type(argv[++i]);
         else if (a == "--model" && i + 1 < argc) path = argv[++i];
-        else if (a == "--pp" && i + 1 < argc) pp = parse_int(argv[++i]);
-        else if (a == "--tg" && i + 1 < argc) tg = parse_int(argv[++i]);
-        else if (a == "--ubatch" && i + 1 < argc) ubatch = parse_int(argv[++i]);
-        else if (a == "--decode-prefix" && i + 1 < argc) decode_prefix = parse_int(argv[++i]);
-        else if (a == "--reps" && i + 1 < argc) reps = parse_int(argv[++i]);
+        else if (a == "--pp" && i + 1 < argc) pp = parse_int(a, argv[++i]);
+        else if (a == "--tg" && i + 1 < argc) tg = parse_int(a, argv[++i]);
+        else if (a == "--ubatch" && i + 1 < argc) ubatch = parse_int(a, argv[++i]);
+        else if (a == "--decode-prefix" && i + 1 < argc) decode_prefix = parse_int(a, argv[++i]);
+        else if (a == "--reps" && i + 1 < argc) reps = parse_int(a, argv[++i]);
         else if (i + 1 < argc && placement.parse(a, argv[i + 1])) ++i;
         else throw std::invalid_argument("Unknown or incomplete bench-model option: " + a);
     }
@@ -536,20 +566,20 @@ int cmd_run(int argc, char** argv) {
         if (a == "--arch" && i + 1 < argc) arch = argv[++i];
         else if (a == "--dtype" && i + 1 < argc) dtype_s = argv[++i];
         else if (a == "--backend" && i + 1 < argc) backend_s = argv[++i];
-        else if (a == "--vk-device" && i + 1 < argc) vk_dev = std::stoi(argv[++i]);
+        else if (a == "--vk-device" && i + 1 < argc) vk_dev = parse_integer(a, argv[++i]);
         else if (a == "--model" && i + 1 < argc) model_path = argv[++i];
         else if (a == "--json-grammar") json_grammar = true;
-        else if (a == "--spec-ngram" && i + 1 < argc) spec_ngram = std::stoi(argv[++i]);
+        else if (a == "--spec-ngram" && i + 1 < argc) spec_ngram = parse_integer(a, argv[++i]);
         else if (a == "--draft-model" && i + 1 < argc) draft_path = argv[++i];
         else if (a == "--mmproj" && i + 1 < argc) mmproj = argv[++i];
         else if (a == "--image" && i + 1 < argc) image_paths.push_back(argv[++i]);
         else if (a == "--draft-tokens" && i + 1 < argc) {
-            draft_tokens = std::stoi(argv[++i]);
+            draft_tokens = parse_integer(a, argv[++i]);
             draft_tokens_set = true;
         }
         else if (a == "--prompt" && i + 1 < argc) prompt = argv[++i];
-        else if (a == "--steps" && i + 1 < argc) steps = std::stoi(argv[++i]);
-        else if (a == "--max-seq" && i + 1 < argc) max_seq = std::stoi(argv[++i]);
+        else if (a == "--steps" && i + 1 < argc) steps = parse_integer(a, argv[++i]);
+        else if (a == "--max-seq" && i + 1 < argc) max_seq = parse_integer(a, argv[++i]);
         else if (a == "--kv-type" && i + 1 < argc) kv_dtype = parse_kv_type(argv[++i]);
         else if (a == "--graph" || a == "--no-graph") graph_option = a == "--graph";
         else if (a == "--stream") stream = true;
@@ -845,7 +875,7 @@ int main(int argc, char** argv) {
                 std::string a = argv[i];
                 if (a == "--suite" && i + 1 < argc) suite = argv[++i];
                 else if (a == "--output" && i + 1 < argc) output = argv[++i];
-                else if (a == "--vk-device" && i + 1 < argc) vk_dev = std::stoi(argv[++i]);
+                else if (a == "--vk-device" && i + 1 < argc) vk_dev = parse_integer(a, argv[++i]);
             }
             return bench::run_benchmark_suite(suite, output, vk_dev);
         }

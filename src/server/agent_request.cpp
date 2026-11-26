@@ -87,14 +87,22 @@ struct ImageBudget {
         if (role != Role::user) throw std::invalid_argument("Image input requires a user message");
         if (count >= 8) throw std::invalid_argument("Too many images in request");
     }
-    void append(Message& msg, Image image) {
+    Image take(Image image) {
         if (image.rgb.size() > 64 * 1024 * 1024 - bytes)
             throw std::invalid_argument("Decoded images exceed request size limit");
         bytes += image.rgb.size();
         ++count;
-        msg.content.emplace_back(std::move(image));
+        return image;
     }
 };
+
+Image anthropic_image(const JsonObject& block, Role role, ImageBudget& budget) {
+    budget.check(role);
+    const auto& source = object(field(block, "source"), "image source");
+    if (identifier(source, "type") != "base64" || !identifier(source, "media_type").starts_with("image/"))
+        throw std::invalid_argument("Expected an Anthropic base64 image source");
+    return budget.take(decode_image_base64(identifier(source, "data")));
+}
 
 void openai_content(Message& msg, const JsonValue& value, Protocol protocol, ImageBudget& budget) {
     if (!value.is_array()) {
@@ -112,10 +120,10 @@ void openai_content(Message& msg, const JsonValue& value, Protocol protocol, Ima
         } else if (protocol == Protocol::chat && type == "image_url") {
             budget.check(msg.role);
             const auto& image = object(field(block, "image_url"), "image_url");
-            budget.append(msg, decode_image_data_uri(identifier(image, "url")));
+            msg.content.emplace_back(budget.take(decode_image_data_uri(identifier(image, "url"))));
         } else if (protocol == Protocol::responses && type == "input_image") {
             budget.check(msg.role);
-            budget.append(msg, decode_image_data_uri(identifier(block, "image_url")));
+            msg.content.emplace_back(budget.take(decode_image_data_uri(identifier(block, "image_url"))));
         } else throw std::invalid_argument("Unsupported OpenAI content block: " + type);
     }
 }
@@ -200,18 +208,25 @@ void anthropic_messages(AgentRequest& req, const JsonValue& input, ImageBudget& 
                 if (type == "text") {
                     msg.content.emplace_back(string(field(b, "text"), "text"));
                 } else if (type == "image") {
-                    budget.check(msg.role);
-                    const auto& source = object(field(b, "source"), "image source");
-                    if (identifier(source, "type") != "base64" || !identifier(source, "media_type").starts_with("image/"))
-                        throw std::invalid_argument("Expected an Anthropic base64 image source");
-                    budget.append(msg, decode_image_base64(identifier(source, "data")));
+                    msg.content.emplace_back(anthropic_image(b, msg.role, budget));
                 } else if (type == "tool_use" && msg.role == Role::assistant) {
                     msg.content.emplace_back(ToolCall{identifier(b, "id"), identifier(b, "name"),
                                                      object(field(b, "input"), "input")});
                 } else if (type == "tool_result" && msg.role == Role::user) {
-                    msg.content.emplace_back(ToolResult{identifier(b, "tool_use_id"), {},
-                        field(b, "content").is_null() ? std::string{} : text_content(field(b, "content")),
-                        boolean(b, "is_error")});
+                    ToolResult result{identifier(b, "tool_use_id"), {}, {}, boolean(b, "is_error")};
+                    const auto& payload = field(b, "content");
+                    if (payload.is_string()) result.content = payload.as_string();
+                    else if (!payload.is_null()) {
+                        for (const auto& part : array(payload, "tool result content")) {
+                            const auto& nested = object(part, "tool result content block");
+                            const auto kind = identifier(nested, "type");
+                            if (kind == "text") result.content += string(field(nested, "text"), "text");
+                            else if (kind == "image") {
+                                result.images.push_back({result.content.size(), anthropic_image(nested, msg.role, budget)});
+                            } else throw std::invalid_argument("Unsupported tool result content block: " + kind);
+                        }
+                    }
+                    msg.content.emplace_back(std::move(result));
                 } else {
                     throw std::invalid_argument("Unsupported Messages content block: " + type);
                 }
@@ -279,6 +294,13 @@ void match_results(AgentRequest& req) {
 }
 
 }  // namespace
+
+int generation_limit(const GenerationParams& params, int context, size_t prompt_len) {
+    const int remaining = prompt_len < static_cast<size_t>(context) ? context - static_cast<int>(prompt_len) : 0;
+    const int limit = std::min(params.max_tokens, remaining);
+    if (params.json && limit <= 0) throw std::invalid_argument("JSON generation needs room for output tokens");
+    return limit;
+}
 
 GenerationParams parse_generation(const JsonObject& obj, const char* limit_key) {
     GenerationParams params;
@@ -348,17 +370,31 @@ AgentRequest parse_request(const JsonObject& obj, Protocol protocol, bool allow_
             const auto type = identifier(config, "type");
             if (type == "json_object" || type == "json_schema") {
                 auto instruction = std::string("Respond with a single JSON object.");
-                req.generation.json = JsonMode::object;
+                req.generation.json = JsonRoot::object;
                 if (type == "json_schema") {
                     const auto& schema_format = nested_schema && !field(config, "json_schema").is_null()
                         ? object(field(config, "json_schema"), "json_schema") : config;
                     const auto& schema = field(schema_format, "schema");
-                    const auto& root = field(object(schema, "schema"), "type");
-                    if (!root.is_string() || root.as_string() != "object") req.generation.json = JsonMode::value;
+                    const auto& schema_fields = object(schema, "schema");
+                    if (std::any_of(schema_fields.begin(), schema_fields.end(), [](const auto& entry) {
+                            return entry.first != "type" && entry.first != "title" && entry.first != "description";
+                        })) {
+                        throw std::invalid_argument("Schema field constraints are not enforced; use response_format.type=json_object for grammar-constrained JSON");
+                    }
+                    req.generation.json = JsonRoot::value;
+                    if (schema_fields.contains("type")) {
+                        static const std::map<std::string, JsonRoot> roots{
+                            {"object", JsonRoot::object}, {"array", JsonRoot::array}, {"string", JsonRoot::string},
+                            {"number", JsonRoot::number}, {"integer", JsonRoot::integer}, {"boolean", JsonRoot::boolean},
+                            {"null", JsonRoot::null}};
+                        const auto root = roots.find(string(field(schema_fields, "type"), "schema type"));
+                        if (root == roots.end()) throw std::invalid_argument("Unsupported JSON schema root type");
+                        req.generation.json = root->second;
+                    }
                     instruction = "Respond with a single JSON value matching this schema: " + schema.dump(0);
                 }
-                if (!req.generation.stops.empty() || req.choice == Choice::required || req.choice == Choice::named) {
-                    throw std::invalid_argument("JSON response formats cannot be combined with stop sequences or required tools");
+                if (!req.generation.stops.empty() || (!req.tools.empty() && req.choice != Choice::none)) {
+                    throw std::invalid_argument("JSON response formats cannot be combined with stop sequences or enabled tools");
                 }
                 req.choice = Choice::none;
                 req.messages.insert(req.messages.begin(), {Role::system, {std::move(instruction)}});

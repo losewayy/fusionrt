@@ -6,6 +6,7 @@
 #include "fusionrt/tokenizer.h"
 
 #include <functional>
+#include <optional>
 #include <string_view>
 
 namespace fusionrt::agent {
@@ -24,8 +25,13 @@ struct ToolCall {
 };
 
 struct ToolResult {
+    struct Attachment {
+        size_t offset;
+        Image image;
+    };
     std::string call_id, name, content;
     bool is_error = false;
+    std::vector<Attachment> images{};
 };
 
 using Block = std::variant<std::string, ToolCall, ToolResult, Image>;
@@ -36,14 +42,13 @@ struct Message {
 };
 
 enum class Choice { automatic, none, required, named };
-enum class JsonMode { none, value, object };
 
 struct GenerationParams {
     int max_tokens = 512;
     SamplingParams sampling;
     std::vector<std::string> stops;
     bool stream = false;
-    JsonMode json = JsonMode::none;
+    std::optional<JsonRoot> json;
 };
 
 struct AgentRequest {
@@ -61,10 +66,12 @@ struct AgentPrompt {
     bool open_thought = false;
     bool llama_calls = false;
     std::vector<const Image*> images;
+    std::vector<size_t> image_offsets;
 };
 
 const JsonValue& field(const JsonObject& obj, const char* key);
 GenerationParams parse_generation(const JsonObject& obj, const char* limit_key);
+int generation_limit(const GenerationParams& params, int context, size_t prompt_len);
 AgentRequest parse_request(const JsonObject& obj, Protocol protocol, bool allow_images = false);
 AgentPrompt render_prompt(const AgentRequest& req, const BpeTokenizer& tokenizer,
                            std::span<const Image> preset_images = {});

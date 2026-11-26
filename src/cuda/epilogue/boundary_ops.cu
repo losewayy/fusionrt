@@ -141,8 +141,8 @@ __global__ void k_vision_activation(float* x, int count, bool gelu, bool quick) 
 }
 
 template <bool Gelu>
-__global__ void k_gated_f32(const float* __restrict__ gate, const float* __restrict__ up,
-                             float* __restrict__ out, int n) {
+__global__ void k_gated_f32(const float* gate, const float* up,
+                             float* out, int n) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx < n) out[idx] = gated_activation<Gelu>(gate[idx], up[idx]);
 }
@@ -169,8 +169,8 @@ __global__ void k_scale_f32(float* x, int n, float scale) {
     }
 }
 
-__global__ void k_add_residual_f32(const float* __restrict__ a, const float* __restrict__ b,
-                                   float* __restrict__ out, int n) {
+__global__ void k_add_residual_f32(const float* a, const float* b,
+                                   float* out, int n) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx < n) out[idx] = a[idx] + b[idx];
 }
@@ -411,6 +411,7 @@ __global__ void k_moe_topk_router(const float* __restrict__ logits,
                 best_e = e;
             }
         }
+        if (best_e < 0) break;
         topk_idx[k] = best_e;
         topk_weight[k] = probs[best_e];
         weight_sum += topk_weight[k];
@@ -817,19 +818,19 @@ void geglu_f32(const float* gate, const float* up, float* out, int n, cudaStream
 }
 
 __global__ void k_gemma_ple_gate(const float* gate, const float* inputs, float* out,
-                                 int count, int width, int stride, int offset) {
-    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+                                 int64_t count, int width, int stride, int offset) {
+    const int64_t i = int64_t{blockIdx.x} * blockDim.x + threadIdx.x;
     if (i < count) {
         const float x = gate[i];
         const float gelu = (0.5f * x) * (1.0f + tanhf(0.7978845608028654f * x * (1.0f + 0.044715f * x * x)));
-        out[i] = gelu * inputs[(i / width) * stride + offset + i % width];
+        out[i] = gelu * inputs[(i / width) * int64_t{stride} + offset + i % width];
     }
 }
 
 void gemma_ple_gate_f32(const float* gate, const float* inputs, float* out,
                        int rows, int width, int input_stride, int input_offset, cudaStream_t stream) {
-    const int count = rows * width;
-    k_gemma_ple_gate<<<(count + 255) / 256, 256, 0, stream>>>(
+    const int64_t count = int64_t{rows} * width;
+    k_gemma_ple_gate<<<static_cast<unsigned>((count + 255) / 256), 256, 0, stream>>>(
         gate, inputs, out, count, width, input_stride, input_offset);
 }
 
@@ -941,6 +942,11 @@ void fused_qk_norm_rope_kv_append_f32(
 void moe_topk_router_f32(const float* logits, int* topk_idx, float* topk_weight,
                          int num_experts, int top_k, bool norm_topk, cudaStream_t stream,
                          const float* selection_bias, bool sigmoid, float scale, int groups, int groups_used) {
+    if (num_experts <= 0 || num_experts > 256 || top_k <= 0 || groups <= 0 || groups > 128 ||
+        groups_used <= 0 || groups_used > groups || num_experts % groups != 0 ||
+        groups_used * (num_experts / groups) < top_k) {
+        throw std::invalid_argument("Invalid CUDA MoE router dimensions");
+    }
     k_moe_topk_router<<<1, 1, 0, stream>>>(logits, topk_idx, topk_weight, num_experts, top_k, norm_topk,
                                           selection_bias, sigmoid, scale, groups, groups_used);
 }

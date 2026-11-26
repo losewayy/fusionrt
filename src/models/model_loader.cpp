@@ -572,17 +572,27 @@ bool parse_gguf_model_raw(const std::string& path, int max_seq_override, LoadedM
                     out.cfg.moe.intermediate_size = static_cast<int>(gate.shape[1]);
                 } else {
                     std::vector<HostTensor> gu_list, dn_list;
+                    int64_t expert_width = get_arch_int("expert_feed_forward_length", 0);
                     for (int e = 0; e < E; ++e) {
-                        std::string es = std::to_string(e);
-                        gu_list.push_back(to_f32_host(req(p + "ffn_gate." + es + ".weight")));
-                        gu_list.push_back(to_f32_host(req(p + "ffn_up." + es + ".weight")));
-                        dn_list.push_back(to_f32_host(req(p + "ffn_down." + es + ".weight")));
+                        const std::string es = std::to_string(e);
+                        const auto gate = req(p + "ffn_gate." + es + ".weight");
+                        const auto up = req(p + "ffn_up." + es + ".weight");
+                        const auto down = req(p + "ffn_down." + es + ".weight");
+                        if (e == 0 && expert_width == 0 && gate.desc.ndim == 2) expert_width = gate.desc.shape[0];
+                        if (expert_width <= 0 || expert_width > std::numeric_limits<int>::max() / 2 ||
+                            !matrix(gate, expert_width, H) || !matrix(up, expert_width, H) ||
+                            !matrix(down, H, expert_width)) {
+                            throw std::runtime_error("Invalid GGUF individual expert FFN shapes: " + p + es);
+                        }
+                        gu_list.push_back(to_f32_host(gate));
+                        gu_list.push_back(to_f32_host(up));
+                        dn_list.push_back(to_f32_host(down));
                     }
                     L.experts_gate_up = concat_rows_same_dtype(gu_list);
-                    L.experts_gate_up.desc = Tensor::from_shape({E, 2 * gu_list[0].desc.shape[0], H}, DType::F32, Backend::CPU);
+                    L.experts_gate_up.desc = Tensor::from_shape({E, 2 * expert_width, H}, DType::F32, Backend::CPU);
                     L.experts_down = concat_rows_same_dtype(dn_list);
-                    L.experts_down.desc = Tensor::from_shape({E, H, dn_list[0].desc.shape[1]}, DType::F32, Backend::CPU);
-                    out.cfg.moe.intermediate_size = static_cast<int>(gu_list[0].desc.shape[0]);
+                    L.experts_down.desc = Tensor::from_shape({E, H, expert_width}, DType::F32, Backend::CPU);
+                    out.cfg.moe.intermediate_size = static_cast<int>(expert_width);
                 }
                 if (L.experts_down.bytes().empty()) L.experts_down = req(p + "ffn_down_exps.weight");
                 const int I = out.cfg.moe.intermediate_size;

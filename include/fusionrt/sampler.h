@@ -3,6 +3,7 @@
 #include <cstdint>
 #include <array>
 #include <random>
+#include <span>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -35,20 +36,24 @@ struct Sampler {
                           const SamplingParams& params, std::mt19937_64& rng);
 };
 
+enum class JsonRoot { value, object, array, string, number, integer, boolean, null };
+
 class JsonGrammarState {
 public:
     explicit JsonGrammarState(bool object_only = false);
+    explicit JsonGrammarState(JsonRoot root);
     bool consume(std::string_view bytes);
     bool complete() const;
     bool sealed() const;
 
 private:
     friend class JsonConstraint;
-    enum class Expect : uint8_t { value, object_root, key_or_end, key, colon, item_or_end, object_end, array_end, done };
+    enum class Expect : uint8_t { value, key_or_end, key, colon, item_or_end, object_end, array_end, done };
     enum class Lex : uint8_t { syntax, string, escape, hex, low_slash, low_u, low_hex, literal,
                                minus, zero, integer, dot, fraction, exponent, exponent_sign, exponent_digits };
 
     std::vector<Expect> stack_;
+    JsonRoot root_;
     Lex lex_ = Lex::syntax;
     std::string_view literal_;
     uint16_t hex_ = 0;
@@ -67,8 +72,10 @@ private:
 class JsonConstraint {
 public:
     explicit JsonConstraint(const BpeTokenizer& tokenizer, int vocab_size, bool object_only = false);
-    JsonGrammarState initial_state() const { return JsonGrammarState(object_only_); }
-    void mask(float* logits, const JsonGrammarState& state, int remaining_tokens) const;
+    JsonConstraint(const BpeTokenizer& tokenizer, int vocab_size, JsonRoot root);
+    size_t vocab_size() const { return pieces_.size(); }
+    JsonGrammarState initial_state() const { return JsonGrammarState(root_); }
+    void mask(std::span<float> logits, const JsonGrammarState& state, int remaining_tokens) const;
     bool accept(JsonGrammarState& state, int32_t id) const;
     bool is_end(int32_t id) const { return end_[id]; }
 
@@ -79,7 +86,7 @@ private:
     std::vector<bool> end_;
     std::array<std::vector<int32_t>, 256> by_first_byte_;
     std::array<bool, 256> single_byte_{};
-    bool object_only_;
+    JsonRoot root_;
 };
 
 class Utf8StreamDecoder {

@@ -41,6 +41,9 @@ struct VisionPrompt {
 
 VisionPrompt encode_vision_prompt(CudaContext& ctx, const VisionEncoder& encoder, const BpeTokenizer& tokenizer,
                                    std::string_view text, std::span<const Image* const> images, int context);
+VisionPrompt encode_vision_prompt(CudaContext& ctx, const VisionEncoder& encoder, const BpeTokenizer& tokenizer,
+                                   std::string_view text, std::span<const Image* const> images,
+                                   std::span<const size_t> offsets, int context);
 #endif
 
 }  // namespace fusionrt

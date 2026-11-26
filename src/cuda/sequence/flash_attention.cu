@@ -64,6 +64,7 @@ __global__ void k_gqa_splitk_part1(
             o_j = o_j * alpha + p * kv_value<true>(values, cache, t, kvh, num_kv_heads, head_dim, tid);
         }
         m_i = m_new;
+        __syncthreads();
     }
 
     if (num_splits == 1) {
@@ -177,6 +178,7 @@ __global__ void k_gqa_prefill_causal(
             o_j = o_j * alpha + p * kv_value<true>(values, cache, t, kvh, num_kv_heads, head_dim, tid);
         }
         m_i = m_new;
+        __syncthreads();
     }
 
     if (tid < head_dim) {
@@ -200,9 +202,9 @@ __global__ void k_gqa_prefill_tiled(
     alignas(16) __shared__ float keys[BKV][HD + (Decode ? ScoreLanes : 0)];
     alignas(16) __shared__ float values[BKV][HD];
 
-    int kvh = blockIdx.x;
+    int kvh = Decode ? blockIdx.x : blockIdx.y;
     int group = num_q_heads / num_kv_heads;
-    int first = Decode ? 0 : blockIdx.y * Warps;
+    int first = Decode ? 0 : blockIdx.x * Warps;
     int query = first + threadIdx.x / 32;
     int m = Decode ? 0 : query / group;
     int qh = kvh * group + query % group;
@@ -772,7 +774,7 @@ void gqa_prefill_causal_f32(
         const auto* values = static_cast<const Cache*>(v_cache);
         if (head_dim == 64 || head_dim == 128 || head_dim == 256 || head_dim == 512) {
             const int group = num_q_heads / num_kv_heads;
-            const dim3 grid(num_kv_heads, (M * group + 7) / 8);
+            const dim3 grid(static_cast<unsigned>((int64_t{M} * group + 7) / 8), num_kv_heads);
             auto tiled = [&]<int HD>() {
                 if (!causal) {
                     k_gqa_prefill_tiled<HD, Cache, false, 8, false, false, false><<<grid, 256, 0, stream>>>(

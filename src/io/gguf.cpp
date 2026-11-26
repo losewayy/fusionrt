@@ -369,6 +369,11 @@ bool GgufFile::load(const std::string& path, std::string* err, bool read_tokeniz
         for (const auto& info : tensors_) {
             if (info.offset > data_bytes || info.nbytes > data_bytes - info.offset)
                 throw std::runtime_error("GGUF tensor extends beyond the file: " + info.name);
+            // GGUF quant blocks contain 16-bit scales even when the host structs are packed.
+            const size_t required_align = info.dtype == DType::F32 || info.dtype == DType::I32
+                ? alignof(uint32_t) : alignof(uint16_t);
+            if ((data_offset_ + info.offset) % required_align != 0)
+                throw std::runtime_error("Misaligned GGUF tensor offset: " + info.name);
         }
         mapping_ = std::move(mapping);
         return true;

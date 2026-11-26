@@ -1,4 +1,5 @@
 #include "fusionrt/sampler.h"
+#include "fusionrt/json.h"
 #include "fusionrt/tokenizer.h"
 
 #include <algorithm>
@@ -101,7 +102,9 @@ int32_t Sampler::sample(const float* logits, int vocab_size, const std::vector<i
 }
 
 JsonGrammarState::JsonGrammarState(bool object_only)
-    : stack_{object_only ? Expect::object_root : Expect::value} {}
+    : JsonGrammarState(object_only ? JsonRoot::object : JsonRoot::value) {}
+
+JsonGrammarState::JsonGrammarState(JsonRoot root) : stack_{Expect::value}, root_(root) {}
 
 bool JsonGrammarState::number_complete() const {
     return lex_ == Lex::zero || lex_ == Lex::integer || lex_ == Lex::fraction || lex_ == Lex::exponent_digits;
@@ -117,8 +120,7 @@ bool JsonGrammarState::complete() const {
 
 void JsonGrammarState::value_done() {
     switch (stack_.back()) {
-        case Expect::value:
-        case Expect::object_root: stack_.back() = Expect::done; break;
+        case Expect::value: stack_.back() = Expect::done; break;
         case Expect::item_or_end: stack_.back() = Expect::array_end; break;
         default: break;
     }
@@ -192,6 +194,7 @@ bool JsonGrammarState::advance(unsigned char c) {
         case Lex::zero:
         case Lex::integer:
             if (digit) return lex_ == Lex::integer;
+            if (root_ == JsonRoot::integer && (c == '.' || c == 'e' || c == 'E')) return false;
             if (c == '.') { lex_ = Lex::dot; return true; }
             if (c == 'e' || c == 'E') { lex_ = Lex::exponent; return true; }
             break;
@@ -246,13 +249,24 @@ bool JsonGrammarState::advance(unsigned char c) {
         case Expect::item_or_end:
             if (c == ']') { stack_.pop_back(); return true; }
             break;
-        case Expect::object_root:
-            if (c != '{') return false;
+        case Expect::value:
+            if (stack_.size() == 1) {
+                switch (root_) {
+                    case JsonRoot::value: break;
+                    case JsonRoot::object: if (c != '{') return false; break;
+                    case JsonRoot::array: if (c != '[') return false; break;
+                    case JsonRoot::string: if (c != '"') return false; break;
+                    case JsonRoot::number:
+                    case JsonRoot::integer: if (!digit && c != '-') return false; break;
+                    case JsonRoot::boolean: if (c != 't' && c != 'f') return false; break;
+                    case JsonRoot::null: if (c != 'n') return false; break;
+                }
+            }
             break;
-        case Expect::value: break;
     }
     if (stack_.size() > 1 && stack_.back() == Expect::value) stack_.pop_back();
     else value_done();
+    if ((c == '{' || c == '[') && stack_.size() > kMaxJsonNesting) return false;
     if (c == '{') stack_.push_back(Expect::key_or_end);
     else if (c == '[') stack_.push_back(Expect::item_or_end);
     else if (c == '"') lex_ = Lex::string;
@@ -301,7 +315,19 @@ std::string JsonGrammarState::closing_suffix() const {
             case Lex::exponent_sign: c = '0'; break;
             default:
                 switch (state.stack_.back()) {
-                    case Expect::object_root: c = '{'; break;
+                    case Expect::value:
+                        if (state.stack_.size() > 1) c = '0';
+                        else {
+                            switch (state.root_) {
+                                case JsonRoot::object: c = '{'; break;
+                                case JsonRoot::array: c = '['; break;
+                                case JsonRoot::string: c = '"'; break;
+                                case JsonRoot::boolean: c = 't'; break;
+                                case JsonRoot::null: c = 'n'; break;
+                                default: c = '0'; break;
+                            }
+                        }
+                        break;
                     case Expect::key_or_end:
                     case Expect::object_end: c = '}'; break;
                     case Expect::item_or_end:
@@ -319,7 +345,10 @@ std::string JsonGrammarState::closing_suffix() const {
 }
 
 JsonConstraint::JsonConstraint(const BpeTokenizer& tokenizer, int vocab_size, bool object_only)
-    : pieces_(vocab_size), end_(vocab_size), object_only_(object_only) {
+    : JsonConstraint(tokenizer, vocab_size, object_only ? JsonRoot::object : JsonRoot::value) {}
+
+JsonConstraint::JsonConstraint(const BpeTokenizer& tokenizer, int vocab_size, JsonRoot root)
+    : pieces_(vocab_size), end_(vocab_size), root_(root) {
     for (int32_t id = 0; id < vocab_size; ++id) {
         end_[id] = tokenizer.is_end_of_generation(id);
         if (end_[id]) continue;
@@ -351,8 +380,9 @@ bool JsonConstraint::can_finish(std::string_view suffix, int budget) const {
     return false;
 }
 
-void JsonConstraint::mask(float* logits, const JsonGrammarState& state, int remaining_tokens) const {
+void JsonConstraint::mask(std::span<float> logits, const JsonGrammarState& state, int remaining_tokens) const {
     constexpr float masked = -std::numeric_limits<float>::infinity();
+    if (logits.size() != vocab_size()) throw std::invalid_argument("JSON constraint vocabulary does not match logits");
     if (remaining_tokens <= 0) throw std::invalid_argument("JSON generation needs a positive token budget");
     auto next = state;
     const bool same_state_fits = can_finish(state.closing_suffix(), remaining_tokens - 1);

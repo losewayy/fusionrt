@@ -54,7 +54,7 @@ Image pnm(Bytes b) {
     const size_t sample_bytes = max_sample > 255 ? 2 : 1;
     if (!ascii) {
         if (pos >= b.size() || !std::isspace(b[pos])) invalid("Missing PPM/PGM raster delimiter");
-        if (b[pos++] == '\r' && pos < b.size() && b[pos] == '\n') ++pos;
+        ++pos;
         const size_t need = out.rgb.size() / (gray ? 3 : 1) * sample_bytes;
         if (need > b.size() - pos) invalid("Truncated PPM/PGM raster");
     }

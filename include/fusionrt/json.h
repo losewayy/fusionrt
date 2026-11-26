@@ -8,6 +8,8 @@
 
 namespace fusionrt {
 
+inline constexpr int kMaxJsonNesting = 128;
+
 struct JsonValue;
 using JsonArray = std::vector<JsonValue>;
 using JsonObject = std::map<std::string, JsonValue>;

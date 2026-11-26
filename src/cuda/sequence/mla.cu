@@ -75,6 +75,10 @@ __global__ void k_mla_causal(const float* queries, float* out, CudaKvView cache,
         float dot = 0.0f;
         for (int i = threadIdx.x; i < width; i += blockDim.x) dot = fmaf(q[i], kv[i], dot);
         const float score = block_reduce_sum(dot, reduction) * scale;
+        if (score == -INFINITY) {
+            __syncthreads();
+            continue;
+        }
         const float peak = fmaxf(max_score, score);
         const float keep = expf(max_score - peak), add = expf(score - peak);
         for (int i = threadIdx.x; i < rank; i += blockDim.x) acc[i] = fmaf(add, kv[i], keep * acc[i]);
@@ -83,7 +87,7 @@ __global__ void k_mla_causal(const float* queries, float* out, CudaKvView cache,
         __syncthreads();
     }
     float* dst = out + static_cast<size_t>(blockIdx.x) * rank;
-    for (int i = threadIdx.x; i < rank; i += blockDim.x) dst[i] = acc[i] / mass;
+    for (int i = threadIdx.x; i < rank; i += blockDim.x) dst[i] = mass == 0.0f ? 0.0f : acc[i] / mass;
 }
 
 }  // namespace

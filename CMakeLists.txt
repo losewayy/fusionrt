@@ -61,6 +61,7 @@ set(FUSIONRT_SOURCES
     src/server/agent_request.cpp
     src/server/agent_template.cpp
     src/server/agent_response.cpp
+    src/server/http_request.cpp
     src/core/tensor.cpp
     src/core/json.cpp
     src/core/sampler.cpp

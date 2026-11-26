@@ -6,6 +6,8 @@
 #include "fusionrt/tokenizer.h"
 #include "fusionrt/vision.h"
 #include "agent.h"
+#include "http_request.h"
+#include "../src/cli/cli_args.h"
 #include "../src/models/model_loader.h"
 #ifdef FUSIONRT_ENABLE_CUDA
 #include "../src/core/cpu_moe.h"
@@ -2058,9 +2060,10 @@ void test_stage7b_images_and_protocols() {
     BpeTokenizer tok;
     tok.init_byte_fallback();
     const std::vector<std::pair<Protocol, std::string>> requests{
-        {Protocol::chat, R"({"messages":[{"role":"user","content":[{"type":"text","text":"before"},{"type":"image_url","image_url":{"url":")" + uri + R"("}},{"type":"text","text":"after"}]}]})"},
+        {Protocol::chat, R"({"messages":[{"role":"user","content":[{"type":"text","text":"literal <image> before"},{"type":"image_url","image_url":{"url":")" + uri + R"("}},{"type":"text","text":"after"}]}]})"},
         {Protocol::responses, R"({"input":[{"role":"user","content":[{"type":"input_image","image_url":")" + uri + R"("}]}]})"},
-        {Protocol::messages, R"({"messages":[{"role":"user","content":[{"type":"image","source":{"type":"base64","media_type":"image/x-portable-pixmap","data":")" + ppm + R"("}}]}]})"}
+        {Protocol::messages, R"({"messages":[{"role":"user","content":[{"type":"image","source":{"type":"base64","media_type":"image/x-portable-pixmap","data":")" + ppm + R"("}}]}]})"},
+        {Protocol::messages, R"({"messages":[{"role":"assistant","content":[{"type":"tool_use","id":"call","name":"draw","input":{}}]},{"role":"user","content":[{"type":"tool_result","tool_use_id":"call","content":[{"type":"text","text":"literal <image> before"},{"type":"image","source":{"type":"base64","media_type":"image/x-portable-pixmap","data":")" + ppm + R"("}},{"type":"text","text":"after"}]}]}]})"}
     };
     auto bad_request = [](const auto& obj, Protocol protocol, bool loaded) {
         try { (void)parse_request(obj, protocol, loaded); }
@@ -2072,8 +2075,11 @@ void test_stage7b_images_and_protocols() {
         const auto parsed = parse_request(obj, protocol, true);
         const auto prompt = render_prompt(parsed, tok);
         if (prompt.images.size() != 1 || prompt.images[0]->rgb != std::vector<uint8_t>{255,0,0} ||
-            prompt.text.find(image_placeholder) == std::string::npos ||
-            (protocol == Protocol::chat && prompt.text.find("before<image>after") == std::string::npos))
+            prompt.image_offsets.size() != 1 ||
+            prompt.text.substr(prompt.image_offsets[0], image_placeholder.size()) != image_placeholder ||
+            (json.find("literal <image>") != std::string::npos &&
+             (prompt.text.find(image_placeholder) >= prompt.image_offsets[0] ||
+              prompt.text.substr(prompt.image_offsets[0] - 6, 18) != "before<image>after")))
             throw std::runtime_error("Image request or prompt order");
         bad_request(obj, protocol, false);
         auto broken = json;
@@ -2083,7 +2089,10 @@ void test_stage7b_images_and_protocols() {
         broken.replace(broken.find(ppm), ppm.size(), "QUJDRA==");
         bad_request(JsonValue::parse(broken).as_object(), protocol, true);
     }
-    std::cout << "  [PASS] PNG stored/fixed/dynamic, BMP/PPM/PGM, three image protocols and 400 paths\n";
+    const std::vector<uint8_t> cr_raster{'P','6','\n','1',' ','1','\n','2','5','5','\r',0x0a,20,30};
+    if (decode_image(cr_raster).rgb != std::vector<uint8_t>{10,20,30})
+        throw std::runtime_error("Binary PPM CR delimiter must preserve first LF pixel byte");
+    std::cout << "  [PASS] PNG, BMP/PPM/PGM, CR raster, literal image marker and Anthropic tool-result image\n";
 }
 
 #ifdef FUSIONRT_ENABLE_CUDA
@@ -2188,6 +2197,17 @@ void test_stage7b_cuda_vision() {
     images[0] = &green;
     const auto b = encode_vision_prompt(ctx, vision, tokenizer, "A<image>Z", images, 64);
     if (a.tokens != b.tokens || a.inputs_embeds[0].rows.shape[0] != 4) throw std::runtime_error("Image placeholder geometry");
+    {
+        agent::AgentRequest request;
+        request.messages.push_back({agent::Role::user, {std::string("literal <image> "), red, std::string("end")}});
+        const auto rendered = agent::render_prompt(request, tokenizer);
+        const auto with_literal = encode_vision_prompt(ctx, vision, tokenizer, rendered.text, rendered.images,
+                                                       rendered.image_offsets, 64);
+        const auto plain = tokenizer.encode("user: literal <image> ");
+        if (with_literal.inputs_embeds.size() != 1 || with_literal.inputs_embeds[0].start != static_cast<int>(plain.size()) ||
+            !std::equal(plain.begin(), plain.end(), with_literal.tokens.begin()))
+            throw std::runtime_error("Literal <image> must remain text before the CUDA image splice");
+    }
     HybridModelConfig cfg;
     cfg.vocab_size = tokenizer.vocab_size();
     cfg.num_layers = 2;
@@ -2269,7 +2289,7 @@ void test_stage7a_json() {
         for (int budget = 32; budget > 0 && !grammar.sealed(); --budget) {
             for (auto& logit : logits) logit = score(rng);
             logits[tok.eos_id()] = logits[invalid] = std::numeric_limits<float>::infinity();
-            constraint.mask(logits.data(), grammar, budget);
+            constraint.mask(logits, grammar, budget);
             const auto token = Sampler::sample(logits.data(), tok.vocab_size(), ids, params, rng);
             check(constraint.accept(grammar, token), "Sampler chose a masked JSON token");
             ids.push_back(token);
@@ -2277,20 +2297,226 @@ void test_stage7a_json() {
         check(grammar.complete() && JsonValue::parse(tok.decode(ids)).is_object(), "Constrained sample must parse");
     }
 
-    using agent::JsonMode;
     using agent::Protocol;
     const auto parse = [](std::string_view json, Protocol protocol) {
         return agent::parse_request(JsonValue::parse(std::string(json)).as_object(), protocol).generation.json;
     };
     check(parse(R"({"messages":[{"role":"user","content":"test"}],"response_format":{"type":"json_object"}})",
-                Protocol::chat) == JsonMode::object, "Chat JSON object format");
+                Protocol::chat) == JsonRoot::object, "Chat JSON object format");
     check(parse(R"({"input":"test","response_format":{"type":"json_schema","json_schema":{"schema":{"type":"object"}}}})",
-                Protocol::responses) == JsonMode::object, "Responses JSON schema format");
+                Protocol::responses) == JsonRoot::object, "Responses JSON schema format");
     check(parse(R"({"input":"test","text":{"format":{"type":"json_schema","schema":{"type":"array"}}}})",
-                Protocol::responses) == JsonMode::value, "Responses native text format");
+                Protocol::responses) == JsonRoot::array, "Responses native text format");
+}
+
+void test_review_input_validation() {
+    using agent::Protocol;
+    auto reject = [](auto operation) {
+        try { operation(); }
+        catch (const std::invalid_argument&) { return; }
+        throw std::runtime_error("Invalid input was accepted");
+    };
+    for (const bool object : {false, true}) {
+        std::string opening;
+        for (int depth = 0; depth < 128; ++depth) opening += object ? "{\"k\":" : "[";
+        const std::string closing(128, object ? '}' : ']');
+        const auto valid = opening + "null" + closing;
+        (void)JsonValue::parse(valid);
+        const std::string nested = opening + (object ? "{}" : "[]") + closing;
+        bool exceeds = false;
+        try { (void)JsonValue::parse(nested); }
+        catch (const std::runtime_error& e) { exceeds = std::string_view(e.what()) == "JSON nesting depth exceeded"; }
+        JsonGrammarState grammar;
+        if (!exceeds || grammar.consume(nested) || !grammar.consume(valid) || !grammar.complete())
+            throw std::runtime_error("JSON nesting limit mismatch");
+    }
+    auto parse = [](const char* text, Protocol protocol) {
+        return agent::parse_request(JsonValue::parse(text).as_object(), protocol);
+    };
+    reject([&] { parse(R"({"input":"test","text":{"format":{"type":"json_schema","schema":{"type":"object","required":["x"]}}}})", Protocol::responses); });
+    reject([&] { parse(R"({"messages":[{"role":"user","content":"test"}],"response_format":{"type":"json_object"},"tools":[{"type":"function","function":{"name":"demo"}}],"tool_choice":"auto"})", Protocol::chat); });
+    auto params = parse(R"({"messages":[{"role":"user","content":"test"}],"response_format":{"type":"json_object"}})", Protocol::chat).generation;
+    for (const bool stream : {false, true}) {
+        params.stream = stream;
+        params.max_tokens = 0;
+        reject([&] { (void)agent::generation_limit(params, 32, 10); });
+        params.max_tokens = 5;
+        reject([&] { (void)agent::generation_limit(params, 32, 32); });
+        if (agent::generation_limit(params, 32, 31) != 1) throw std::runtime_error("Effective JSON output limit");
+    }
+    JsonGrammarState array(JsonRoot::array), integer(JsonRoot::integer);
+    if (array.consume("{}") || !array.consume("[]") || !array.complete() ||
+        integer.consume("1.5") || !integer.consume("-42") || !integer.complete())
+        throw std::runtime_error("JSON schema root constraint");
+    BpeTokenizer tok;
+    tok.init_byte_fallback();
+    JsonConstraint constraint(tok, tok.vocab_size(), JsonRoot::array);
+    std::vector<float> logits(tok.vocab_size() - 1);
+    reject([&] { constraint.mask(logits, constraint.initial_state(), 2); });
+    logits.resize(tok.vocab_size(), 0.0f);
+    auto grammar = constraint.initial_state();
+    constraint.mask(logits, grammar, 2);
+    if (logits[tok.encode("[", false).front()] != 0.0f || std::isfinite(logits[tok.encode("{", false).front()]))
+        throw std::runtime_error("JSON array mask admits a different root");
+
+    std::optional<Protocol> route;
+    const auto accepted = http::parse_request_head("POST /v1/messages HTTP/1.1\r\nContent-Length: 16777216", route);
+    if (accepted.content_length != 16777216 || route != Protocol::messages) throw std::runtime_error("HTTP body limit boundary");
+    for (const auto* length : {"16777217", "18446744073709551616"}) {
+        for (const auto* path : {"/v1/messages", "/v1/responses"}) {
+            const bool anthropic = std::string_view(path) == "/v1/messages";
+            bool oversized = false;
+            try {
+                (void)http::parse_request_head(std::string("POST ") + path + "?mode=test HTTP/1.1\r\nContent-Length: " + length, route);
+            } catch (const http::PayloadTooLarge& e) {
+                const auto body = http::error_body(e.status, e.what(), route);
+                const auto& detail = body.at("error").as_object();
+                oversized = std::string_view(e.status) == "413 Payload Too Large" &&
+                    route == (anthropic ? Protocol::messages : Protocol::responses) &&
+                    body.contains("type") == anthropic &&
+                    detail.at("type").as_string() == (anthropic ? "request_too_large" : "invalid_request_error");
+            }
+            if (!oversized) throw std::runtime_error("HTTP 413 must preserve the route's error envelope");
+        }
+    }
+    for (const auto* option : {"--spec-ngram", "--draft-tokens", "--max-seq", "--steps", "--port"}) {
+        for (const auto* value : {"0junk", "4junk", "2147483648"})
+            reject([&] { (void)cli::parse_integer(option, value); });
+        if (cli::parse_integer(option, "4") != 4) throw std::runtime_error("CLI integer parser rejected a valid value");
+    }
+    std::cout << "  [PASS] JSON nesting, schema/root and tool choice, JSON output budget, HTTP 413, and strict CLI integers\n";
+}
+
+void test_review_gguf_validation() {
+    struct Fixture {
+        std::string path = "test-review-gguf.gguf";
+        ~Fixture() { std::error_code error; std::filesystem::remove(path, error); }
+    } fixture;
+    std::string error;
+    for (const auto dtype : {DType::F16, DType::BF16, DType::F32, DType::I32, DType::Q6_K}) {
+        const int cols = dtype == DType::Q6_K ? 256 : 4;
+        const HostTensor weight({cols}, dtype);
+        GgufFile gguf;
+        if (!GgufFile::write_v3(fixture.path, {}, {{"v", weight}, {"next", weight}}, &error) ||
+            !gguf.load(fixture.path, &error)) throw std::runtime_error(error);
+        gguf = {};
+        constexpr int first_tensor_offset = 24 + 8 + 1 + 4 + 8 + 4;
+        {
+            std::fstream file(fixture.path, std::ios::in | std::ios::out | std::ios::binary);
+            file.seekp(first_tensor_offset);
+            file.put(dtype == DType::F32 || dtype == DType::I32 ? '\x02' : '\x01');
+            if (!file) throw std::runtime_error("Could not construct misaligned GGUF fixture");
+        }
+        if (gguf.load(fixture.path, &error) || !error.starts_with("Misaligned GGUF tensor offset"))
+            throw std::runtime_error("GGUF must reject misaligned data");
+    }
+    {
+        const std::map<std::string, GgufMetaValue> meta{
+            {"tokenizer.ggml.model", std::string("gemma4")},
+            {"tokenizer.ggml.tokens", std::vector<std::string>{"a", "\xe2\x96\x81", "b"}}
+        };
+        GgufFile gguf;
+        BpeTokenizer tokenizer;
+        if (!GgufFile::write_v3(fixture.path, meta, {}, &error) || !gguf.load(fixture.path, &error) ||
+            !tokenizer.load_from_gguf(gguf) || tokenizer.encode("a b", false) != std::vector<int32_t>{0,1,2})
+            throw std::runtime_error("Gemma 4 must normalize spaces with an empty merge table");
+    }
+    const std::map<std::string, GgufMetaValue> meta{
+        {"general.architecture", std::string("moe")}, {"moe.block_count", uint32_t{1}},
+        {"moe.embedding_length", uint32_t{8}}, {"moe.attention.head_count", uint32_t{1}},
+        {"moe.expert_count", uint32_t{2}}, {"moe.expert_feed_forward_length", uint32_t{4}}
+    };
+    std::vector<std::pair<std::string, HostTensor>> weights{
+        {"token_embd.weight", HostTensor({8,8}, DType::F32)}, {"output_norm.weight", HostTensor({8}, DType::F32)},
+        {"blk.0.ffn_norm.weight", HostTensor({8}, DType::F32)}, {"blk.0.ffn_gate_inp.weight", HostTensor({2,8}, DType::F32)}
+    };
+    for (int e = 0; e < 2; ++e) {
+        const auto suffix = std::to_string(e) + ".weight";
+        weights.emplace_back("blk.0.ffn_gate." + suffix, HostTensor({4,8}, DType::F32));
+        weights.emplace_back("blk.0.ffn_up." + suffix, HostTensor({4,8}, DType::F32));
+        weights.emplace_back("blk.0.ffn_down." + suffix, HostTensor({8,4}, DType::F32));
+    }
+    if (!GgufFile::write_v3(fixture.path, meta, weights, &error)) throw std::runtime_error(error);
+    {
+        model_io::LoadedModelRaw raw;
+        if (!model_io::parse_gguf_model_raw(fixture.path, 16, raw, &error)) throw std::runtime_error(error);
+    }
+    weights[7].second = HostTensor({3,8}, DType::F32);
+    weights[8].second = HostTensor({5,8}, DType::F32);
+    model_io::LoadedModelRaw raw;
+    if (!GgufFile::write_v3(fixture.path, meta, weights, &error) ||
+        model_io::parse_gguf_model_raw(fixture.path, 16, raw, &error) ||
+        !error.starts_with("Invalid GGUF individual expert FFN shapes"))
+        throw std::runtime_error("GGUF loader accepted mismatched per-expert gate/up widths");
+    std::cout << "  [PASS] GGUF scalar/block alignment, individual expert shapes and Gemma 4 empty merges\n";
 }
 
 #ifdef FUSIONRT_ENABLE_CUDA
+void test_review_cuda_kernels(CudaContext& ctx) {
+    auto& arena = ctx.scratch_arena();
+    const auto mark = arena.mark();
+    auto buffer = arena.alloc_tensor({4}, DType::F32);
+    auto captured_grid = [&](auto launch) {
+        FUSIONRT_CUDA_CHECK(cudaStreamBeginCapture(ctx.stream(), cudaStreamCaptureModeThreadLocal));
+        launch(buffer.ptr<float>());
+        cudaGraph_t raw = nullptr;
+        FUSIONRT_CUDA_CHECK(cudaStreamEndCapture(ctx.stream(), &raw));
+        std::unique_ptr<std::remove_pointer_t<cudaGraph_t>, decltype(&cudaGraphDestroy)> graph(raw, cudaGraphDestroy);
+        cudaGraphNode_t node = nullptr;
+        size_t count = 1;
+        FUSIONRT_CUDA_CHECK(cudaGraphGetNodes(graph.get(), &node, &count));
+        if (count != 1) throw std::runtime_error("Expected a single captured CUDA kernel");
+        cudaKernelNodeParams params{};
+        FUSIONRT_CUDA_CHECK(cudaGraphKernelNodeGetParams(node, &params));
+        return params.gridDim;
+    };
+    // Inspect the actual launch without allocating gigabytes of attention inputs.
+    const auto gqa = captured_grid([&](float* p) {
+        cuda_ops::gqa_prefill_causal_f32(p, p, p, p, 32768, 32, 2, 512, 0, 32768, 1.0f, ctx.stream());
+    });
+    if (gqa.x != 65536 || gqa.y != 2) throw std::runtime_error("HD512 prefill grid must fit CUDA's Y dimension");
+    const auto ple = captured_grid([&](float* p) {
+        cuda_ops::gemma_ple_gate_f32(p, p, p, 65536, 32769, 32769, 0, ctx.stream());
+    });
+    if (ple.x != (uint64_t{65536} * 32769 + 255) / 256) throw std::runtime_error("Large Gemma PLE grid overflow");
+
+    bool invalid_router = false;
+    try {
+        cuda_ops::moe_topk_router_f32(nullptr, nullptr, nullptr, 8, 5, true, ctx.stream(), nullptr, true, 1.0f, 2, 1);
+    } catch (const std::invalid_argument&) {
+        invalid_router = true;
+    }
+    if (!invalid_router) throw std::runtime_error("Grouped router accepted more experts than the selected groups contain");
+
+    auto upload = [&](std::initializer_list<float> values, std::vector<int64_t> dims) {
+        auto host = HostTensor::create(dims, DType::F32);
+        std::copy(values.begin(), values.end(), host.data<float>());
+        return ctx.upload(host, false);
+    };
+    const auto gate = upload({1, 2}, {2}), up = upload({2, 3}, {2});
+    cuda_ops::swiglu_f32(gate.ptr<float>(), up.ptr<float>(), up.ptr<float>(), 2, ctx.stream());
+    cuda_ops::add_residual_f32(gate.ptr<float>(), up.ptr<float>(), up.ptr<float>(), 2, ctx.stream());
+    const auto updated = ctx.download(up);
+    expect_close({updated.data<float>(), updated.data<float>() + 2},
+                 {1 + 2 / (1 + std::exp(-1.0)), 2 + 6 / (1 + std::exp(-2.0))},
+                 1e-6, 1e-6, "Aliased up/output and residual/output");
+
+    const auto q = upload({-1e20f, 0, 0}, {1,3});
+    const auto kv = upload({1, 0, 0}, {1,3});
+    const auto norm = upload({1e20f}, {1});
+    const auto k_b = upload({1}, {1,1,1}), v_b = upload({1}, {1,1,1});
+    const auto frequency = upload({1}, {1});
+    const auto cache = make_cuda_kv_view(arena, DType::F32, 1, 1, 3, true);
+    auto* page = static_cast<uint8_t*>(arena.alloc(cache.page_bytes()));
+    FUSIONRT_CUDA_CHECK(cudaMemcpyAsync(cache.pages, &page, sizeof(page), cudaMemcpyHostToDevice, ctx.stream()));
+    auto absorbed = arena.alloc_tensor({3}, DType::F32), latent = arena.alloc_tensor({1}, DType::F32);
+    cuda_ops::mla_attention_f32(q.ptr<float>(), kv.ptr<float>(), norm.ptr<float>(), k_b, v_b, frequency.ptr<float>(),
+        absorbed.ptr<float>(), latent.ptr<float>(), buffer.ptr<float>(), cache, 1, 1, 3, 0, nullptr, 1e-6f, 1.0f, 1.0f, ctx.stream());
+    if (ctx.download(buffer).data<float>()[0] != 0.0f) throw std::runtime_error("All -Inf MLA scores must produce zero");
+    arena.reset(mark);
+    std::cout << "  [PASS] HD512 grid.x=65536, 64-bit PLE, MoE launch validation and all-masked MLA zero output\n";
+}
+
 void test_stage7a_speculative() {
     std::cout << "Testing prompt lookup and draft model CUDA token parity...\n";
     CudaContext ctx(0, 32, 32);
@@ -2336,6 +2562,94 @@ void test_stage7a_speculative() {
         }
         ctx.weight_arena().reset(mark);
     }
+}
+
+void test_review_speculation() {
+    CudaContext ctx(0, 32, 8);
+    constexpr int H = 256, V = 32;
+    struct Fixture {
+        std::string path = "test-review-speculation.gguf";
+        ~Fixture() { std::error_code error; std::filesystem::remove(path, error); }
+    } fixture;
+    const std::map<std::string, GgufMetaValue> meta{
+        {"general.architecture", std::string("qwen3")}, {"qwen3.block_count", uint32_t{1}},
+        {"qwen3.embedding_length", uint32_t{H}}, {"qwen3.attention.head_count", uint32_t{4}},
+        {"qwen3.attention.head_count_kv", uint32_t{1}}, {"qwen3.feed_forward_length", uint32_t{H}}
+    };
+    HostTensor embeddings({V,H}, DType::F32), lm_head({V,H}, DType::Q4_0);
+    for (int i = 0; i < V; ++i) {
+        auto* row = embeddings.data<float>() + i * H;
+        row[0] = 1.0f;
+        row[1] = 0.501f;
+        row[2] = 0.5001f;
+    }
+    auto* blocks = lm_head.data<BlockQ4_0>();
+    for (int i = 0; i < V * H / 32; ++i) {
+        blocks[i].d = 0x3c00;
+        std::fill_n(blocks[i].qs, 16, uint8_t{0x88});
+    }
+    // Token 1 wins in FP32, but channels 1 and 2 quantize to the same value in the decode activation.
+    blocks[H / 32].qs[1] = 0x89;
+    blocks[H / 32].qs[2] = 0x87;
+    const std::vector<std::pair<std::string, HostTensor>> weights{
+        {"token_embd.weight", std::move(embeddings)}, {"output.weight", std::move(lm_head)},
+        {"output_norm.weight", make_ones_f32({H})},
+        {"blk.0.attn_norm.weight", make_ones_f32({H})}, {"blk.0.ffn_norm.weight", make_ones_f32({H})},
+        {"blk.0.attn_q.weight", HostTensor({H,H}, DType::F32)}, {"blk.0.attn_k.weight", HostTensor({64,H}, DType::F32)},
+        {"blk.0.attn_v.weight", HostTensor({64,H}, DType::F32)}, {"blk.0.attn_output.weight", HostTensor({H,H}, DType::F32)},
+        {"blk.0.ffn_gate.weight", HostTensor({H,H}, DType::F32)}, {"blk.0.ffn_up.weight", HostTensor({H,H}, DType::F32)},
+        {"blk.0.ffn_down.weight", HostTensor({H,H}, DType::F32)}
+    };
+    std::string error;
+    FusionModel target(HybridModelConfig{}), draft(HybridModelConfig{});
+    if (!GgufFile::write_v3(fixture.path, meta, weights, &error) ||
+        !target.load_gguf(ctx, fixture.path, &error, 64, true) ||
+        !draft.load_gguf(ctx, fixture.path, &error, 64, true)) throw std::runtime_error(error);
+    const std::vector<int32_t> invalid{-9, INT32_MAX, 0, INT32_MAX, -9, V - 1}, valid{0,V - 1,0,V - 1,0,V - 1};
+    const auto baseline = target.generate_cuda(ctx, valid, 10, false, false);
+    if (!std::all_of(baseline.begin() + valid.size(), baseline.end(), [](int32_t id) { return id == 0; }))
+        throw std::runtime_error("Quantized speculative regression fixture must tie at token 0");
+    GenerationStats stats;
+    GenerationOptions options;
+    options.draft_model = &draft;
+    if (target.generate_cuda(ctx, invalid, 10, false, false, &stats, false, 0, -1, options) != baseline ||
+        stats.spec_proposed == 0 || stats.spec_accepted != stats.spec_proposed)
+        throw std::runtime_error("Unfused draft verification changed quantized decode or did not clamp prompt IDs");
+    options.draft_model = nullptr;
+    options.spec_ngram = 4;
+    if (target.generate_cuda(ctx, invalid, 10, false, false, &stats, false, 0, -1, options) != baseline ||
+        stats.spec_proposed == 0)
+        throw std::runtime_error("Prompt lookup must use clamped IDs");
+    BpeTokenizer tok;
+    tok.init_byte_fallback();
+    JsonConstraint mismatched(tok, V + 1, true);
+    options.json_constraint = &mismatched;
+    bool rejected = false;
+    try { (void)target.generate_cuda(ctx, valid, 10, false, false, nullptr, false, 0, -1, options); }
+    catch (const std::invalid_argument&) { rejected = true; }
+    if (!rejected) throw std::runtime_error("CUDA generation accepted a mismatched JSON vocabulary");
+
+    HybridModelConfig cfg;
+    cfg.vocab_size = 8192;
+    cfg.num_layers = 1;
+    cfg.dense.hidden_size = cfg.dense.head_dim = 64;
+    cfg.dense.num_attention_heads = cfg.dense.num_key_value_heads = 1;
+    cfg.dense.intermediate_size = 64;
+    cfg.dense.max_seq_len = 64;
+    FusionModel wide(cfg);
+    wide.init_synthetic(ctx, 9);
+    auto& arena = ctx.scratch_arena();
+    const auto mark = arena.mark();
+    ctx.set_prefill_batch(2);
+    arena.alloc(arena.capacity() - arena.used() - 96 * 1024);
+    const auto ordinary = wide.generate_cuda(ctx, valid, 4, true, false);
+    options.json_constraint = nullptr;
+    if (wide.prefill_batch_limit(ctx) != 2 || wide.prefill_batch_limit(ctx, true) != 1 ||
+        wide.generate_cuda(ctx, valid, 4, true, false, &stats, false, 0, -1, options) != ordinary ||
+        stats.spec_proposed != 0)
+        throw std::runtime_error("Speculation must fall back when two verification logits rows do not fit");
+    arena.reset(mark);
+    std::cout << "  [PASS] Unfused quantized verification, clamped draft/lookup IDs, vocabulary guard and scratch fallback\n";
 }
 #endif
 
@@ -3263,9 +3577,13 @@ int main() {
         test_wave3();
         test_stage7a_json();
         test_stage7b_images_and_protocols();
+        test_review_input_validation();
+        test_review_gguf_validation();
         test_stage7c_mla();
 #ifdef FUSIONRT_ENABLE_CUDA
+        test_review_cuda_kernels(cuda_ctx);
         test_stage7a_speculative();
+        test_review_speculation();
         test_stage7b_cuda_vision();
         test_chunked_prefill_and_k_quant_gdn();
         test_cuda_session_slots();

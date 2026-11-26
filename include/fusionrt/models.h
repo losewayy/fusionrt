@@ -322,8 +322,9 @@ public:
     void set_device_profile(CudaContext& ctx, const DeviceProfile& profile);
     bool recommended_cuda_graph() const { return recommend_cuda_graph_; }
     ModelMemory cuda_cache_memory() const;
+    DType cuda_kv_dtype() const { return cuda_kv_dtype_; }
     ModelMemory inspect_cuda(CudaContext& ctx);
-    int prefill_batch_limit(CudaContext& ctx) const;
+    int prefill_batch_limit(CudaContext& ctx, bool verify = false) const;
 
     const std::vector<CudaDenseGQALayer>& dense_layers() const { return dense_layers_; }
     const std::vector<CudaGatedDeltaNetLayer>& gdn_layers() const { return gdn_layers_; }

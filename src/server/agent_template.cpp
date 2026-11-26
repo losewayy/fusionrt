@@ -76,8 +76,10 @@ AgentPrompt render_prompt(const AgentRequest& req, const BpeTokenizer& tokenizer
     for (const auto& msg : req.messages) {
         if (msg.role == Role::system) continue;
         std::string content;
+        std::vector<size_t> image_offsets;
         bool pending = false;
         auto add_image = [&](const Image& image) {
+            image_offsets.push_back(content.size());
             content += image_placeholder;
             prompt.images.push_back(&image);
             pending = true;
@@ -88,8 +90,10 @@ AgentPrompt render_prompt(const AgentRequest& req, const BpeTokenizer& tokenizer
         }
         auto flush = [&] {
             if (!pending) return;
-            messages.push_back({msg.role == Role::assistant ? "assistant" : "user", std::move(content)});
+            messages.push_back({msg.role == Role::assistant ? "assistant" : "user", std::move(content),
+                                std::move(image_offsets)});
             content.clear();
+            image_offsets.clear();
             pending = false;
             last_was_result = false;
         };
@@ -106,14 +110,31 @@ AgentPrompt render_prompt(const AgentRequest& req, const BpeTokenizer& tokenizer
                 pending = true;
             } else if (const auto* result = std::get_if<ToolResult>(&block)) {
                 flush();
-                const std::string value = (result->is_error ? "Tool error: " : "") + result->content;
-                if (llama) {
-                    messages.push_back({"ipython", JsonValue(value).dump(0)});
-                } else {
-                    auto wrapped = "<tool_response>\n" + value + "\n</tool_response>";
-                    if (last_was_result) messages.back().content += '\n' + wrapped;
-                    else messages.push_back({"user", std::move(wrapped)});
+                ChatMessage reply{llama ? "ipython" : "user", llama ? "\"" : "<tool_response>\n"};
+                auto append_text = [&](std::string_view text) {
+                    if (llama) {
+                        const auto quoted = JsonValue(std::string(text)).dump(0);
+                        reply.content.append(quoted, 1, quoted.size() - 2);
+                    } else reply.content += text;
+                };
+                if (result->is_error) append_text("Tool error: ");
+                size_t pos = 0;
+                const std::string_view value = result->content;
+                for (const auto& attachment : result->images) {
+                    append_text(value.substr(pos, attachment.offset - pos));
+                    reply.image_offsets.push_back(reply.content.size());
+                    reply.content += image_placeholder;
+                    prompt.images.push_back(&attachment.image);
+                    pos = attachment.offset;
                 }
+                append_text(value.substr(pos));
+                reply.content += llama ? "\"" : "\n</tool_response>";
+                if (!llama && last_was_result) {
+                    auto& previous = messages.back();
+                    previous.content += '\n';
+                    for (const auto offset : reply.image_offsets) previous.image_offsets.push_back(previous.content.size() + offset);
+                    previous.content += reply.content;
+                } else messages.push_back(std::move(reply));
                 last_was_result = true;
             }
         }
@@ -123,16 +144,23 @@ AgentPrompt render_prompt(const AgentRequest& req, const BpeTokenizer& tokenizer
         const auto user = std::find_if(messages.begin(), messages.end(), [](const ChatMessage& msg) {
             return msg.role == "user";
         });
-        if (user != messages.end()) user->content.insert(0, instructions);
+        if (user != messages.end()) {
+            user->content.insert(0, instructions);
+            for (auto& offset : user->image_offsets) offset += instructions.size();
+        }
     }
-    prompt.text = tokenizer.format_chat_messages(messages);
+    prompt.text = tokenizer.format_chat_messages(messages, true, &prompt.image_offsets);
     if (llama_tools_in_user && !instructions.empty()) {
         const auto date = prompt.text.find("Cutting Knowledge Date: December 2023");
-        if (date != std::string::npos) prompt.text.insert(date, "Environment: ipython\n");
+        if (date != std::string::npos) {
+            constexpr std::string_view environment = "Environment: ipython\n";
+            prompt.text.insert(date, environment);
+            for (auto& offset : prompt.image_offsets) if (offset >= date) offset += environment.size();
+        }
     }
     prompt.llama_calls = llama && !req.tools.empty() && req.choice != Choice::none;
     prompt.open_thought = prompt.text.ends_with("<think>\n");
-    if (prompt.open_thought && req.generation.json != JsonMode::none) {
+    if (prompt.open_thought && req.generation.json) {
         prompt.text += "\n</think>\n\n";
         prompt.open_thought = false;
     }

@@ -13,12 +13,14 @@ class JsonParser {
 public:
     explicit JsonParser(const std::string& s) : s_(s) {}
 
-    JsonValue parse_value() {
+    JsonValue parse_value(int depth = 0) {
         skip_ws();
         if (pos_ >= s_.size()) throw std::runtime_error("Unexpected end of JSON");
         char c = s_[pos_];
-        if (c == '{') return parse_object();
-        if (c == '[') return parse_array();
+        if (c == '{' || c == '[') {
+            if (depth >= kMaxJsonNesting) throw std::runtime_error("JSON nesting depth exceeded");
+            return c == '{' ? parse_object(depth + 1) : parse_array(depth + 1);
+        }
         if (c == '"') return JsonValue(parse_string());
         if (c == 't') { expect("true"); return JsonValue(true); }
         if (c == 'f') { expect("false"); return JsonValue(false); }
@@ -150,13 +152,13 @@ private:
         return JsonValue(static_cast<int64_t>(std::stoll(sub)));
     }
 
-    JsonValue parse_array() {
+    JsonValue parse_array(int depth) {
         ++pos_;
         JsonArray arr;
         skip_ws();
         if (pos_ < s_.size() && s_[pos_] == ']') { ++pos_; return JsonValue(std::move(arr)); }
         while (true) {
-            arr.push_back(parse_value());
+            arr.push_back(parse_value(depth));
             skip_ws();
             if (pos_ < s_.size() && s_[pos_] == ',') { ++pos_; continue; }
             if (pos_ < s_.size() && s_[pos_] == ']') { ++pos_; break; }
@@ -165,7 +167,7 @@ private:
         return JsonValue(std::move(arr));
     }
 
-    JsonValue parse_object() {
+    JsonValue parse_object(int depth) {
         ++pos_;
         JsonObject obj;
         skip_ws();
@@ -176,7 +178,7 @@ private:
             skip_ws();
             if (pos_ >= s_.size() || s_[pos_] != ':') throw std::runtime_error("Expected ':'");
             ++pos_;
-            obj[std::move(key)] = parse_value();
+            obj[std::move(key)] = parse_value(depth);
             skip_ws();
             if (pos_ < s_.size() && s_[pos_] == ',') { ++pos_; continue; }
             if (pos_ < s_.size() && s_[pos_] == '}') { ++pos_; break; }
