@@ -262,8 +262,8 @@ void CudaModelWeights::init_synthetic(CudaContext& ctx, uint64_t seed, const Cud
         }
     }
     ctx.synchronize();
-    hooks.start_sessions(ctx.kv_dtype(), 0);
     rebuild_ir();
+    hooks.start_sessions(ctx.kv_dtype(), 0);
 }
 
 static bool upload_raw_model_to_cuda(CudaContext& ctx, CudaArena& arena, LoadedModelRaw& raw,
@@ -479,6 +479,7 @@ static size_t cuda_model_arena_bytes(const LoadedModelRaw& raw, const CostHardwa
     reserve(sizeof(float) * static_cast<size_t>(d.hidden_size));
     reserve(sizeof(float) * static_cast<size_t>(raw.cfg.vocab_size));
     reserve(sizeof(int32_t) * (1 + static_cast<size_t>(d.max_seq_len)));
+    reserve(sizeof(int32_t));
     reserve(sizeof(int32_t));
     reserve(sizeof(int32_t));
     if (raw.layers.size() > static_cast<size_t>(raw.cfg.num_layers)) {
@@ -748,17 +749,20 @@ bool CudaModelWeights::load_gguf(CudaContext& ctx, const std::string& path, std:
         return false;
     }
     if (!load_mtp_) raw.layers.resize(raw.cfg.num_layers);
-    mtp_ = {};
-    hooks.release_sessions();
-    if (!own_weights) gguf_weights_.release();
     auto& weights = own_weights ? gguf_weights_ : ctx.weight_arena();
+    if (!own_weights) settings.releasable_session_bytes += gguf_weights_.capacity();
     const bool resize = own_weights || weights.capacity() == 0 || owned_gguf_arena_ == &ctx;
     DType kv_dtype;
     const auto kv_budget = place_cuda_experts(ctx, raw, moe_gpu_experts_override_, settings.requested_kv_bytes,
-        settings.commitment_tokens, settings.slots, kv_dtype, resize, resize ? weights.capacity() : 0);
+        settings.commitment_tokens, settings.slots, kv_dtype, resize,
+        settings.releasable_session_bytes + (resize ? weights.capacity() : 0));
+    const size_t bytes = resize ? cuda_model_arena_bytes(raw, ctx.cost_hardware(), raw.cfg.gpu_experts) : 0;
+    ctx.synchronize();
+    hooks.release_sessions();
+    mtp_ = {};
+    if (!own_weights) gguf_weights_.release();
     hooks.set_placement(kv_dtype, kv_budget);
     if (resize) {
-        const size_t bytes = cuda_model_arena_bytes(raw, ctx.cost_hardware(), raw.cfg.gpu_experts);
         if (weights.capacity() != bytes) weights.init(bytes);
         else weights.reset();
         if (!own_weights) owned_gguf_arena_ = &ctx;
@@ -782,8 +786,8 @@ bool CudaModelWeights::load_gguf(CudaContext& ctx, const std::string& path, std:
         hooks.allocate_mtp_hidden(weights, cfg_.dense.max_seq_len, cfg_.dense.hidden_size);
         ctx.synchronize();
     }
-    hooks.start_sessions(kv_dtype, resize && moe_gpu_experts_override_ < 0 && kv_budget ? moe_layers_.size() : 0);
     rebuild_ir();
+    hooks.start_sessions(kv_dtype, resize && moe_gpu_experts_override_ < 0 && kv_budget ? moe_layers_.size() : 0);
     return true;
 }
 
@@ -795,16 +799,18 @@ bool CudaModelWeights::load_safetensors(CudaContext& ctx, const std::string& pat
         return false;
     }
     if (!parse_safetensors_model_raw(path, max_seq_override, raw, err)) return false;
-    mtp_ = {};
-    hooks.release_sessions();
     auto& weights = ctx.weight_arena();
     const bool resize = weights.capacity() == 0 || owned_gguf_arena_ == &ctx;
     DType kv_dtype;
     const auto kv_budget = place_cuda_experts(ctx, raw, moe_gpu_experts_override_, settings.requested_kv_bytes,
-        settings.commitment_tokens, settings.slots, kv_dtype, resize, resize ? weights.capacity() : 0);
+        settings.commitment_tokens, settings.slots, kv_dtype, resize,
+        settings.releasable_session_bytes + (resize ? weights.capacity() : 0));
+    const size_t bytes = resize ? cuda_model_arena_bytes(raw, ctx.cost_hardware(), raw.cfg.gpu_experts) : 0;
+    ctx.synchronize();
+    hooks.release_sessions();
+    mtp_ = {};
     hooks.set_placement(kv_dtype, kv_budget);
     if (resize) {
-        const auto bytes = cuda_model_arena_bytes(raw, ctx.cost_hardware(), raw.cfg.gpu_experts);
         if (weights.capacity() != bytes) weights.init(bytes);
         else weights.reset();
         owned_gguf_arena_ = &ctx;
@@ -814,8 +820,8 @@ bool CudaModelWeights::load_safetensors(CudaContext& ctx, const std::string& pat
                                     layer_kinds_, layer_indices_, dense_layers_, gdn_layers_, moe_layers_)) {
         return false;
     }
-    hooks.start_sessions(kv_dtype, resize && moe_gpu_experts_override_ < 0 && kv_budget ? moe_layers_.size() : 0);
     rebuild_ir();
+    hooks.start_sessions(kv_dtype, resize && moe_gpu_experts_override_ < 0 && kv_budget ? moe_layers_.size() : 0);
     return true;
 }
 

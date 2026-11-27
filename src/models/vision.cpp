@@ -185,6 +185,7 @@ struct VisionEncoder::Weights {
     std::array<float, 3> mean{}, stddev{1,1,1};
     float eps = 1e-6f, theta = 0;
     int window = 0, window_pattern = 0;
+    int64_t min_pixels = 0, max_pixels = 0;
     bool qwen = false, gemma = false, gemma4 = false, rms = false, gelu = true, quick = false;
 };
 
@@ -197,6 +198,15 @@ VisionEncoder::VisionEncoder(CudaContext& ctx, const std::string& path, int text
     w.info = VisionInfo::from_gguf(file);
     const auto& g = w.info;
     w.qwen = qwen_projector(g.projector);
+    if (g.projector == "qwen3vl_merger") {
+        const int align = g.patch_size * g.spatial_merge;
+        const int64_t unit = static_cast<int64_t>(align) * align;
+        w.min_pixels = file.get_int("clip.vision.image_min_pixels", 8 * unit);
+        w.max_pixels = std::min(file.get_int("clip.vision.image_max_pixels", 4096 * unit),
+                                4096 * unit / (g.spatial_merge * g.spatial_merge));
+        if (w.min_pixels < unit || w.max_pixels < w.min_pixels)
+            throw std::invalid_argument("Invalid Qwen3-VL image pixel budget");
+    }
     w.gemma4 = gemma4_projector(g.projector);
     w.gemma = w.gemma4 || g.projector == "gemma" || g.projector == "gemma3";
     const bool qwen25 = g.projector.starts_with("qwen25") || g.projector.starts_with("qwen2.5");
@@ -376,6 +386,27 @@ VisionEmbedding VisionEncoder::encode(CudaContext& ctx, const Image& image, int 
         const auto [nx, ny] = gemma4_image_grid(image, P * merge);
         gx = nx * merge;
         gy = ny * merge;
+    } else if (w.max_pixels > 0) {
+        const int factor = P * merge;
+        const int64_t pixels = static_cast<int64_t>(image.width) * image.height;
+        const auto round_even = [&](int side) {
+            const int lower = side / factor, remainder = side % factor;
+            return std::max(1, lower + (2 * remainder > factor || (2 * remainder == factor && lower % 2)));
+        };
+        int nx = round_even(image.width), ny = round_even(image.height);
+        const auto aligned = static_cast<int64_t>(nx) * ny * factor * factor;
+        if (aligned > w.max_pixels || aligned < w.min_pixels) {
+            const bool shrink = aligned > w.max_pixels;
+            const double scale = std::sqrt(static_cast<double>(shrink ? w.max_pixels : w.min_pixels) / pixels);
+            const auto adjust = [&](int side) {
+                const double count = side * scale / factor;
+                return std::max(1, static_cast<int>(shrink ? std::floor(count) : std::ceil(count)));
+            };
+            nx = adjust(image.width);
+            ny = adjust(image.height);
+        }
+        gx = nx * merge;
+        gy = ny * merge;
     } else if (w.qwen) {
         const int side = std::max(image.width, image.height);
         gx = std::max(1, (image.width * limit + side / 2) / side) * merge;
@@ -418,7 +449,7 @@ VisionEmbedding VisionEncoder::encode(CudaContext& ctx, const Image& image, int 
         auto* dst = pixels.data<float>();
         Image resized;
         const Image* source = &image;
-        if (w.gemma4 && (image.width != gx * P || image.height != gy * P)) {
+        if ((w.gemma4 || w.max_pixels) && (image.width != gx * P || image.height != gy * P)) {
             resized = resize_gemma4_image(image, gx * P, gy * P);
             source = &resized;
         }
@@ -429,7 +460,9 @@ VisionEmbedding VisionEncoder::encode(CudaContext& ctx, const Image& image, int 
                     *dst++ = source->rgb[(static_cast<size_t>(iy) * source->width + ix) * 3 + c] / 255.f * 2.f - 1.f;
                     continue;
                 }
-                const auto sample = bilinear((ix + 0.5f) * image.width / (gx * P) - 0.5f,
+                const auto sample = w.max_pixels
+                    ? source->rgb[(static_cast<size_t>(iy) * source->width + ix) * 3 + c] / 255.f
+                    : bilinear((ix + 0.5f) * image.width / (gx * P) - 0.5f,
                     (iy + 0.5f) * image.height / (gy * P) - 0.5f, image.width, image.height,
                     [&](int sx, int sy) { return image.rgb[(static_cast<size_t>(sy) * image.width + sx) * 3 + c] / 255.f; });
                 *dst++ = (sample - w.mean[c]) / w.stddev[c];
@@ -625,7 +658,9 @@ VisionPrompt encode_vision_prompt(CudaContext& ctx, const VisionEncoder& encoder
         if (start >= 0) prompt.tokens.push_back(start);
         prompt.images.push_back(encoder.encode(ctx, *images[i], context - static_cast<int>(prompt.tokens.size()) - (end >= 0)));
         const auto& rows = prompt.images.back().rows;
-        prompt.inputs_embeds.push_back({static_cast<int>(prompt.tokens.size()), rows});
+        const auto& info = encoder.info();
+        const bool bidirectional = gemma4_projector(info.projector) && info.output_size != 1536 && info.output_size != 2560;
+        prompt.inputs_embeds.push_back({static_cast<int>(prompt.tokens.size()), rows, bidirectional});
         prompt.tokens.insert(prompt.tokens.end(), static_cast<size_t>(rows.shape[0]), pad);
         if (end >= 0) prompt.tokens.push_back(end);
         consumed = place + image_placeholder.size();

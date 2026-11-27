@@ -1,6 +1,8 @@
 #include "fusionrt/safetensors.h"
 #include "fusionrt/json.h"
+#include <algorithm>
 #include <cstring>
+#include <limits>
 #include <filesystem>
 #include <fstream>
 #include <stdexcept>
@@ -33,10 +35,8 @@ std::string st_dtype_to_str(DType dt) {
 
 bool SafetensorsFile::load(const std::string& path, std::string* err) {
     try {
-        path_ = path;
-        metadata_.clear();
-        tensors_.clear();
-        tensor_index_.clear();
+        SafetensorsFile loaded;
+        loaded.path_ = path;
 
         std::ifstream ifs(std::filesystem::path(std::u8string(path.begin(), path.end())), std::ios::binary);
         if (!ifs) {
@@ -57,7 +57,17 @@ bool SafetensorsFile::load(const std::string& path, std::string* err) {
             if (err) *err = "Failed reading safetensors JSON header";
             return false;
         }
-        data_offset_ = 8 + hdr_len;
+        loaded.data_offset_ = 8 + hdr_len;
+        ifs.seekg(0, std::ios::end);
+        const auto file_size = ifs.tellg();
+        if (file_size < 0 || static_cast<uint64_t>(file_size) < loaded.data_offset_)
+            throw std::runtime_error("Invalid safetensors file size");
+        const uint64_t payload_size = static_cast<uint64_t>(file_size) - loaded.data_offset_;
+        const auto integer = [](const JsonValue& val) {
+            if (!val.is_int() || val.as_int() < 0)
+                throw std::runtime_error("Expected non-negative safetensors integer");
+            return static_cast<uint64_t>(val.as_int());
+        };
 
         JsonValue root = JsonValue::parse(hdr_str);
         if (!root.is_object()) {
@@ -68,25 +78,56 @@ bool SafetensorsFile::load(const std::string& path, std::string* err) {
             if (key == "__metadata__") {
                 if (val.is_object()) {
                     for (const auto& [mk, mv] : val.as_object()) {
-                        if (mv.is_string()) metadata_[mk] = mv.as_string();
+                        if (mv.is_string()) loaded.metadata_[mk] = mv.as_string();
                     }
                 }
                 continue;
             }
-            if (!val.is_object()) continue;
             const auto& obj = val.as_object();
             SafetensorsEntry e;
             e.name = key;
             e.dtype = str_to_st_dtype(obj.at("dtype").as_string());
-            for (const auto& dv : obj.at("shape").as_array()) {
-                e.shape.push_back(dv.as_int());
+            const auto& dims = obj.at("shape").as_array();
+            if (dims.empty() || dims.size() > Tensor{}.shape.size())
+                throw std::runtime_error("Invalid safetensors rank for " + key);
+            uint64_t elements = 1;
+            bool empty = false;
+            for (const auto& dim : dims) {
+                const auto d = integer(dim);
+                if (d && elements > static_cast<uint64_t>(INT64_MAX) / d)
+                    throw std::runtime_error("Safetensors element count overflow for " + key);
+                elements *= std::max<uint64_t>(1, d);
+                empty |= d == 0;
+                e.shape.push_back(static_cast<int64_t>(d));
             }
             const auto& offs = obj.at("data_offsets").as_array();
-            e.begin = static_cast<uint64_t>(offs.at(0).as_int());
-            e.end = static_cast<uint64_t>(offs.at(1).as_int());
-            tensor_index_[key] = tensors_.size();
-            tensors_.push_back(std::move(e));
+            if (offs.size() != 2) throw std::runtime_error("Invalid safetensors offsets for " + key);
+            e.begin = integer(offs[0]);
+            e.end = integer(offs[1]);
+            const auto type_bytes = dtype_type_size(e.dtype);
+            if (e.begin > e.end || e.end > payload_size ||
+                elements > static_cast<uint64_t>(std::numeric_limits<size_t>::max()) / type_bytes ||
+                (empty ? 0 : elements * type_bytes) != e.end - e.begin)
+                throw std::runtime_error("Invalid safetensors byte range for " + key);
+            loaded.tensors_.push_back(std::move(e));
         }
+        std::vector<const SafetensorsEntry*> ranges;
+        for (size_t i = 0; i < loaded.tensors_.size(); ++i) {
+            const auto& entry = loaded.tensors_[i];
+            ranges.push_back(&entry);
+            loaded.tensor_index_[entry.name] = i;
+        }
+        std::sort(ranges.begin(), ranges.end(), [](const auto* a, const auto* b) {
+            return a->begin != b->begin ? a->begin < b->begin : a->end < b->end;
+        });
+        uint64_t previous_end = 0;
+        for (const auto* e : ranges) {
+            if (e->begin == e->end) continue;
+            if (e->begin < previous_end)
+                throw std::runtime_error("Overlapping safetensors byte range for " + e->name);
+            previous_end = e->end;
+        }
+        *this = std::move(loaded);
         return true;
     } catch (const std::exception& e) {
         if (err) *err = e.what();

@@ -35,31 +35,32 @@ using fusionrt::cli::parse_integer;
 
 namespace {
 
-void print_usage() {
-    std::cout << "fusionrt v" << FUSIONRT_VERSION << " - Direct CUDA sm_120 + Vulkan LLM Inference Engine\n"
-              << "Usage:\n"
-              << "  fusionrt info\n"
-              << "  fusionrt run [--arch dense|hybrid|moe] [--dtype f32|q8|q4] [--backend cuda|vulkan]\n"
-              << "               [--vk-device 0] [--model <gguf|safetensors>] [--prompt \"text\"]\n"
-              << "               [--steps <n>] [--max-seq 4096] [--graph|--no-graph] [--unfused] [--stream]\n"
-              << "               [--temp 0] [--top-k 40] [--top-p 0.95] [--min-p 0.05] [--repeat-penalty 1] [--seed 42]\n"
-              << "               [--profile <json>] [--profile-ops <json>] [--trace-layers <json>]\n"
-              << "               [--slots <n>] [--warmup <n>] [--trace-moe] [--trace-moe-routes <jsonl>] [--cpu-moe-f32]\n"
-              << "               [--json-grammar] [--spec-ngram <k> | --draft-model <gguf> | --spec-mtp] [--draft-tokens 4] [--spec-p-min 0.1]\n"
-              << "               [--mmproj <gguf> --image <path> ...] (use <image> to place images in the prompt)\n"
-              << "               --steps defaults to 512 with --model and 16 for synthetic models.\n"
-              << "  fusionrt inspect --model <path> [--max-seq 4096] [--device-memory]\n"
-              << "  fusionrt chat --model <path> [--system <text>] [--temp 0.7] [--max-tokens 512]\n"
-              << "  fusionrt serve --model <path> [--mmproj <gguf>] [--image <preset> ...]\n"
-              << "                 [--host 127.0.0.1] [--port 8080] [--max-seq 4096] [--slots 1] [--profile <json>]\n"
-              << "                 [--spec-ngram <k> | --draft-model <gguf> | --spec-mtp] [--draft-tokens 4] [--spec-p-min 0.1] [--trace-moe-routes <jsonl>]\n"
-              << "  fusionrt bench-model --model <path> [--pp 128] [--tg 64] [--decode-prefix 0] [--ubatch 512] [--reps 5] [--graph] [--profile-ops <json>]\n"
-              << "  CUDA run, chat, serve, inspect and bench-model accept --kv-dtype {auto|f32|f16|q8_0}.\n"
-              << "  CUDA --threads <n> controls CPU execution (0: auto). --cpu-affinity spread pins workers.\n"
-              << "  generate is an alias for run.\n"
-              << "  CUDA placement options: --kv-vram-mb <MiB> (0: auto), --host-kv-mb <MiB> (0: disabled),\n"
-              << "                          --moe-gpu-experts <n> (-1: auto).\n"
-              << "  fusionrt bench [--suite all|fusions|blocks|vulkan] [--output <path>] [--vk-device 0]\n";
+void print_usage(std::string_view command = {}) {
+    const auto show = [&](std::string_view name) { return command.empty() || command == name; };
+    const auto sampling = "  [--temp N] [--top-k N] [--top-p N] [--min-p N] [--repeat-penalty N] [--seed N]\n";
+    const auto placement = "  CUDA: [--kv-dtype auto|f32|f16|q8_0] [--profile FILE] [--threads N] [--cpu-affinity spread]\n"
+                           "  CUDA: [--kv-vram-mb MiB] [--host-kv-mb MiB] [--moe-gpu-experts N]\n";
+    const auto speculative = "  CUDA: [--spec-ngram K | --draft-model GGUF | --spec-mtp] [--draft-tokens N] [--spec-p-min N]\n";
+    if (command.empty()) std::cout << "fusionrt " << FUSIONRT_VERSION
+        << "\nUsage: fusionrt <info|run|chat|serve|inspect|bench-model|bench> [options]\n"
+        << "Use fusionrt <command> --help for details. generate is an alias for run.\n";
+    if (show("run")) std::cout << "fusionrt run [--model PATH] [--arch dense|hybrid|moe] [--dtype f32|f16|bf16|q4|q8]\n"
+        << "  [--backend cuda|vulkan] [--vk-device N] [--prompt TEXT] [--steps N] [--max-seq N] [--chat]\n"
+        << "  [--stream] [--ignore-eos] [--chatml] [--graph|--no-graph] [--unfused]\n"
+        << "  CUDA: [--slots N] [--warmup N] [--json-grammar] [--mmproj GGUF] [--image PATH]...\n"
+        << "  CUDA: [--profile-ops FILE] [--trace-layers FILE] [--trace-moe] [--trace-moe-routes FILE] [--cpu-moe-f32]\n"
+        << sampling << placement << speculative << "  --steps defaults to 512 for real models and 16 for synthetic models.\n";
+    if (show("chat")) std::cout << "fusionrt chat --model PATH [--system TEXT] [--max-tokens N] [--max-seq N] [--graph|--no-graph]\n"
+        << sampling << placement;
+    if (show("serve")) std::cout << "fusionrt serve --model PATH [--host HOST] [--port N] [--max-seq N] [--slots N]\n"
+        << "  [--graph|--no-graph] [--mmproj GGUF] [--image PATH]... [--trace-moe-routes FILE]\n"
+        << placement << speculative;
+    if (show("inspect")) std::cout << "fusionrt inspect --model PATH [--max-seq N] [--device-memory]\n"
+        << "  CUDA placement flags require --device-memory.\n" << placement;
+    if (show("bench-model")) std::cout << "fusionrt bench-model --model PATH [--pp N] [--tg N] [--decode-prefix N]\n"
+        << "  [--ubatch N] [--reps N] [--graph|--no-graph] [--profile-ops FILE]\n" << placement;
+    if (show("bench")) std::cout << "fusionrt bench [--suite all|fusions|blocks|vulkan] [--output FILE] [--vk-device N]\n";
+    if (command == "info") std::cout << "fusionrt info\n";
 }
 
 int cmd_info() {
@@ -309,7 +310,7 @@ int cmd_daily(const std::string& cmd, int argc, char** argv) {
     std::vector<std::string> image_paths;
     int max_seq = 4096, steps = 512, port = 8080, slots = 1;
     std::optional<bool> graph;
-    bool inspect_device = false;
+    bool inspect_device = false, kv_dtype_specified = false;
     SamplingParams sampling;
     sampling.temperature = 0.7f;
     sampling.top_p = 0.9f;
@@ -320,6 +321,7 @@ int cmd_daily(const std::string& cmd, int argc, char** argv) {
     for (int i = 2; i < argc; ++i) {
         const std::string arg = argv[i];
         if (arg == "--graph" || arg == "--no-graph") {
+            if (cmd == "inspect") throw std::invalid_argument("inspect does not accept " + arg);
             graph = arg == "--graph";
             continue;
         }
@@ -335,7 +337,10 @@ int cmd_daily(const std::string& cmd, int argc, char** argv) {
         const std::string value = argv[++i];
         if (arg == "--model") path = value;
         else if (arg == "--max-seq") max_seq = parse_integer(arg, value);
-        else if (arg == "--kv-type" || arg == "--kv-dtype") kv_dtype = parse_kv_type(value);
+        else if (arg == "--kv-type" || arg == "--kv-dtype") {
+            kv_dtype = parse_kv_type(value);
+            kv_dtype_specified = true;
+        }
         else if (arg == "--profile") profile = value;
         else if (placement.parse(arg, value)) continue;
         else if (cmd == "serve" && arg == "--host") host = value;
@@ -357,6 +362,8 @@ int cmd_daily(const std::string& cmd, int argc, char** argv) {
     if (path.empty() || max_seq <= 0 || steps <= 0 || port < 1 || port > 65535) {
         throw std::invalid_argument("Expected --model and positive context, generation length and port");
     }
+    if (cmd == "inspect" && !inspect_device && (kv_dtype_specified || !profile.empty() || placement.specified))
+        throw std::invalid_argument("inspect device options require --device-memory");
     sampling.validate();
     speculative.validate(!path.empty());
     if (!image_paths.empty() && mmproj.empty()) throw std::invalid_argument("--image requires --mmproj");
@@ -572,6 +579,15 @@ int cmd_bench_model(int argc, char** argv) {
     const bool graph = graph_option.value_or(model.recommended_cuda_graph());
     OpTrace trace;
     auto samples = model.bench_model_cuda(ctx, pp, tg, reps, graph, profile_ops.empty() ? nullptr : &trace, decode_prefix);
+    const bool graph_used = samples.front().used_cuda_graph;
+    if (graph_option.value_or(false) && !graph_used) {
+        const auto& layers = model.moe_layers();
+        const bool cold = std::any_of(layers.begin(), layers.end(), [](const auto& layer) {
+            return layer.cfg.gpu_resident_experts < layer.cfg.num_experts;
+        });
+        std::clog << "--graph requested, benchmark used eager because "
+                  << (cold ? "some MoE experts are CPU-resident" : "CUDA Graph capture failed") << '\n';
+    }
     if (!profile_ops.empty()) trace.write(profile_ops, model_filename(path));
     auto report = [&](const char* name, int tokens, double GenerationStats::* rate) {
         if (tokens == 0) return;
@@ -583,7 +599,7 @@ int cmd_bench_model(int argc, char** argv) {
         std::cout << name << tokens << " median=" << median << " tok/s mean=" << mean << " tok/s\n";
     };
     std::cout << "model=" << std::filesystem::path(path).filename().string()
-              << " backend=cuda graph=" << (graph ? "true" : "false") << " reps=" << reps
+              << " backend=cuda graph=" << (graph_used ? "true" : "false") << " reps=" << reps
               << " ubatch=" << model.prefill_batch_limit(ctx) << " load_ms=" << load_ms
               << '\n' << std::fixed << std::setprecision(2);
     report("pp", pp, &GenerationStats::prefill_tok_per_s);
@@ -684,6 +700,7 @@ int cmd_run(int argc, char** argv) {
     else if (dtype_s == "q4") wdt = DType::Q4_0;
     else if (dtype_s == "f16") wdt = DType::F16;
     else if (dtype_s == "bf16") wdt = DType::BF16;
+    else if (dtype_s != "f32") throw std::invalid_argument("Unknown --dtype: " + dtype_s);
 
     HybridModelConfig cfg;
     cfg.arch = arch;
@@ -987,6 +1004,11 @@ int main(int argc, char** argv) {
             return 0;
         }
         std::string cmd = argv[1];
+        const auto is_help = [](std::string_view arg) { return arg == "-h" || arg == "--help"; };
+        if (is_help(cmd) || (argc >= 3 && is_help(argv[2]))) {
+            print_usage(is_help(cmd) ? "" : cmd == "generate" ? "run" : cmd);
+            return 0;
+        }
         if (cmd == "--version" || cmd == "-v") {
             std::cout << "fusionrt " << FUSIONRT_VERSION << "\n";
             return 0;

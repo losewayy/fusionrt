@@ -337,63 +337,68 @@ bool BpeTokenizer::load_from_json(const std::string& path, std::string* err) {
         if (!model.count("vocab") || !model.at("vocab").is_object()) return false;
 
         const auto& vocab = model.at("vocab").as_object();
-        int64_t max_id = 0;
+        const JsonArray empty_added;
+        const auto& added = robj.contains("added_tokens") ? robj.at("added_tokens").as_array() : empty_added;
+        const size_t entries = vocab.size() + added.size();
+        const auto checked_id = [&](const JsonValue& value) {
+            if (!value.is_int() || value.as_int() < 0 || value.as_int() >= INT32_MAX ||
+                static_cast<uint64_t>(value.as_int()) >= entries)
+                throw std::runtime_error("Invalid tokenizer token ID");
+            return static_cast<int32_t>(value.as_int());
+        };
+        int32_t max_id = 0;
+        for (const auto& [tok, id] : vocab) max_id = std::max(max_id, checked_id(id));
+        for (const auto& token : added) {
+            const auto& obj = token.as_object();
+            if (!obj.at("content").is_string()) throw std::runtime_error("Invalid tokenizer added token content");
+            max_id = std::max(max_id, checked_id(obj.at("id")));
+        }
+        BpeTokenizer loaded = *this;
+        loaded.id_to_token_.assign(static_cast<size_t>(max_id + 1), "<unk>");
+        loaded.token_to_id_.clear();
+        loaded.special_tokens_.clear();
+        loaded.chat_template_.clear();
+        loaded.pretokenizer_.clear();
+        loaded.end_ids_.clear();
+        loaded.token_types_.clear();
+        loaded.token_scores_.clear();
+        loaded.sentencepiece_ = false;
         for (const auto& [tok, id_v] : vocab) {
-            max_id = std::max(max_id, id_v.as_int());
+            const int32_t id = checked_id(id_v);
+            loaded.id_to_token_[static_cast<size_t>(id)] = tok;
+            loaded.token_to_id_[tok] = id;
         }
-        id_to_token_.assign(static_cast<size_t>(max_id + 1), "<unk>");
-        token_to_id_.clear();
-        special_tokens_.clear();
-        chat_template_.clear();
-    pretokenizer_.clear();
-        end_ids_.clear();
-        token_types_.clear();
-        token_scores_.clear();
-        sentencepiece_ = false;
-        for (const auto& [tok, id_v] : vocab) {
-            int32_t id = static_cast<int32_t>(id_v.as_int());
-            id_to_token_[static_cast<size_t>(id)] = tok;
-            token_to_id_[tok] = id;
+        for (const auto& token : added) {
+            const auto& obj = token.as_object();
+            const auto id = checked_id(obj.at("id"));
+            const auto& content = obj.at("content").as_string();
+            loaded.id_to_token_[static_cast<size_t>(id)] = content;
+            loaded.token_to_id_[content] = id;
+            if (obj.contains("special") && obj.at("special").is_bool() && std::get<bool>(obj.at("special").val))
+                loaded.special_tokens_.push_back(content);
         }
-        if (robj.count("added_tokens") && robj.at("added_tokens").is_array()) {
-            for (const auto& at : robj.at("added_tokens").as_array()) {
-                if (!at.is_object()) continue;
-                const auto& aobj = at.as_object();
-                if (aobj.count("content") && aobj.count("id")) {
-                    int32_t id = static_cast<int32_t>(aobj.at("id").as_int());
-                    std::string content = aobj.at("content").as_string();
-                    if (id >= static_cast<int32_t>(id_to_token_.size())) {
-                        id_to_token_.resize(static_cast<size_t>(id + 1), "<unk>");
-                    }
-                    id_to_token_[static_cast<size_t>(id)] = content;
-                    token_to_id_[content] = id;
-                    if (aobj.count("special") && aobj.at("special").is_bool() && std::get<bool>(aobj.at("special").val)) {
-                        special_tokens_.push_back(content);
-                    }
-                }
-            }
-        }
-        std::sort(special_tokens_.begin(), special_tokens_.end(),
+        std::sort(loaded.special_tokens_.begin(), loaded.special_tokens_.end(),
                   [](const std::string& a, const std::string& b) { return a.size() > b.size(); });
 
-        gpt2_byte_bpe_ = token_to_id_.count("\xC4\xA0" "the") || token_to_id_.count("\xC4\xA0" "and") || token_to_id_.count("\xC4\x8A");
-        add_bos_default_ = !gpt2_byte_bpe_;
+        loaded.gpt2_byte_bpe_ = loaded.token_to_id_.count("\xC4\xA0" "the") || loaded.token_to_id_.count("\xC4\xA0" "and") || loaded.token_to_id_.count("\xC4\x8A");
+        loaded.add_bos_default_ = !loaded.gpt2_byte_bpe_;
 
-        merge_ranks_.clear();
+        loaded.merge_ranks_.clear();
         if (model.count("merges") && model.at("merges").is_array()) {
             const auto& merges = model.at("merges").as_array();
             for (size_t i = 0; i < merges.size(); ++i) {
                 if (merges[i].is_string()) {
-                    merge_ranks_[merges[i].as_string()] = static_cast<int>(i);
+                    loaded.merge_ranks_[merges[i].as_string()] = static_cast<int>(i);
                 } else if (merges[i].is_array()) {
                     const auto& pair = merges[i].as_array();
                     if (pair.size() == 2 && pair[0].is_string() && pair[1].is_string()) {
-                        merge_ranks_[pair[0].as_string() + " " + pair[1].as_string()] = static_cast<int>(i);
+                        loaded.merge_ranks_[pair[0].as_string() + " " + pair[1].as_string()] = static_cast<int>(i);
                     }
                 }
             }
         }
-        byte_fallback_only_ = merge_ranks_.empty();
+        loaded.byte_fallback_only_ = loaded.merge_ranks_.empty();
+        *this = std::move(loaded);
         return true;
     } catch (const std::exception& e) {
         if (err) *err = e.what();

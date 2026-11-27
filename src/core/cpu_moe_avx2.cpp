@@ -233,11 +233,17 @@ void cpu_moe_avx2_quantize_q8(const float* input, CpuQ8K* output, int cols) {
 #ifdef __AVX2__
     const auto sign_clear = _mm256_castsi256_ps(_mm256_set1_epi32(0x7fffffff));
     const auto bias = _mm_set1_epi8(-128);
+    const auto infinity = _mm256_castsi256_ps(_mm256_set1_epi32(0x7f800000));
+    const auto finite_load = [&](const float* p) {
+        const auto x = _mm256_loadu_ps(p);
+        const auto finite = _mm256_cmp_ps(_mm256_and_ps(x, sign_clear), infinity, _CMP_LT_OQ);
+        return _mm256_and_ps(x, finite);
+    };
     for (int i = 0; i < cols; i += 256) {
         auto& block = output[i / 256];
         auto maxima = _mm256_setzero_ps();
         for (int j = 0; j < 256; j += 8)
-            maxima = _mm256_max_ps(maxima, _mm256_and_ps(_mm256_loadu_ps(input + i + j), sign_clear));
+            maxima = _mm256_max_ps(maxima, _mm256_and_ps(finite_load(input + i + j), sign_clear));
         auto peak = _mm_max_ps(_mm256_castps256_ps128(maxima), _mm256_extractf128_ps(maxima, 1));
         peak = _mm_max_ps(peak, _mm_movehl_ps(peak, peak));
         peak = _mm_max_ss(peak, _mm_shuffle_ps(peak, peak, _MM_SHUFFLE(0, 0, 0, 1)));
@@ -246,8 +252,8 @@ void cpu_moe_avx2_quantize_q8(const float* input, CpuQ8K* output, int cols) {
         const auto inv = _mm256_set1_ps(max > 0 ? 127.0f / max : 0.0f);
         for (int sub = 0; sub < 16; ++sub) {
             const float* x = input + i + sub * 16;
-            const auto a = _mm256_cvtps_epi32(_mm256_mul_ps(_mm256_loadu_ps(x), inv));
-            const auto b = _mm256_cvtps_epi32(_mm256_mul_ps(_mm256_loadu_ps(x + 8), inv));
+            const auto a = _mm256_cvtps_epi32(_mm256_mul_ps(finite_load(x), inv));
+            const auto b = _mm256_cvtps_epi32(_mm256_mul_ps(finite_load(x + 8), inv));
             const auto lo = _mm_packs_epi32(_mm256_castsi256_si128(a), _mm256_extracti128_si256(a, 1));
             const auto hi = _mm_packs_epi32(_mm256_castsi256_si128(b), _mm256_extracti128_si256(b, 1));
             const auto packed = _mm_packs_epi16(lo, hi);

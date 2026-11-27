@@ -307,6 +307,29 @@ void test_cuda_frontier(CudaContext& ctx) {
     std::cout << "  [PASS] Native MTP cutoff, graph verification and KV reuse preserve exact greedy IDs\n";
     mtp.spec_p_min = 0.f;
 
+    ServeSpeculation serve;
+    serve.mtp = true;
+    serve.draft_tokens = 3;
+    serve.p_min = 0.f;
+    const auto image = ctx.upload(make_ones_f32({1, f.hidden}), false);
+    const InputEmbedding span{0, image};
+    const auto image_opts = serve.for_inputs(std::span(&span, 1));
+    (void)model.generate_cuda(ctx, prompt, 16, true, true, &stats, false, 0, -1, image_opts);
+    if (stats.speculative_active || stats.spec_proposed)
+        throw std::runtime_error("Vision generation must bypass native MTP");
+    auto text_opts = serve.for_inputs({});
+    if (model.generate_cuda(ctx, prompt, 16, true, true, &stats, false, 0, -1, text_opts) != normal ||
+        !stats.speculative_active || stats.spec_accepted == 0)
+        throw std::runtime_error("Text generation must resume native MTP after a vision request");
+    text_opts.sampling.temperature = 0.7f;
+    text_opts.sampling.top_k = 4;
+    text_opts.sampling.seed = 421;
+    const auto sampled = model.generate_cuda(ctx, prompt, 16, true, true, &stats, false, 0, -1, text_opts);
+    if (!stats.speculative_active || sampled.size() != prompt.size() + 16 ||
+        model.generate_cuda(ctx, prompt, 16, true, true, nullptr, false, 0, -1, text_opts) != sampled)
+        throw std::runtime_error("Seeded stochastic native MTP must reproduce its own output");
+    std::cout << "  [PASS] Native MTP resumes after vision and seeded sampling is reproducible\n";
+
     auto conflicting_head = model_io::make_zeros_f32({f.vocab, f.hidden});
     // Rows 1 and 2 have opposite logits. The trunk's greedy choice is 0.
     conflicting_head.data<float>()[f.hidden] = 1.f;

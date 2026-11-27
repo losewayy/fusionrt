@@ -17,7 +17,7 @@ __global__ void k_linear_gemm_tiled_f32(const float* __restrict__ x, const float
     __shared__ float sx[TILE][TILE];
     __shared__ float sw[TILE][TILE];
 
-    int row = blockIdx.y * TILE + threadIdx.y;  // m
+    const int64_t row = static_cast<int64_t>(blockIdx.y) * TILE + threadIdx.y;
     int col = blockIdx.x * TILE + threadIdx.x;  // n
     float acc = 0.0f;
 
@@ -857,8 +857,7 @@ void rmsnorm_or_copy_to_f16(const float* x, const float* norm_w, uint16_t* out_f
 }
 
 void cublas_linear_f16_f32(cublasHandle_t handle, const uint16_t* x_f16, const uint16_t* w_f16,
-                           float* y, int M, int N, int K, int output_stride) {
-    const float alpha = 1.0f;
+                           float* y, int M, int N, int K, int output_stride, float alpha) {
     const float beta = 0.0f;
     cublasStatus_t st = cublasGemmEx(
         handle,

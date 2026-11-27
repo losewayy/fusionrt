@@ -1,4 +1,5 @@
 #include "fusionrt/cuda_backend.h"
+#include "fusionrt/weight_codec.h"
 #include "../core/cpu_moe.h"
 #include <algorithm>
 #include <sstream>
@@ -532,10 +533,14 @@ CudaContext::CudaContext(int device_id, size_t weight_arena_mb, size_t scratch_a
     info_ = devs[device_id];
     set_device_profile({});
     FUSIONRT_CUDA_CHECK(cudaSetDevice(device_id));
-    FUSIONRT_CUDA_CHECK(cudaStreamCreateWithFlags(&stream_, cudaStreamNonBlocking));
-    FUSIONRT_CUBLAS_CHECK(cublasCreate(&cublas_));
-    FUSIONRT_CUBLAS_CHECK(cublasSetStream(cublas_, stream_));
-    FUSIONRT_CUBLAS_CHECK(cublasSetMathMode(cublas_, CUBLAS_DEFAULT_MATH));
+    cudaStream_t stream_handle = nullptr;
+    FUSIONRT_CUDA_CHECK(cudaStreamCreateWithFlags(&stream_handle, cudaStreamNonBlocking));
+    stream_.reset(stream_handle);
+    cublasHandle_t cublas_handle = nullptr;
+    FUSIONRT_CUBLAS_CHECK(cublasCreate(&cublas_handle));
+    cublas_.reset(cublas_handle);
+    FUSIONRT_CUBLAS_CHECK(cublasSetStream(cublas(), stream()));
+    FUSIONRT_CUBLAS_CHECK(cublasSetMathMode(cublas(), CUBLAS_DEFAULT_MATH));
     weight_arena_.init(weight_arena_mb * 1024ULL * 1024ULL);
     scratch_arena_.init(scratch_arena_mb * 1024ULL * 1024ULL);
 
@@ -545,10 +550,10 @@ CudaContext::CudaContext(int device_id, size_t weight_arena_mb, size_t scratch_a
         void* a = scratch_arena_.alloc(16 * 16 * sizeof(uint16_t));
         void* b = scratch_arena_.alloc(16 * 16 * sizeof(uint16_t));
         void* c = scratch_arena_.alloc(16 * 16 * sizeof(float));
-        FUSIONRT_CUDA_CHECK(cudaMemsetAsync(a, 0, 512, stream_));
-        FUSIONRT_CUDA_CHECK(cudaMemsetAsync(b, 0, 512, stream_));
+        FUSIONRT_CUDA_CHECK(cudaMemsetAsync(a, 0, 512, stream()));
+        FUSIONRT_CUDA_CHECK(cudaMemsetAsync(b, 0, 512, stream()));
         const float alpha = 1.0f, beta = 0.0f;
-        cublasGemmEx(cublas_, CUBLAS_OP_T, CUBLAS_OP_N, 16, 16, 16, &alpha,
+        cublasGemmEx(cublas(), CUBLAS_OP_T, CUBLAS_OP_N, 16, 16, 16, &alpha,
                      a, CUDA_R_16F, 16, b, CUDA_R_16F, 16, &beta, c, CUDA_R_32F, 16,
                      CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
         scratch_arena_.reset(mark);
@@ -556,7 +561,7 @@ CudaContext::CudaContext(int device_id, size_t weight_arena_mb, size_t scratch_a
 
     // Allocate L2 flush buffer >= 2x device L2 (or at least 64 MiB)
     l2_flush_bytes_ = std::max<size_t>(info_.l2_cache_bytes * 2, 64ULL * 1024ULL * 1024ULL);
-    FUSIONRT_CUDA_CHECK(cudaStreamSynchronize(stream_));
+    FUSIONRT_CUDA_CHECK(cudaStreamSynchronize(stream()));
 }
 
 void CudaContext::set_device_profile(const DeviceProfile& profile) {
@@ -590,14 +595,12 @@ void CudaContext::set_device_profile(const DeviceProfile& profile) {
 
 CudaContext::~CudaContext() {
     if (moe_input_ready_) {
-        (void)cudaStreamSynchronize(stream_);
+        (void)cudaStreamSynchronize(stream());
         cudaEventDestroy(moe_input_ready_);
     }
     if (l2_flush_buf_) cudaFree(l2_flush_buf_);
     scratch_arena_.release();
     weight_arena_.release();
-    if (cublas_) cublasDestroy(cublas_);
-    if (stream_) cudaStreamDestroy(stream_);
 }
 
 float* CudaContext::moe_transfer_buffer(size_t bytes) {
@@ -619,11 +622,7 @@ Tensor CudaContext::upload(const HostTensor& ht, bool persistent) {
     Tensor dst = arena.alloc_tensor(
         std::vector<int64_t>(ht.desc.shape.begin(), ht.desc.shape.begin() + ht.desc.ndim),
         ht.desc.dtype, ht.desc.name);
-    if (ht.desc.nbytes() > 0) {
-        FUSIONRT_CUDA_CHECK(cudaMemcpyAsync(dst.ptr(), ht.bytes().data(), ht.desc.nbytes(),
-                                            cudaMemcpyHostToDevice, stream_));
-        FUSIONRT_CUDA_CHECK(cudaStreamSynchronize(stream_));
-    }
+    upload_into(ht, dst);
     return dst;
 }
 
@@ -631,10 +630,26 @@ void CudaContext::upload_into(const HostTensor& ht, Tensor& dst) {
     if (ht.desc.nbytes() != dst.nbytes()) {
         throw std::runtime_error("upload_into size mismatch");
     }
+    dst.codec_tile_scale = 1.f;
+    const auto type = ht.desc.dtype;
+    if (is_weight_codec_dtype(type) && !has_weight_codec_int8(type)) {
+        const size_t stride = dtype_type_size(type);
+        const size_t scale_offset = type == DType::Q3_K ? 108 : 0;
+        constexpr float coefficient_bound = 2048.f;
+        const auto packed = ht.bytes();
+        for (size_t block = 0; block < packed.size(); block += stride) {
+            uint16_t bits;
+            std::memcpy(&bits, packed.data() + block + scale_offset, sizeof(bits));
+            if ((bits & 0x7fffu) > fp32_to_fp16(65504.f / coefficient_bound)) {
+                dst.codec_tile_scale = coefficient_bound;
+                break;
+            }
+        }
+    }
     if (ht.desc.nbytes() > 0) {
         FUSIONRT_CUDA_CHECK(cudaMemcpyAsync(dst.ptr(), ht.bytes().data(), ht.desc.nbytes(),
-                                            cudaMemcpyHostToDevice, stream_));
-        FUSIONRT_CUDA_CHECK(cudaStreamSynchronize(stream_));
+                                            cudaMemcpyHostToDevice, stream()));
+        FUSIONRT_CUDA_CHECK(cudaStreamSynchronize(stream()));
     }
 }
 
@@ -644,8 +659,8 @@ HostTensor CudaContext::download(const Tensor& t) {
     ht.desc.name = t.name;
     if (t.nbytes() > 0) {
         FUSIONRT_CUDA_CHECK(cudaMemcpyAsync(ht.storage.data(), t.ptr(), t.nbytes(),
-                                            cudaMemcpyDeviceToHost, stream_));
-        FUSIONRT_CUDA_CHECK(cudaStreamSynchronize(stream_));
+                                            cudaMemcpyDeviceToHost, stream()));
+        FUSIONRT_CUDA_CHECK(cudaStreamSynchronize(stream()));
     }
     return ht;
 }
@@ -670,12 +685,12 @@ CpuMoeWorkspace& CudaContext::cpu_moe_workspace() {
 }
 
 void CudaContext::synchronize() {
-    FUSIONRT_CUDA_CHECK(cudaStreamSynchronize(stream_));
+    FUSIONRT_CUDA_CHECK(cudaStreamSynchronize(stream()));
 }
 
 void CudaContext::flush_l2() {
     if (!l2_flush_buf_) FUSIONRT_CUDA_CHECK(cudaMalloc(&l2_flush_buf_, l2_flush_bytes_));
-    FUSIONRT_CUDA_CHECK(cudaMemsetAsync(l2_flush_buf_, 0x5A, l2_flush_bytes_, stream_));
+    FUSIONRT_CUDA_CHECK(cudaMemsetAsync(l2_flush_buf_, 0x5A, l2_flush_bytes_, stream()));
 }
 
 CudaMoeTiming::~CudaMoeTiming() {

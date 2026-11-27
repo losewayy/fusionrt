@@ -1,4 +1,5 @@
 #include "test_support.h"
+#include "../src/models/cuda_executor.h"
 #include "../src/models/cuda_session.h"
 
 #ifdef FUSIONRT_ENABLE_CUDA
@@ -6,6 +7,8 @@ namespace fusionrt {
 decltype(CudaKvPool::allocate_)& CudaReviewTestAccess::allocator(FusionModel& model) {
     return model.sessions_->cuda_kv_pool_.allocate_;
 }
+CudaGraphExec& CudaReviewTestAccess::graph(FusionModel& model) { return model.executor_->work_.decode_graph; }
+uint64_t CudaReviewTestAccess::residency(FusionModel& model) { return model.sessions_->expert_residency_generation(); }
 }  // namespace fusionrt
 #endif
 
@@ -491,13 +494,15 @@ void test_cuda_native_quantized_moe() {
                 (context / kKvPageTokens) * kv_bytes - (E - base) * (gate_bytes + down_bytes)) / mib;
             model.set_device_profile(ctx, profile);
             load(-1, base, context);
+            const auto before_promotion = CudaReviewTestAccess::residency(model);
             const auto short_result = model.generate_cuda(ctx, {1, 2, 3}, 4);
+            const auto after_promotion = CudaReviewTestAccess::residency(model);
             const auto borrowed = model.cuda_borrowed_expert_bytes();
-            if (!borrowed || model.moe_layers()[0].cfg.gpu_resident_experts != E)
+            if (!borrowed || after_promotion <= before_promotion || model.moe_layers()[0].cfg.gpu_resident_experts != E)
                 throw std::runtime_error("Short request must allow experts to borrow unused KV memory");
             const auto long_result = model.generate_cuda(ctx, std::vector<int32_t>(1152, 1), 4);
             if (model.cuda_borrowed_expert_bytes() != 0 || model.moe_layers()[0].cfg.gpu_resident_experts != base ||
-                long_result.size() != 1152 + 4)
+                long_result.size() != 1152 + 4 || CudaReviewTestAccess::residency(model) <= after_promotion)
                 throw std::runtime_error("Growing KV cache must reclaim borrowed expert memory");
             if (model.generate_cuda(ctx, {1, 2, 3}, 4) != short_result || model.cuda_borrowed_expert_bytes() != borrowed)
                 throw std::runtime_error("After the KV cache resets, expert re-promotion must preserve output");
@@ -899,6 +904,9 @@ void test_stage7c_mla() {
             meta["deepseek2.rope.scaling.yarn_log_multiplier"] = yarn_log_mul;
             meta["deepseek2.expert_group_count"] = uint32_t{2};
             meta["deepseek2.expert_group_used_count"] = uint32_t{1};
+        } else {
+            meta["deepseek2.rope.scaling.type"] = std::string("linear");
+            meta["deepseek2.rope.scaling.factor"] = 4.0f;
         }
         std::mt19937_64 rng(7003);
         std::vector<std::pair<std::string, HostTensor>> tensors;
@@ -974,6 +982,10 @@ void test_stage7c_mla() {
             throw std::runtime_error("DeepSeek MLA GGUF roundtrip: " + error);
         }
         const auto& mla = raw.cfg.dense.mla;
+        const double mscale = 1 + (lora ? yarn_log_mul : 0.1) * std::log(4.0);
+        const double attention_scale = mscale * mscale / std::sqrt(key);
+        if (std::abs(mla.attention_scale - attention_scale) > 1e-6 || mla.rope_amplitude != 1.f)
+            throw std::runtime_error("MLA score multiplier and rotary amplitude must be independent");
         if (mla.query_rank != (lora ? query_rank : 0) || mla.latent_width() != rank + rope ||
             mla.value_dim != value || mla.leading_dense_layers != 1 || raw.cfg.dense.head_dim != key ||
             raw.cfg.dense.num_key_value_heads != 1 || raw.cfg.moe.num_experts != experts ||
@@ -989,6 +1001,14 @@ void test_stage7c_mla() {
         FusionModel model(HybridModelConfig{});
         model.set_moe_gpu_experts(experts);
         if (!model.load_gguf(ctx, path, &error, 0, true)) throw std::runtime_error(error);
+        ctx.set_kv_dtype(DType::F16);
+        bool incompatible = false;
+        try {
+            (void)model.load_gguf(ctx, path, &error, 0, true);
+        } catch (const std::invalid_argument&) { incompatible = true; }
+        ctx.set_kv_dtype(DType::F32);
+        if (!incompatible || model.cuda_max_active_tokens() != 256)
+            throw std::runtime_error("Incompatible reload must preserve the initialized CUDA session");
         const std::vector<int32_t> prompt{2, 9, 11, 3, 5, 24, 7, 8, 16};
         using Row = std::vector<double>;
         auto weight = [&](const std::string& name) -> const HostTensor& {
@@ -1011,7 +1031,7 @@ void test_stage7c_mla() {
         auto rotate = [&](double* x, size_t t) {
             for (int j = 0; j < rope / 2; ++j) {
                 // For this YaRN fixture the correction interval is [0, 4].
-                const double rate = lora ? (1 - 0.75 * j / 4) : 1;
+                const double rate = lora ? (1 - 0.75 * j / 4) : 0.25;
                 const double a = t * std::pow(100.0, -2.0 * j / rope) * rate;
                 const double c = std::cos(a), s = std::sin(a), re = x[2 * j], im = x[2 * j + 1];
                 x[2 * j] = c * re - s * im;
@@ -1029,8 +1049,6 @@ void test_stage7c_mla() {
             const auto* emb = weight("token_embd.weight").data<float>() + token * hidden;
             h.emplace_back(emb, emb + hidden);
         }
-        const double mscale = lora ? 1 + yarn_log_mul * std::log(4.0) : 1;
-        const double attention_scale = mscale * mscale / std::sqrt(key);
         for (int l = 0; l < layers; ++l) {
             const std::string p = "blk." + std::to_string(l) + ".";
             std::vector<Row> queries, keys, expanded_kv;

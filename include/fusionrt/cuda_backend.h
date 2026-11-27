@@ -128,8 +128,8 @@ public:
     CudaContext& operator=(const CudaContext&) = delete;
 
     const CudaDeviceInfo& info() const { return info_; }
-    cudaStream_t stream() const { return stream_; }
-    cublasHandle_t cublas() const { return cublas_; }
+    cudaStream_t stream() const { return stream_.get(); }
+    cublasHandle_t cublas() const { return cublas_.get(); }
     int prefill_batch() const { return prefill_batch_; }
     void set_prefill_batch(int rows) { prefill_batch_ = rows; }
     const DeviceProfile& device_profile() const { return device_profile_; }
@@ -180,8 +180,8 @@ private:
     CudaDeviceInfo info_;
     DeviceProfile device_profile_;
     CostHardware cost_hardware_;
-    cudaStream_t stream_ = nullptr;
-    cublasHandle_t cublas_ = nullptr;
+    std::unique_ptr<std::remove_pointer_t<cudaStream_t>, decltype(&cudaStreamDestroy)> stream_{nullptr, cudaStreamDestroy};
+    std::unique_ptr<std::remove_pointer_t<cublasHandle_t>, decltype(&cublasDestroy)> cublas_{nullptr, cublasDestroy};
     CudaArena weight_arena_;
     CudaArena scratch_arena_;
     void* l2_flush_buf_ = nullptr;

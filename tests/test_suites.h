@@ -3,6 +3,11 @@
 #include "fusionrt/models.h"
 
 namespace fusionrt::test {
+void test_wave1_inputs();
+#ifdef FUSIONRT_ENABLE_CUDA
+void test_wave1_cuda(CudaContext&);
+void test_wave1_http(CudaContext&);
+#endif
 
 void test_quant_and_io();
 void test_gdn_loader_shapes();

@@ -48,9 +48,9 @@ static std::optional<std::pair<int, int>> moe_graph_prefix(const MiniGraph& grap
 }
 
 static void embed_tokens(CudaContext& ctx, const Tensor& table, const Tensor& ids, Tensor& hidden,
-                         int rows, int width, float scale) {
+                         int rows, int width, float scale, int* invalid_token = nullptr) {
     cuda_ops::embed_lookup_f32(table.ptr(), table.dtype, ids.ptr<int32_t>(), hidden.ptr<float>(),
-                               rows, width, ctx.stream());
+                               rows, width, static_cast<int>(table.shape[0]), ctx.stream(), invalid_token);
     if (table.hadamard_block) {
         cuda_ops::blockwise_hadamard_f32(hidden.ptr<float>(), table.hadamard_signs, hidden.ptr<float>(),
                                          rows, width, table.hadamard_block, ctx.stream(), true);
@@ -61,7 +61,7 @@ static void embed_tokens(CudaContext& ctx, const Tensor& table, const Tensor& id
 static bool run_forward_token_step_cuda(
     CudaContext& ctx, const HybridModelConfig& cfg,
     const Tensor& tok_embeddings, const MiniGraph& ir, CudaIRWorkspace& ws,
-    Tensor& hidden_buf, Tensor& logits_buf, Tensor& tok_id_dev, Tensor& pos_dev, Tensor& kv_len_dev,
+    Tensor& hidden_buf, Tensor& logits_buf, Tensor& tok_id_dev, Tensor& pos_dev, Tensor& kv_len_dev, int* invalid_token,
     const std::vector<CudaDenseGQALayer>& dense_layers,
     const std::vector<CudaGatedDeltaNetLayer>& gdn_layers,
     const std::vector<CudaKvView>& kv_states, const std::vector<CudaGdnState>& gdn_states,
@@ -73,7 +73,7 @@ static bool run_forward_token_step_cuda(
     int H = static_cast<int>(hidden_buf.shape[0]);
 
     auto run_body = [&](bool graph_mode) {
-        embed_tokens(ctx, tok_embeddings, tok_id_dev, hidden_buf, 1, H, cfg.embed_scale);
+        embed_tokens(ctx, tok_embeddings, tok_id_dev, hidden_buf, 1, H, cfg.embed_scale, invalid_token);
         int* p_dev = graph_mode ? pos_dev.ptr<int>() : nullptr;
         int* kl_dev = graph_mode ? kv_len_dev.ptr<int>() : nullptr;
         if (timer) {
@@ -88,9 +88,21 @@ static bool run_forward_token_step_cuda(
         }
     };
 
+    const auto capture = [&](const auto& body) {
+        try {
+            decode_graph.capture(ctx.stream(), body);
+            return true;
+        } catch (const std::runtime_error& error) {
+            graph_captured = false;
+            std::clog << "CUDA Graph capture failed, using eager: " << error.what() << '\n';
+            run_body(false);
+            return false;
+        }
+    };
+
     if (use_graph && all_experts_resident(moe_layers)) {
         // The generation graph advances both counters after it writes the next token.
-        if (first_step || !with_argmax) {
+        if (first_step || !with_argmax || !graph_captured) {
             int kv_len = pos + 1;
             FUSIONRT_CUDA_CHECK(cudaMemcpyAsync(pos_dev.ptr(), &pos, sizeof(int), cudaMemcpyHostToDevice, ctx.stream()));
             FUSIONRT_CUDA_CHECK(cudaMemcpyAsync(kv_len_dev.ptr(), &kv_len, sizeof(int), cudaMemcpyHostToDevice, ctx.stream()));
@@ -99,7 +111,7 @@ static bool run_forward_token_step_cuda(
                                                 cfg.dense.num_key_value_heads, kMaxDecodeSplits);
         if (!graph_captured || graph_fused_flag != use_fused || graph_has_argmax != with_argmax ||
             graph_split_bucket != bucket) {
-            decode_graph.capture(ctx.stream(), [&]() { run_body(true); });
+            if (!capture([&] { run_body(true); })) return false;
             graph_captured = true;
             graph_fused_flag = use_fused;
             graph_has_argmax = with_argmax;
@@ -118,12 +130,12 @@ static bool run_forward_token_step_cuda(
             if (!graph_captured || graph_fused_flag != use_fused || graph_has_argmax != with_argmax ||
                 graph_split_bucket != bucket) {
                 const CudaIRSegment captured{0, cut, ir.input_value, boundary, &hidden_buf};
-                decode_graph.capture(ctx.stream(), [&] {
-                    embed_tokens(ctx, tok_embeddings, tok_id_dev, hidden_buf, 1, H, cfg.embed_scale);
+                if (!capture([&] {
+                    embed_tokens(ctx, tok_embeddings, tok_id_dev, hidden_buf, 1, H, cfg.embed_scale, invalid_token);
                     execute_ir_graph_cuda(ir, ws, ctx, hidden_buf, tok_id_dev, logits_buf, 1, pos, pos,
                         pos_dev.ptr<int>(), kv_len_dev.ptr<int>(), dense_layers, gdn_layers, kv_states, gdn_states,
                         moe_layers, use_fused, nullptr, nullptr, nullptr, false, false, &captured);
-                });
+                })) return false;
                 graph_captured = true;
                 graph_fused_flag = use_fused;
                 graph_has_argmax = with_argmax;
@@ -213,7 +225,9 @@ void CudaExecutor::validate_input_embeddings(std::span<const InputEmbedding> spa
 void CudaExecutor::execute_prefill_chunks(CudaContext& ctx, const int32_t* token_ids, int count,
                                          int start_pos, bool use_fused, LayerTrace* layer_trace,
                                          OpTrace* op_trace, bool compute_logits, bool save_prefix_checkpoints,
-                                         std::span<const InputEmbedding> inputs_embeds) {
+                                         std::span<const InputEmbedding> inputs_embeds,
+                                         const std::atomic_bool* cancel) {
+    if (cancel && cancel->load(std::memory_order_relaxed)) throw CudaPrefillCancelled{};
     const int H = static_cast<int>(weights_.embeddings().shape[1]);
     auto& arena = ctx.scratch_arena();
     struct RestoreArena {
@@ -224,6 +238,19 @@ void CudaExecutor::execute_prefill_chunks(CudaContext& ctx, const int32_t* token
 
     ensure_kv(ctx, start_pos, start_pos + count);
     const int capacity = std::min(count, prefill_batch_limit(ctx));
+    const bool gemma_images = !inputs_embeds.empty() && weights_.config().model_architecture == "gemma4";
+    if (gemma_images) for (const auto& span : inputs_embeds) {
+        if (span.bidirectional && span.rows.shape[0] > capacity)
+            throw std::invalid_argument("Gemma 4 image span exceeds the available prefill batch");
+    }
+    Tensor bounds;
+    std::vector<int> image_bounds;
+    if (gemma_images && std::any_of(inputs_embeds.begin(), inputs_embeds.end(), [](const auto& span) {
+        return span.bidirectional;
+    })) {
+        bounds = cuda_scratch(ctx, {capacity, 2}, DType::I32);
+        image_bounds.resize(static_cast<size_t>(capacity) * 2);
+    }
     Tensor ids = cuda_scratch(ctx, {capacity}, DType::I32);
     Tensor hidden = cuda_scratch(ctx, {capacity, H});
     const auto& ir = use_fused ? weights_.fused_ir() : weights_.raw_ir();
@@ -238,8 +265,29 @@ void CudaExecutor::execute_prefill_chunks(CudaContext& ctx, const int32_t* token
         std::max((start_pos / kKvPageTokens + 1) * kKvPageTokens,
                  ((end - 1) / kKvPageTokens - 1) * kKvPageTokens) : end;
     for (int begin = 0; begin < count;) {
+        if (cancel && cancel->load(std::memory_order_relaxed)) throw CudaPrefillCancelled{};
         const int position = start_pos + begin;
-        const int rows = std::min(capacity, std::min(end, checkpoint) - position);
+        int rows = std::min(capacity, std::min(end, checkpoint) - position);
+        if (bounds.data) for (const auto& span : inputs_embeds) {
+            if (!span.bidirectional || span.start < begin || span.start >= begin + rows) continue;
+            const int span_end = span.start + static_cast<int>(span.rows.shape[0]);
+            if (span_end > begin + rows) rows = span.start == begin ? span_end - begin : span.start - begin;
+        }
+        const int* image_mask = nullptr;
+        if (bounds.data) {
+            std::fill_n(image_bounds.begin(), 2 * rows, -1);
+            for (const auto& span : inputs_embeds) {
+                if (!span.bidirectional || span.start < begin || span.start >= begin + rows) continue;
+                const int span_end = span.start + static_cast<int>(span.rows.shape[0]);
+                for (int row = span.start - begin; row < span_end - begin; ++row) {
+                    image_bounds[2 * row] = start_pos + span.start;
+                    image_bounds[2 * row + 1] = start_pos + span_end;
+                }
+                image_mask = bounds.ptr<int>();
+            }
+            if (image_mask) FUSIONRT_CUDA_CHECK(cudaMemcpyAsync(bounds.ptr(), image_bounds.data(),
+                static_cast<size_t>(2 * rows) * sizeof(int), cudaMemcpyHostToDevice, ctx.stream()));
+        }
         const bool last = begin + rows == count;
         FUSIONRT_CUDA_CHECK(cudaMemcpyAsync(ids.ptr(), token_ids + begin, rows * sizeof(int32_t),
                                             cudaMemcpyHostToDevice, ctx.stream()));
@@ -259,12 +307,13 @@ void CudaExecutor::execute_prefill_chunks(CudaContext& ctx, const int32_t* token
             execute_ir_graph_cuda<true>(ir, ws, ctx, hidden, ids, work_.logits, rows, position, position,
                 nullptr, nullptr, weights_.dense_layers(), weights_.gdn_layers(), sessions_.kv(), sessions_.gdn(),
                 weights_.moe_layers(), use_fused, op_trace, timer.get(), last ? layer_trace : nullptr,
-                last && compute_logits, false, nullptr, nextn);
+                last && compute_logits, false, nullptr, nextn, nullptr, image_mask);
         } else {
             execute_ir_graph_cuda(ir, ws, ctx, hidden, ids, work_.logits, rows, position, position,
                 nullptr, nullptr, weights_.dense_layers(), weights_.gdn_layers(), sessions_.kv(), sessions_.gdn(),
-                weights_.moe_layers(), use_fused, nullptr, nullptr, nullptr, last && compute_logits, false, nullptr, nextn);
+                weights_.moe_layers(), use_fused, nullptr, nullptr, nullptr, last && compute_logits, false, nullptr, nextn, nullptr, image_mask);
         }
+        if (cancel) ctx.synchronize();
         begin += rows;
         if (position + rows == checkpoint && checkpoint < end) {
             sessions_.save_cuda_checkpoint(ctx, checkpoint, nullptr);
@@ -282,10 +331,11 @@ void CudaExecutor::execute_prefill_chunks(CudaContext& ctx, const int32_t* token
 std::vector<float> CudaExecutor::prefill_cuda_impl(CudaContext& ctx, const int32_t* token_ids, int count,
                                                  int start_pos, bool use_fused, LayerTrace* layer_trace,
                                                  OpTrace* op_trace, bool save_prefix_checkpoints,
-                                                 std::span<const InputEmbedding> inputs_embeds) {
+                                                 std::span<const InputEmbedding> inputs_embeds,
+                                                 const std::atomic_bool* cancel) {
     validate_token_ids({token_ids, static_cast<size_t>(count)}, start_pos, weights_.config().vocab_size);
     execute_prefill_chunks(ctx, token_ids, count, start_pos, use_fused, layer_trace, op_trace, true,
-                           save_prefix_checkpoints, inputs_embeds);
+                           save_prefix_checkpoints, inputs_embeds, cancel);
     HostTensor logits = ctx.download(work_.logits);
     return {logits.data<float>(), logits.data<float>() + weights_.config().vocab_size};
 }
@@ -296,6 +346,7 @@ struct CudaExecutor::Verify {
     struct Entry {
         CudaGraphExec graph;
         uint64_t bucket = 0;
+        uint64_t residency_generation = 0;
         bool failed = false;
     };
     std::array<Entry, 9> graphs;
@@ -303,8 +354,14 @@ struct CudaExecutor::Verify {
     bool enabled = false;
 };
 
-static bool launch_spec_graph(cudaStream_t stream, auto& entry, uint64_t bucket, const auto& body) {
-    if (entry.failed) return false;
+static bool launch_spec_graph(cudaStream_t stream, auto& entry, uint64_t bucket,
+                              uint64_t residency_generation, bool eligible, const auto& body) {
+    if (entry.residency_generation != residency_generation) {
+        entry.graph.reset();
+        entry.residency_generation = residency_generation;
+        entry.failed = false;
+    }
+    if (!eligible || entry.failed) return false;
     if (!entry.graph.valid() || entry.bucket != bucket) {
         try {
             entry.graph.capture(stream, body);
@@ -377,7 +434,8 @@ bool CudaExecutor::verify_cuda(CudaContext& ctx, const std::vector<int32_t>& inp
             bucket = bucket * (kMaxDecodeSplits + 1) + select_decode_splits(ctx.cost_hardware(),
                 pos + i + 1, weights_.config().dense.num_key_value_heads, kMaxDecodeSplits);
         }
-        used_graph = launch_spec_graph(ctx.stream(), capture->graphs[rows], bucket, body);
+        used_graph = launch_spec_graph(ctx.stream(), capture->graphs[rows], bucket,
+            sessions_.expert_residency_generation(), can_use_cuda_graph(), body);
     }
     if (!used_graph) {
         arena.reset(body_mark);
@@ -437,6 +495,7 @@ void CudaExecutor::allocate_workspace(CudaArena& arena, int H, int vocab, int co
     work_.token_ids = arena.alloc_tensor({1 + static_cast<int64_t>(context)}, DType::I32, "tok_id_dev");
     work_.position = arena.alloc_tensor({1}, DType::I32, "pos_dev");
     work_.kv_length = arena.alloc_tensor({1}, DType::I32, "kv_len_dev");
+    work_.invalid_token = arena.alloc_tensor({1}, DType::I32, "invalid_token");
 }
 
 struct CudaExecutor::Decode {
@@ -459,7 +518,7 @@ bool CudaExecutor::decode(CudaContext& ctx, Decode& r, int pos, bool graph, bool
     if (ensure) ensure_kv(ctx, pos, pos + 1);
     if (token) set_token(ctx, token);
     return run_forward_token_step_cuda(ctx, weights_.config(), weights_.embeddings(), r.ir, r.ws,
-        work_.hidden, work_.logits, work_.token_ids, work_.position, work_.kv_length,
+        work_.hidden, work_.logits, work_.token_ids, work_.position, work_.kv_length, work_.invalid_token.ptr<int>(),
         weights_.dense_layers(), weights_.gdn_layers(), sessions_.kv(), sessions_.gdn(), weights_.moe_layers(),
         work_.decode_graph, work_.graph_captured, work_.graph_fused, work_.graph_has_argmax,
         work_.graph_split_bucket, pos, r.fused, graph, argmax, first_step, r.trace, r.timer.get());
@@ -470,10 +529,19 @@ void CudaExecutor::set_token(CudaContext& ctx, const int32_t* token) {
                                        cudaMemcpyHostToDevice, ctx.stream()));
 }
 
-void CudaExecutor::download_token_history(CudaContext& ctx, int offset, std::span<int32_t> tokens) {
+void CudaExecutor::clear_invalid_token(CudaContext& ctx) {
+    FUSIONRT_CUDA_CHECK(cudaMemsetAsync(work_.invalid_token.ptr(), 0, sizeof(int), ctx.stream()));
+}
+
+void CudaExecutor::download_token_history(CudaContext& ctx, int offset, std::span<int32_t> tokens,
+                                             bool check_invalid) {
+    int invalid = 0;
+    if (check_invalid) FUSIONRT_CUDA_CHECK(cudaMemcpyAsync(&invalid, work_.invalid_token.ptr(), sizeof(invalid),
+                                                           cudaMemcpyDeviceToHost, ctx.stream()));
     FUSIONRT_CUDA_CHECK(cudaMemcpyAsync(tokens.data(), work_.token_ids.ptr<int32_t>() + offset, tokens.size_bytes(),
                                        cudaMemcpyDeviceToHost, ctx.stream()));
     ctx.synchronize();
+    if (invalid) throw std::runtime_error("Sampling found no selectable logits");
 }
 
 void CudaExecutor::store_token_history(CudaContext& ctx, int offset) {
@@ -494,28 +562,27 @@ int32_t CudaExecutor::sample_gpu(CudaContext& ctx) {
 }
 
 size_t CudaExecutor::inspect_scratch(CudaContext& ctx) {
-    const int rows = prefill_batch_limit(ctx);
-    const std::vector<int32_t> tokens(rows, 0);
     auto& arena = ctx.scratch_arena();
+    struct RestoreProbe {
+        CudaArena& arena;
+        size_t mark;
+        ~RestoreProbe() { arena.track_peak(false); arena.reset(mark); }
+    } restore{arena, arena.mark()};
+    CudaSessionManager probe_session(weights_, [] {});
+    probe_session.start_sessions(sessions_.dtype(), 0);
+    CudaExecutor probe(weights_, probe_session);
+    probe.work_.logits = cuda_scratch(ctx, {weights_.config().vocab_size});
+    probe.work_.token_ids = cuda_scratch(ctx, {1}, DType::I32);
+    const int rows = probe.prefill_batch_limit(ctx);
+    const std::vector<int32_t> tokens(rows, 0);
     const size_t mark = arena.mark();
-    size_t peak = 0;
-    sessions_.with_probe_session([&] {
-        arena.track_peak(true);
-        try {
-            (void)prefill_cuda_impl(ctx, tokens.data(), rows, 0, true);
-            sessions_.reset_kv_and_state(ctx);
-            (void)prefill_cuda_impl(ctx, tokens.data(), 1, 0, true);
-            decode_argmax(ctx, work_.logits, work_.token_ids, weights_.config().vocab_size);
-            ctx.synchronize();
-            peak = arena.peak() - mark;
-        } catch (...) {
-            arena.track_peak(false);
-            arena.reset(mark);
-            throw;
-        }
-        arena.track_peak(false);
-    });
-    return peak;
+    arena.track_peak(true);
+    (void)probe.prefill_cuda_impl(ctx, tokens.data(), rows, 0, true);
+    probe_session.reset_kv_and_state(ctx);
+    (void)probe.prefill_cuda_impl(ctx, tokens.data(), 1, 0, true);
+    decode_argmax(ctx, probe.work_.logits, probe.work_.token_ids, weights_.config().vocab_size);
+    ctx.synchronize();
+    return arena.peak() - mark;
 }
 
 struct CudaExecutor::MtpDraft {
@@ -584,7 +651,8 @@ bool CudaExecutor::mtp_step(CudaContext& ctx, MtpDraft& draft, int position, int
     };
     const int bucket = select_decode_splits(ctx.cost_hardware(), position + 1,
         weights_.dense_layers().back().cfg.num_key_value_heads, kMaxDecodeSplits);
-    const bool captured = predict && verify.enabled && launch_spec_graph(ctx.stream(), draft.graph, bucket, body);
+    const bool captured = predict && verify.enabled && launch_spec_graph(ctx.stream(), draft.graph, bucket,
+        sessions_.expert_residency_generation(), can_use_cuda_graph(), body);
     if (!captured) {
         spec_arena.reset(mark);
         body();

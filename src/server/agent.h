@@ -105,7 +105,7 @@ private:
     bool llama_calls_ = false, explicit_json_ = false, saw_text_ = false, truncated_call_ = false;
 };
 
-enum class Finish { stop, length, truncated_tool_call };
+enum class Finish { stop, length, truncated_tool_call, stop_sequence, cancelled };
 
 struct Thought {
     std::string text;
@@ -117,6 +117,7 @@ struct AgentResult {
     std::vector<OutputBlock> output;
     int input_tokens = 0, output_tokens = 0;
     Finish finish = Finish::stop;
+    std::string stop_sequence;
 
     bool has_calls() const;
 };
@@ -131,7 +132,8 @@ public:
     void text(std::string_view text);
     void thought(std::string_view text);
     void call(ToolCall call);
-    void finish(Finish reason, int output_tokens);
+    void finish(Finish reason, int output_tokens, std::string stop_sequence = {},
+                JsonObject diagnostics = {});
     void error(std::string_view message);
     JsonValue body() const;
     bool connected() const { return connected_; }
@@ -153,6 +155,7 @@ private:
     int64_t created_;
     EventSink event_;
     AgentResult result_;
+    JsonObject diagnostics_;
     int sequence_ = 0, next_call_ = 0;
     OpenBlock open_block_ = OpenBlock::none;
     bool connected_ = true, stream_usage_ = false;

@@ -69,6 +69,7 @@ void CudaSessionManager::release_cuda_sessions() {
     invalidate_graph_();
     for (auto& slot : cuda_slots_) slot.reset();
     cuda_kv_pool_.release();
+    if (expert_slab_bytes_) ++expert_residency_gen_;
     expert_slabs_.clear();
     expert_slab_bytes_ = 0;
     active_slot_ = 0;
@@ -97,7 +98,7 @@ void CudaSessionManager::reset_kv_and_state(CudaContext& ctx) {
 
 size_t CudaSessionManager::cuda_kv_page_bytes() const {
     size_t page_bytes = 0;
-    for (const auto& layer : cuda_slots_[active_slot_]->kv) page_bytes += layer.page_bytes();
+    for (const auto& layer : active().kv) page_bytes += layer.page_bytes();
     return page_bytes;
 }
 
@@ -183,6 +184,7 @@ void CudaSessionManager::promote_cuda_expert_slabs(CudaContext& ctx, int budgete
         layer.cfg.gpu_resident_experts += count;
         available -= bytes;
         expert_slab_bytes_ += bytes;
+        ++expert_residency_gen_;
     }
     if (promoted) {
         int full = 0;
@@ -213,6 +215,7 @@ void CudaSessionManager::reclaim_cuda_expert_slabs(CudaContext& ctx, size_t targ
         layer.borrowed_up_w = {};
         layer.borrowed_down_w = {};
         ++evicted;
+        ++expert_residency_gen_;
     }
     std::clog << "MoE slabs evicted=" << evicted << " borrowed_bytes=" << expert_slab_bytes_
               << " target_kv_bytes=" << target_kv_bytes << '\n';
@@ -391,7 +394,9 @@ CudaSessionManager::Prefix CudaSessionManager::prepare_prefix(CudaContext& ctx,
 }
 
 CudaLoadSettings CudaSessionManager::load_settings() const {
-    return {requested_kv_budget_, kv_commitment_tokens_, num_slots()};
+    size_t releasable = cuda_kv_pool_.reserved_bytes() + expert_slab_bytes_;
+    for (const auto& slot : cuda_slots_) if (slot) releasable += slot->storage.capacity();
+    return {requested_kv_budget_, releasable, kv_commitment_tokens_, num_slots()};
 }
 
 void CudaSessionManager::configure_placement(DType dtype, size_t kv_budget) {
@@ -435,22 +440,6 @@ void CudaSessionManager::save_recurrent(CudaContext& ctx, void* dst) const {
 void CudaSessionManager::restore_recurrent(CudaContext& ctx, const void* src) {
     if (active().ssm_bytes) FUSIONRT_CUDA_CHECK(cudaMemcpyAsync(active().gdn_data, src,
         active().ssm_bytes, cudaMemcpyDeviceToDevice, ctx.stream()));
-}
-
-void CudaSessionManager::with_probe_session(const std::function<void()>& probe) {
-    auto probe_slot = make_cuda_session();
-    CudaKvPool probe_pool;
-    std::swap(probe_slot, cuda_slots_[active_slot_]);
-    std::swap(probe_pool, cuda_kv_pool_);
-    try {
-        probe();
-    } catch (...) {
-        std::swap(probe_pool, cuda_kv_pool_);
-        std::swap(probe_slot, cuda_slots_[active_slot_]);
-        throw;
-    }
-    std::swap(probe_pool, cuda_kv_pool_);
-    std::swap(probe_slot, cuda_slots_[active_slot_]);
 }
 
 }  // namespace fusionrt

@@ -26,6 +26,10 @@ public:
     void set_kv_commitment_tokens(int tokens);
     DType dtype() const { return cuda_kv_dtype_; }
     size_t borrowed_bytes() const { return expert_slab_bytes_; }
+    uint64_t expert_residency_generation() const { return expert_residency_gen_; }
+    void require_loaded() const {
+        if (!initialized()) throw std::logic_error("CUDA model is not loaded");
+    }
     bool initialized() const { return cuda_slots_[0] != nullptr; }
     const std::vector<CudaKvView>& kv() const { return active().kv; }
     const std::vector<CudaGdnState>& gdn() const { return active().gdn; }
@@ -51,7 +55,6 @@ public:
     void save_cuda_checkpoint(CudaContext&, int tokens, const Tensor* logits);
     ModelMemory cache_memory(size_t logits_bytes) const;
     int cuda_max_active_tokens() const;
-    void with_probe_session(const std::function<void()>&);
     struct Prefix { int length; bool checkpoint_pages; };
     Prefix prepare_prefix(CudaContext&, const std::vector<int32_t>&, bool fused,
                           bool allow_cached_logits, const Tensor& logits);
@@ -81,8 +84,8 @@ private:
         bool cached_fused = true;
         uint64_t last_used = 0;
     };
-    CudaSession& active() { return *cuda_slots_[active_slot_]; }
-    const CudaSession& active() const { return *cuda_slots_[active_slot_]; }
+    CudaSession& active() { require_loaded(); return *cuda_slots_[active_slot_]; }
+    const CudaSession& active() const { require_loaded(); return *cuda_slots_[active_slot_]; }
     std::unique_ptr<CudaSession> make_cuda_session() const;
     size_t cuda_kv_page_bytes() const;
     void reclaim_cuda_expert_slabs(CudaContext&, size_t, bool, std::span<CudaSparseMoELayer>);
@@ -101,6 +104,7 @@ private:
     };
     std::vector<ExpertSlab> expert_slabs_;
     size_t expert_slab_bytes_ = 0;
+    uint64_t expert_residency_gen_ = 0;
 };
 
 }  // namespace fusionrt

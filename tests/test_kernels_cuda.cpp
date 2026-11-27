@@ -178,6 +178,10 @@ void test_cuda_step1_fast_paths(CudaContext& ctx) {
         HostTensor hal = HostTensor::create({nv}, DType::F32);
         for (int i = 0; i < nv; ++i) hal.data<float>()[i] = -1.2f;
         HostTensor hdt = rand_f32({nv}, rng, 0.05f);
+        std::fill_n(hal.data<float>(), nv, 0.f);
+        // A huge first decay must not erase later interval decays.
+        for (int m = 0; m < M; ++m) for (int h = 0; h < nv; ++h)
+            ha.data<float>()[m * nv + h] = m == 0 ? 1e8f : std::log(std::expm1(1.f)) - hdt.data<float>()[h];
         HostTensor hnw_g = rand_f32({dv}, rng, 0.5f);
 
         Tensor d_qkv = ctx.upload(hqkv, false), d_z = ctx.upload(hz, false);
@@ -217,7 +221,7 @@ void test_cuda_step1_fast_paths(CudaContext& ctx) {
         HostTensor h2 = ctx.download(out_pf);
         std::vector<double> ref_v(h1.data<float>(), h1.data<float>() + M * v_dim);
         expect_close(std::vector<float>(h2.data<float>(), h2.data<float>() + M * v_dim),
-                     ref_v, 1e-4, 1e-4, "CUDA GDN 3-stage prefill M=12 vs step-by-step");
+                     ref_v, 1e-4, 1e-4, "CUDA GDN extreme decay prefill vs step-by-step");
     }
 
     // Step 2: Fused Add+RMSNorm+Linear Q4_A/Q8_A + MiniGraph optimization stats & IR parity

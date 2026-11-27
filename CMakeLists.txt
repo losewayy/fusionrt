@@ -195,6 +195,7 @@ if(FUSIONRT_BUILD_TESTS)
         tests/test_models_moe.cpp
         tests/test_model_state.cpp
         tests/test_spec_and_protocols.cpp
+        tests/test_wave1.cpp
     )
     target_include_directories(fusionrt_tests PRIVATE src/server)
     target_link_libraries(fusionrt_tests PRIVATE fusionrt_core)

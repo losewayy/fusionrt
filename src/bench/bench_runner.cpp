@@ -362,11 +362,13 @@ int run_benchmark_suite(const std::string& suite, const std::string& output_json
 #if !defined(FUSIONRT_ENABLE_CUDA) && !defined(FUSIONRT_ENABLE_VULKAN)
     return 1;
 #else
-#ifdef FUSIONRT_ENABLE_CUDA
-    CudaContext cuda_ctx(0, 512, 256);
-    size_t l2_bytes = cuda_ctx.info().l2_cache_bytes;
-#else
     size_t l2_bytes = 32ULL * 1024ULL * 1024ULL;
+#ifdef FUSIONRT_ENABLE_CUDA
+    std::unique_ptr<CudaContext> cuda;
+    if (suite != "vulkan") {
+        cuda = std::make_unique<CudaContext>(0, 512, 256);
+        l2_bytes = cuda->info().l2_cache_bytes;
+    }
 #endif
     NvmlSample nv_start = read_nvml(0);
     std::vector<BenchmarkEntry> entries;
@@ -387,6 +389,7 @@ int run_benchmark_suite(const std::string& suite, const std::string& output_json
     // 1. CUDA Fusions Suite
     // -------------------------------------------------------------------------
     if (run_all || suite == "fusions") {
+        auto& cuda_ctx = *cuda;
         // 1a. Fused Pre-Norm + Linear (K=4096, N=6144, M=1, F32)
         {
             int M = 1, K = 4096, N = 6144;
@@ -650,6 +653,7 @@ int run_benchmark_suite(const std::string& suite, const std::string& output_json
     // 2. End-to-End Architecture Blocks Suite (Dense, Hybrid 3:1, Sparse MoE)
     // -------------------------------------------------------------------------
     if (run_all || suite == "blocks") {
+        auto& cuda_ctx = *cuda;
         for (const std::string& arch : {"dense", "hybrid", "moe"}) {
             cuda_ctx.weight_arena().reset();
             cuda_ctx.scratch_arena().reset();

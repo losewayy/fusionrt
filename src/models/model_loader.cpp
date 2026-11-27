@@ -9,6 +9,7 @@
 #include "fusionrt/safetensors.h"
 #include <algorithm>
 #include <cmath>
+#include <climits>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
@@ -629,7 +630,8 @@ bool parse_gguf_model_raw(const std::string& path, int max_seq_override, LoadedM
             const double log_factor = std::log(factor);
             const double amplitude = attn_factor * (ext != 0 && log_mul == 0 ? 1 + 0.1 * log_factor : 1);
             mla.rope_amplitude = static_cast<float>(amplitude);
-            const double score_scale = amplitude * (1 + log_mul * log_factor);
+            const double score_scale = scaling == "linear" && factor > 1
+                ? 1 + 0.1 * log_factor : amplitude * (1 + log_mul * log_factor);
             mla.attention_scale = static_cast<float>(score_scale * score_scale / std::sqrt(hd));
             if (!(mla.attention_scale > 0) || !std::isfinite(mla.attention_scale) ||
                 !(mla.rope_amplitude > 0) || !std::isfinite(mla.rope_amplitude)) {
@@ -1097,7 +1099,7 @@ bool parse_gguf_model_raw(const std::string& path, int max_seq_override, LoadedM
     return true;
 }
 
-bool parse_safetensors_model_raw(const std::string& path, int max_seq_override, LoadedModelRaw& out, std::string* err) {
+bool parse_safetensors_model_raw(const std::string& path, int max_seq_override, LoadedModelRaw& out, std::string* err) try {
     SafetensorsFile sf;
     if (!sf.load(path, err)) return false;
 
@@ -1122,7 +1124,11 @@ bool parse_safetensors_model_raw(const std::string& path, int max_seq_override, 
     }
 
     auto get_int = [&](const std::string& k, int def) {
-        return cobj.count(k) ? static_cast<int>(cobj.at(k).as_int(def)) : def;
+        const auto it = cobj.find(k);
+        if (it == cobj.end()) return def;
+        if (!it->second.is_int() || it->second.as_int() < 0 || it->second.as_int() > INT_MAX)
+            throw std::runtime_error("Invalid config.json dimension: " + k);
+        return static_cast<int>(it->second.as_int());
     };
     auto get_flt = [&](const std::string& k, float def) {
         return cobj.count(k) ? static_cast<float>(cobj.at(k).as_double(def)) : def;
@@ -1140,19 +1146,27 @@ bool parse_safetensors_model_raw(const std::string& path, int max_seq_override, 
     int hd = get_int("head_dim", (nq > 0) ? (H / nq) : 0);
     int inter = get_int("intermediate_size", 0);
     int vocab = get_int("vocab_size", 0);
-    if (H <= 0 || num_layers <= 0 || nq <= 0 || hd <= 0 || inter <= 0 || vocab <= 0) {
+    if (H <= 0 || num_layers <= 0 || static_cast<size_t>(num_layers) > sf.tensors().size() ||
+        nq <= 0 || nkv <= 0 || nq % nkv != 0 || hd <= 0 || nq > INT_MAX / hd ||
+        inter <= 0 || inter > INT_MAX / 2 || vocab <= 0) {
         if (err) *err = "config.json missing required model dimensions (hidden_size/num_hidden_layers/num_attention_heads/intermediate_size/vocab_size)";
         return false;
     }
 
-    if (!sf.find_tensor("model.embed_tokens.weight") || !sf.find_tensor("model.norm.weight")) {
-        if (err) *err = "Safetensors missing model.embed_tokens.weight or model.norm.weight";
-        return false;
-    }
-    out.tok_embeddings = sf.read_tensor("model.embed_tokens.weight");
-    out.final_norm_w = to_f32_host(sf.read_tensor("model.norm.weight"));
+    const auto req = [&](const std::string& name, std::initializer_list<int64_t> dimensions = {}) {
+        const auto* entry = sf.find_tensor(name);
+        if (!entry) throw std::runtime_error("Safetensors missing required tensor: " + name);
+        if (dimensions.size() && !std::equal(dimensions.begin(), dimensions.end(),
+                                            entry->shape.begin(), entry->shape.end()))
+            throw std::runtime_error("Safetensors shape disagrees with config.json: " + name);
+        if (entry->dtype != DType::F32 && entry->dtype != DType::F16 && entry->dtype != DType::BF16)
+            throw std::runtime_error("Unsupported Safetensors model weight dtype: " + name);
+        return sf.read_tensor(name);
+    };
+    out.tok_embeddings = req("model.embed_tokens.weight", {vocab, H});
+    out.final_norm_w = to_f32_host(req("model.norm.weight", {H}));
     if (sf.find_tensor("lm_head.weight")) {
-        out.lm_head_w = sf.read_tensor("lm_head.weight");
+        out.lm_head_w = req("lm_head.weight", {vocab, H});
     } else if (get_bool("tie_word_embeddings", true)) {
         out.lm_head_w = out.tok_embeddings;
     } else {
@@ -1161,6 +1175,7 @@ bool parse_safetensors_model_raw(const std::string& path, int max_seq_override, 
     }
 
     int ctx_len = get_int("max_position_embeddings", 4096);
+    if (ctx_len <= 0) throw std::runtime_error("Invalid config.json context length");
     if (max_seq_override > 0) ctx_len = max_seq_override;
     else ctx_len = std::min(ctx_len, 4096);
 
@@ -1194,97 +1209,105 @@ bool parse_safetensors_model_raw(const std::string& path, int max_seq_override, 
     out.cfg.moe.gpu_resident_experts = out.cfg.moe.num_experts;
     out.cfg.moe.rms_norm_eps = out.cfg.dense.rms_norm_eps;
 
-    auto req = [&](const std::string& name) -> HostTensor {
-        if (!sf.find_tensor(name)) {
-            throw std::runtime_error("Safetensors missing required tensor: " + name);
-        }
-        return sf.read_tensor(name);
-    };
-
     bool saw_gdn = false, saw_moe = false;
     out.layers.resize(static_cast<size_t>(num_layers));
-    try {
-        for (int i = 0; i < num_layers; ++i) {
-            std::string pfx = "model.layers." + std::to_string(i) + ".";
-            LoadedLayerRaw& L = out.layers[static_cast<size_t>(i)];
-            if (sf.find_tensor(pfx + "linear_attn.conv1d.weight")) {
-                L.kind = 1;
-                saw_gdn = true;
-                L.attn_norm = to_f32_host(req(pfx + "input_layernorm.weight"));
-                L.qkv_proj = req(pfx + "linear_attn.in_proj_qkv.weight");
-                L.z_proj = req(pfx + "linear_attn.in_proj_z.weight");
-                L.a_proj = req(pfx + "linear_attn.in_proj_a.weight");
-                L.b_proj = req(pfx + "linear_attn.in_proj_b.weight");
-                L.conv_w = to_f32_host(req(pfx + "linear_attn.conv1d.weight"));
-                L.conv_bias = sf.find_tensor(pfx + "linear_attn.conv1d.bias")
-                    ? to_f32_host(sf.read_tensor(pfx + "linear_attn.conv1d.bias"))
-                    : make_zeros_f32({L.conv_w.desc.shape[0]});
-                L.A_log = to_f32_host(req(pfx + "linear_attn.A_log"));
-                L.dt_bias = to_f32_host(req(pfx + "linear_attn.dt_bias"));
-                L.gdn_norm_w = to_f32_host(req(pfx + "linear_attn.norm.weight"));
-                L.o_proj = req(pfx + "linear_attn.out_proj.weight");
-                L.mlp_norm = to_f32_host(req(pfx + "post_attention_layernorm.weight"));
-                L.gate_up = concat_rows_same_dtype({req(pfx + "mlp.gate_proj.weight"), req(pfx + "mlp.up_proj.weight")});
-                L.down = req(pfx + "mlp.down_proj.weight");
-                validate_gdn_layer(L, get_int("linear_conv_kernel_dim", 4), out.cfg.gdn, pfx);
-            } else if (sf.find_tensor(pfx + "mlp.gate.weight")) {
-                L.kind = 2;
-                saw_moe = true;
-                L.attn_norm = to_f32_host(req(pfx + "input_layernorm.weight"));
-                L.router_w = to_f32_host(req(pfx + "mlp.gate.weight"));
-                int E = static_cast<int>(L.router_w.desc.shape[0]);
-                out.cfg.moe.num_experts = E;
-                out.cfg.moe.gpu_resident_experts = E;
-                std::vector<HostTensor> gu_list, dn_list;
-                for (int e = 0; e < E; ++e) {
-                    std::string ep = pfx + "mlp.experts." + std::to_string(e) + ".";
-                    gu_list.push_back(to_f32_host(req(ep + "gate_proj.weight")));
-                    gu_list.push_back(to_f32_host(req(ep + "up_proj.weight")));
-                    dn_list.push_back(to_f32_host(req(ep + "down_proj.weight")));
-                }
-                int64_t inter_e = gu_list[0].desc.shape[0];
-                out.cfg.moe.intermediate_size = static_cast<int>(inter_e);
-                L.experts_gate_up = concat_rows_same_dtype(gu_list);
-                L.experts_gate_up.desc = Tensor::from_shape({E, 2 * inter_e, H}, DType::F32, Backend::CPU);
-                L.experts_down = concat_rows_same_dtype(dn_list);
-                L.experts_down.desc = Tensor::from_shape({E, H, inter_e}, DType::F32, Backend::CPU);
-                if (sf.find_tensor(pfx + "mlp.shared_expert.gate_proj.weight")) {
-                    L.has_shared = true;
-                    out.cfg.moe.has_shared_expert = true;
-                    L.shared_gate_up = concat_rows_same_dtype({
-                        req(pfx + "mlp.shared_expert.gate_proj.weight"),
-                        req(pfx + "mlp.shared_expert.up_proj.weight")});
-                    L.shared_down = req(pfx + "mlp.shared_expert.down_proj.weight");
-                    out.cfg.moe.shared_intermediate_size = static_cast<int>(L.shared_down.desc.shape[1]);
-                } else {
-                    out.cfg.moe.has_shared_expert = false;
-                }
-            } else {
-                L.kind = 0;
-                L.attn_norm = to_f32_host(req(pfx + "input_layernorm.weight"));
-                L.q_proj = req(pfx + "self_attn.q_proj.weight");
-                L.k_proj = req(pfx + "self_attn.k_proj.weight");
-                L.v_proj = req(pfx + "self_attn.v_proj.weight");
-                if (sf.find_tensor(pfx + "self_attn.q_norm.weight") && sf.find_tensor(pfx + "self_attn.k_norm.weight")) {
-                    out.cfg.dense.qk_norm = true;
-                    L.q_norm = to_f32_host(sf.read_tensor(pfx + "self_attn.q_norm.weight"));
-                    L.k_norm = to_f32_host(sf.read_tensor(pfx + "self_attn.k_norm.weight"));
-                }
-                L.o_proj = req(pfx + "self_attn.o_proj.weight");
-                L.mlp_norm = to_f32_host(req(pfx + "post_attention_layernorm.weight"));
-                L.gate_up = concat_rows_same_dtype({req(pfx + "mlp.gate_proj.weight"), req(pfx + "mlp.up_proj.weight")});
-                L.down = req(pfx + "mlp.down_proj.weight");
+    for (int i = 0; i < num_layers; ++i) {
+        std::string pfx = "model.layers." + std::to_string(i) + ".";
+        LoadedLayerRaw& L = out.layers[static_cast<size_t>(i)];
+        if (sf.find_tensor(pfx + "linear_attn.conv1d.weight")) {
+            L.kind = 1;
+            saw_gdn = true;
+            L.attn_norm = to_f32_host(req(pfx + "input_layernorm.weight"));
+            L.qkv_proj = req(pfx + "linear_attn.in_proj_qkv.weight");
+            L.z_proj = req(pfx + "linear_attn.in_proj_z.weight");
+            L.a_proj = req(pfx + "linear_attn.in_proj_a.weight");
+            L.b_proj = req(pfx + "linear_attn.in_proj_b.weight");
+            L.conv_w = to_f32_host(req(pfx + "linear_attn.conv1d.weight"));
+            L.conv_bias = sf.find_tensor(pfx + "linear_attn.conv1d.bias")
+                ? to_f32_host(sf.read_tensor(pfx + "linear_attn.conv1d.bias"))
+                : make_zeros_f32({L.conv_w.desc.shape[0]});
+            L.A_log = to_f32_host(req(pfx + "linear_attn.A_log"));
+            L.dt_bias = to_f32_host(req(pfx + "linear_attn.dt_bias"));
+            L.gdn_norm_w = to_f32_host(req(pfx + "linear_attn.norm.weight"));
+            L.o_proj = req(pfx + "linear_attn.out_proj.weight");
+            L.mlp_norm = to_f32_host(req(pfx + "post_attention_layernorm.weight"));
+            L.gate_up = concat_rows_same_dtype({req(pfx + "mlp.gate_proj.weight", {inter, H}), req(pfx + "mlp.up_proj.weight", {inter, H})});
+            L.down = req(pfx + "mlp.down_proj.weight", {H, inter});
+            validate_gdn_layer(L, get_int("linear_conv_kernel_dim", 4), out.cfg.gdn, pfx);
+        } else if (sf.find_tensor(pfx + "mlp.gate.weight")) {
+            L.kind = 2;
+            saw_moe = true;
+            L.attn_norm = to_f32_host(req(pfx + "input_layernorm.weight", {H}));
+            const auto& router = *sf.find_tensor(pfx + "mlp.gate.weight");
+            const auto experts = router.shape[0];
+            if (experts <= 0 || experts > INT_MAX ||
+                experts > static_cast<int64_t>(sf.tensors().size()) / 3 ||
+                (out.cfg.moe.num_experts && experts != out.cfg.moe.num_experts) ||
+                out.cfg.moe.top_k <= 0 || out.cfg.moe.top_k > experts)
+                throw std::runtime_error("Invalid Safetensors MoE router geometry: " + pfx);
+            const int E = static_cast<int>(experts);
+            L.router_w = to_f32_host(req(pfx + "mlp.gate.weight", {E, H}));
+            const auto* first_gate = sf.find_tensor(pfx + "mlp.experts.0.gate_proj.weight");
+            if (!first_gate || first_gate->shape[0] <= 0 || first_gate->shape[0] > INT_MAX / 2)
+                throw std::runtime_error("Invalid Safetensors expert geometry: " + pfx);
+            const int64_t inter_e = get_int("moe_intermediate_size", static_cast<int>(first_gate->shape[0]));
+            out.cfg.moe.num_experts = E;
+            out.cfg.moe.gpu_resident_experts = E;
+            std::vector<HostTensor> gu_list, dn_list;
+            for (int e = 0; e < E; ++e) {
+                std::string ep = pfx + "mlp.experts." + std::to_string(e) + ".";
+                gu_list.push_back(to_f32_host(req(ep + "gate_proj.weight", {inter_e, H})));
+                gu_list.push_back(to_f32_host(req(ep + "up_proj.weight", {inter_e, H})));
+                dn_list.push_back(to_f32_host(req(ep + "down_proj.weight", {H, inter_e})));
             }
+            out.cfg.moe.intermediate_size = static_cast<int>(inter_e);
+            L.experts_gate_up = concat_rows_same_dtype(gu_list);
+            L.experts_gate_up.desc = Tensor::from_shape({E, 2 * inter_e, H}, DType::F32, Backend::CPU);
+            L.experts_down = concat_rows_same_dtype(dn_list);
+            L.experts_down.desc = Tensor::from_shape({E, H, inter_e}, DType::F32, Backend::CPU);
+            if (const auto* shared_gate = sf.find_tensor(pfx + "mlp.shared_expert.gate_proj.weight")) {
+                const auto width = shared_gate->shape[0];
+                if (width <= 0 || width > INT_MAX / 2 ||
+                    width != get_int("shared_expert_intermediate_size", static_cast<int>(width)))
+                    throw std::runtime_error("Invalid Safetensors shared expert geometry: " + pfx);
+                L.has_shared = true;
+                out.cfg.moe.has_shared_expert = true;
+                L.shared_gate_up = concat_rows_same_dtype({
+                    req(pfx + "mlp.shared_expert.gate_proj.weight", {width, H}),
+                    req(pfx + "mlp.shared_expert.up_proj.weight", {width, H})});
+                L.shared_down = req(pfx + "mlp.shared_expert.down_proj.weight", {H, width});
+                out.cfg.moe.shared_intermediate_size = static_cast<int>(L.shared_down.desc.shape[1]);
+            } else {
+                out.cfg.moe.has_shared_expert = false;
+            }
+        } else {
+            L.kind = 0;
+            L.attn_norm = to_f32_host(req(pfx + "input_layernorm.weight", {H}));
+            L.q_proj = req(pfx + "self_attn.q_proj.weight", {nq * hd, H});
+            L.k_proj = req(pfx + "self_attn.k_proj.weight", {nkv * hd, H});
+            L.v_proj = req(pfx + "self_attn.v_proj.weight", {nkv * hd, H});
+            const bool has_q_norm = sf.find_tensor(pfx + "self_attn.q_norm.weight") != nullptr;
+            const bool has_k_norm = sf.find_tensor(pfx + "self_attn.k_norm.weight") != nullptr;
+            if (has_q_norm != has_k_norm)
+                throw std::runtime_error("Incomplete Safetensors Q/K normalization: " + pfx);
+            if (has_q_norm) {
+                out.cfg.dense.qk_norm = true;
+                L.q_norm = to_f32_host(req(pfx + "self_attn.q_norm.weight", {hd}));
+                L.k_norm = to_f32_host(req(pfx + "self_attn.k_norm.weight", {hd}));
+            }
+            L.o_proj = req(pfx + "self_attn.o_proj.weight", {H, nq * hd});
+            L.mlp_norm = to_f32_host(req(pfx + "post_attention_layernorm.weight", {H}));
+            L.gate_up = concat_rows_same_dtype({req(pfx + "mlp.gate_proj.weight", {inter, H}), req(pfx + "mlp.up_proj.weight", {inter, H})});
+            L.down = req(pfx + "mlp.down_proj.weight", {H, inter});
         }
-    } catch (const std::exception& e) {
-        if (err) *err = e.what();
-        return false;
     }
-
     if (saw_gdn) out.cfg.arch = "hybrid";
     else if (saw_moe) out.cfg.arch = "moe";
     else out.cfg.arch = "dense";
     return true;
+} catch (const std::exception& e) {
+    if (err) *err = e.what();
+    return false;
 }
 
 }  // namespace fusionrt::model_io

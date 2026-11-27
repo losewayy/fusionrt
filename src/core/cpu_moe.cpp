@@ -478,16 +478,18 @@ CpuMoeQ8SmallDot cpu_moe_vnni_small_dot(DType dtype) {
     return nullptr;
 }
 
+static float finite_activation(float x) { return std::isfinite(x) ? x : 0.0f; }
+
 void cpu_moe_quantize_q8_small(const float* input, CpuQ8Small* output, int cols) {
     for (int i = 0; i < cols; i += 32) {
         auto& block = output[i / 32];
         float max = 0.0f;
-        for (int j = 0; j < 32; ++j) max = std::max(max, std::abs(input[i + j]));
+        for (int j = 0; j < 32; ++j) max = std::max(max, std::abs(finite_activation(input[i + j])));
         block.scale = max / 127.0f;
         const float inv = max > 0.0f ? 127.0f / max : 0.0f;
         int sum = 0;
         for (int j = 0; j < 32; ++j) {
-            block.values[j] = static_cast<int8_t>(std::nearbyint(input[i + j] * inv));
+            block.values[j] = static_cast<int8_t>(std::nearbyint(finite_activation(input[i + j]) * inv));
             sum += block.values[j];
         }
         block.sum = static_cast<int16_t>(sum);
@@ -504,13 +506,13 @@ void cpu_moe_quantize_q8(const float* input, CpuQ8K* output, int cols) {
     for (int i = 0; i < cols; i += 256) {
         auto& block = output[i / 256];
         float max = 0.0f;
-        for (int j = 0; j < 256; ++j) max = std::max(max, std::abs(input[i + j]));
+        for (int j = 0; j < 256; ++j) max = std::max(max, std::abs(finite_activation(input[i + j])));
         block.scale = max / 127.f;
         const float inv = max > 0.f ? 127.f / max : 0.f;
         for (int sub = 0; sub < 16; ++sub) {
             int sum = 0;
             for (int j = sub * 16; j < (sub + 1) * 16; ++j) {
-                block.values[j] = static_cast<int8_t>(std::nearbyint(input[i + j] * inv));
+                block.values[j] = static_cast<int8_t>(std::nearbyint(finite_activation(input[i + j]) * inv));
                 sum += block.values[j];
             }
             block.sums[sub] = static_cast<int16_t>(sum);
@@ -547,8 +549,10 @@ static int accumulate_layer(CpuWorkers* workers, CpuMoeWorkspace& scratch,
         scratch.offsets[row] = static_cast<int>(jobs.size());
         for (int k = 0; k < top_k; ++k) {
             const int route = row * top_k + k;
-            if (indices[route] < first_cold) continue;
-            const size_t expert = static_cast<size_t>(indices[route] - host_first);
+            const int id = indices[route];
+            if (id < 0 || id < first_cold || id < host_first ||
+                static_cast<int64_t>(id) - host_first >= down.desc.shape[0]) continue;
+            const size_t expert = static_cast<size_t>(id - host_first);
             const size_t first = expert * inter;
             const auto* g = gate.bytes().data() + first * (packed ? 2 : 1) * gate_stride;
             const auto* u = packed ? g + inter * gate_stride : up.bytes().data() + first * up_stride;
@@ -762,6 +766,7 @@ int cpu_moe_accumulate_layer(CpuWorkers* workers, CpuMoeWorkspace& scratch,
 
 void cpu_moe_accumulate(const HostTensor& gate, const HostTensor& up, const HostTensor& down,
                         int expert, const float* input, float weight, float* output, CpuMoeMode mode) {
+    if (expert < 0 || expert >= down.desc.shape[0]) return;
     thread_local CpuMoeWorkspace workspace;
     thread_local std::vector<float> contribution;
     const int hidden = static_cast<int>(down.desc.shape[1]);
@@ -771,8 +776,8 @@ void cpu_moe_accumulate(const HostTensor& gate, const HostTensor& up, const Host
         thread_local CpuWorkers pool;
         workers = &pool;
     }
-    cpu_moe_accumulate_layer(workers, workspace, gate, up, down, &expert, &weight, 0, 0, 1, 1,
-                             input, contribution.data(), mode);
+    if (!cpu_moe_accumulate_layer(workers, workspace, gate, up, down, &expert, &weight, 0, 0, 1, 1,
+                                  input, contribution.data(), mode)) return;
     for (int i = 0; i < hidden; ++i) output[i] += contribution[i];
 }
 

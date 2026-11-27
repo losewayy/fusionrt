@@ -22,6 +22,7 @@ struct Tensor {
     uint64_t vk_offset = 0;      // byte offset into VkBuffer
     size_t byte_offset = 0;      // byte offset on CPU/CUDA base pointer
     std::string name;
+    float codec_tile_scale = 1.0f;
     int hadamard_block = 0;
     const int8_t* hadamard_signs = nullptr;  // Device vector on uploaded rotated weights.
     int hadamard_head_dim = 0, hadamard_key_heads = 0;

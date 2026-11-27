@@ -147,7 +147,20 @@ static OpTiming operator_work(const IRNode& node, int rows, int pos, const CudaC
             const int64_t inter = moe->cfg.intermediate_size;
             norm(n, m, true);
             work.flops += m * (2 * n * experts + selected * (6 * n * inter + 5 * inter + 2 * n));
-            work.bytes += m * (moe->router_w.nbytes() + f32 * (selected * 3 * n * inter + experts + 2 * n));
+            const auto expert_bytes = [&](const auto& gate, const auto& up, const auto& down, int64_t count) {
+                return count ? (gate + up + down) / count : size_t{0};
+            };
+            const int64_t base = moe->gpu_down_w.data ? moe->gpu_down_w.shape[0] : 0;
+            const int64_t borrowed = moe->borrowed_down_w.data ? moe->borrowed_down_w.shape[0] : 0;
+            const int64_t cold = experts - base - borrowed;
+            const auto base_bytes = expert_bytes(moe->gpu_gate_up_w.nbytes(), moe->gpu_up_w.nbytes(),
+                moe->gpu_down_w.nbytes(), base);
+            const auto slab_bytes = expert_bytes(moe->borrowed_gate_up_w.nbytes(), moe->borrowed_up_w.nbytes(),
+                moe->borrowed_down_w.nbytes(), borrowed);
+            const auto cold_bytes = expert_bytes(moe->cpu_gate_up_w.bytes().size(), moe->cpu_up_w.bytes().size(),
+                moe->cpu_down_w.bytes().size(), moe->cpu_down_w.desc.ndim ? moe->cpu_down_w.desc.shape[0] : 0);
+            const auto average = (base * base_bytes + borrowed * slab_bytes + cold * cold_bytes) / experts;
+            work.bytes += m * (moe->router_w.nbytes() + selected * average + f32 * (experts + 2 * n));
             if (moe->shared_down_w.data) {
                 work.bytes += m * (moe->shared_gate_up_w.nbytes() + moe->shared_down_w.nbytes());
                 work.flops += m * (6 * n + 5) * moe->cfg.shared_intermediate_size;
@@ -171,8 +184,13 @@ void execute_ir_graph_cuda(
     const std::vector<CudaSparseMoELayer>& moe_layers,
     bool use_fused, OpTrace* op_trace, CudaOpTimer* timer,
     LayerTrace* layer_trace, bool compute_logits, bool all_logits,
-    const CudaIRSegment* segment, float* nextn_out, GdnReplay* replay) {
-    size_t mark = ctx.scratch_arena().mark();
+    const CudaIRSegment* segment, float* nextn_out, GdnReplay* replay, const int* image_bounds) {
+    auto& scratch = ctx.scratch_arena();
+    struct RestoreScratch {
+        CudaArena& arena;
+        size_t mark;
+        ~RestoreScratch() { arena.reset(mark); }
+    } restore{scratch, scratch.mark()};
     int H = g.hidden_size;
     const int first_node = segment ? segment->first : 0;
     const int num_nodes = segment ? segment->end : static_cast<int>(g.nodes.size());
@@ -191,7 +209,7 @@ void execute_ir_graph_cuda(
         cuda_ops::rmsnorm_f32(projected.ptr<float>(), g.gemma_inputs.norm->ptr<float>(), normalized.ptr<float>(),
                               M * cols / width, width, g.gemma_input_eps * H, ctx.stream());
         cuda_ops::embed_lookup_f32(embedding->ptr(), embedding->dtype, token_ids.ptr<int32_t>(),
-                                  ple.ptr<float>(), M, cols, ctx.stream());
+                                  ple.ptr<float>(), M, cols, static_cast<int>(embedding->shape[0]), ctx.stream());
         cuda_ops::scale_f32(ple.ptr<float>(), M * cols, std::sqrt(static_cast<float>(width)), ctx.stream());
         cuda_ops::add_residual_f32(ple.ptr<float>(), normalized.ptr<float>(), ple.ptr<float>(), M * cols, ctx.stream());
         cuda_ops::scale_f32(ple.ptr<float>(), M * cols, 0.7071067811865475f, ctx.stream());
@@ -456,13 +474,13 @@ void execute_ir_graph_cuda(
                                     state, L.sliding_window);
                                 ctx.scratch_arena().reset(mark);
                             }
-                        } else if ((hd == 64 || hd == 128 || hd == 256) && start_pos + rows >= 512) {
+                        } else if (!image_bounds && (hd == 64 || hd == 128 || hd == 256) && start_pos + rows >= 512) {
                             cuda_ops::gqa_prefill_online_f32(q_p, q_stride, state, attn_out.ptr<float>(),
                                 rows, nq, nkv, hd, start_pos, scale, ctx.stream(), L.sliding_window);
                         } else {
                             cuda_ops::gqa_prefill_causal_f32(q_p, nullptr, nullptr, attn_out.ptr<float>(),
                                 rows, nq, nkv, hd, start_pos, cfg.max_context, scale, ctx.stream(),
-                                q_stride, state.dtype, state, L.sliding_window);
+                                q_stride, state.dtype, state, L.sliding_window, true, image_bounds);
                         }
                     }
                     if (node.attention.gated && !quantize_output) {
@@ -680,7 +698,6 @@ void execute_ir_graph_cuda(
         FUSIONRT_CUDA_CHECK(cudaMemcpyAsync(segment->boundary->ptr(), output.ptr(), output.nbytes(),
                                             cudaMemcpyDeviceToDevice, ctx.stream()));
     }
-    ctx.scratch_arena().reset(mark);
 }
 
 template void execute_ir_graph_cuda<false>(
@@ -694,7 +711,7 @@ template void execute_ir_graph_cuda<false>(
     const std::vector<CudaSparseMoELayer>& moe_layers,
     bool use_fused, OpTrace* op_trace, CudaOpTimer* timer,
     LayerTrace* layer_trace, bool compute_logits, bool all_logits,
-    const CudaIRSegment* segment, float* nextn_out, GdnReplay* replay);
+    const CudaIRSegment* segment, float* nextn_out, GdnReplay* replay, const int* image_bounds);
 template void execute_ir_graph_cuda<true>(
     const MiniGraph& g, CudaIRWorkspace& ws, CudaContext& ctx,
     const Tensor& x_input, const Tensor& token_ids, Tensor& logits_buf,
@@ -706,7 +723,7 @@ template void execute_ir_graph_cuda<true>(
     const std::vector<CudaSparseMoELayer>& moe_layers,
     bool use_fused, OpTrace* op_trace, CudaOpTimer* timer,
     LayerTrace* layer_trace, bool compute_logits, bool all_logits,
-    const CudaIRSegment* segment, float* nextn_out, GdnReplay* replay);
+    const CudaIRSegment* segment, float* nextn_out, GdnReplay* replay, const int* image_bounds);
 
 }  // namespace fusionrt
 #endif

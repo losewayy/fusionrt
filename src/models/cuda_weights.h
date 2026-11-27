@@ -8,6 +8,7 @@ namespace fusionrt {
 // The facade wires runtime resources into the loader without making the loader depend on them.
 struct CudaLoadSettings {
     size_t requested_kv_bytes;
+    size_t releasable_session_bytes;
     int commitment_tokens;
     int slots;
 };

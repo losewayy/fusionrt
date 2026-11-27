@@ -49,6 +49,8 @@ namespace fusionrt {
 struct CudaReviewTestAccess {
     static auto& instantiate(CudaGraphExec& graph) { return graph.instantiate_; }
     static decltype(CudaKvPool::allocate_)& allocator(FusionModel& model);
+    static CudaGraphExec& graph(FusionModel& model);
+    static uint64_t residency(FusionModel& model);
 };
 }  // namespace fusionrt
 #endif

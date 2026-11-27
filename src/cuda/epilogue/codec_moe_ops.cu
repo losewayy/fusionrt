@@ -270,21 +270,33 @@ __global__ void k_codec_verify_q8_1(const int* __restrict__ x, const uint8_t* __
 
 template<class Codec, bool Embedding>
 __global__ void k_codec_unpack(const uint8_t* w, const int32_t* ids,
-                               void* out, int rows, int cols, int first) {
+                               void* out, int rows, int cols, int first, int vocab_size, int* invalid_token, float inverse_scale) {
     constexpr int warps = 8;
     const int block = blockIdx.x * warps + threadIdx.x / 32;
     const int row_blocks = cols / Codec::kBlockSize;
     if (block >= row_blocks) return;
     for (int row = blockIdx.y; row < rows; row += gridDim.y) {
         const int64_t src_row = Embedding ? ids[row] : static_cast<int64_t>(row) + first;
-        const auto* b = w + (src_row * row_blocks + block) * Codec::kBlockBytes;
         const int64_t pos = static_cast<int64_t>(row) * cols + block * Codec::kBlockSize;
+        if constexpr (Embedding) {
+            if (src_row < 0 || src_row >= vocab_size) {
+                if (invalid_token && block == 0 && threadIdx.x == 0) atomicExch(invalid_token, 1);
+                for (int i = threadIdx.x & 31; i < Codec::kBlockSize; i += 32)
+                    static_cast<float*>(out)[pos + i] = 0.0f;
+                continue;
+            }
+        }
+        const auto* b = w + (src_row * row_blocks + block) * Codec::kBlockBytes;
 #pragma unroll
         for (int offset = 0; offset < Codec::kBlockSize; offset += 32) {
             const int i = offset + (threadIdx.x & 31);
             const float v = Codec::value(b, i);
             if constexpr (Embedding) static_cast<float*>(out)[pos + i] = v;
-            else static_cast<half*>(out)[pos + i] = __float2half_rn(v);
+            else {
+                const float scaled = v * inverse_scale;
+                static_cast<half*>(out)[pos + i] = __float2half_rn(
+                    isfinite(scaled) ? fminf(65504.f, fmaxf(-65504.f, scaled)) : scaled);
+            }
         }
     }
 }
@@ -374,14 +386,15 @@ __global__ void k_moe_indexed_down_combine(
 
 __global__ void k_embed_lookup_f32(const uint8_t* __restrict__ table, int dtype,
                                    const int32_t* __restrict__ token_ids,
-                                   float* __restrict__ out, int M, int hidden) {
+                                   float* __restrict__ out, int M, int hidden, int vocab_size, int* invalid_token) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     int total = M * hidden;
     if (idx >= total) return;
     int m = idx / hidden;
     int c = idx % hidden;
     int tid = token_ids[m];
-    if (tid < 0) {
+    if (tid < 0 || tid >= vocab_size) {
+        if (invalid_token && c == 0) atomicExch(invalid_token, 1);
         out[idx] = 0.0f;
         return;
     }
@@ -449,13 +462,14 @@ __global__ void k_embed_lookup_f32(const uint8_t* __restrict__ table, int dtype,
 template<class Block>
 __global__ void k_embed_lookup_repacked_f32(const Block* __restrict__ table,
                                             const int32_t* __restrict__ token_ids,
-                                            float* __restrict__ out, int blocks_per_row) {
+                                            float* __restrict__ out, int blocks_per_row, int vocab_size, int* invalid_token) {
     const int row = blockIdx.y;
     const int col = blockIdx.x;
     const int lane = threadIdx.x;
     const auto index = (static_cast<int64_t>(row) * blocks_per_row + col) * 256 + lane;
     const int token = token_ids[row];
-    if (token < 0) {
+    if (token < 0 || token >= vocab_size) {
+        if (invalid_token && col == 0 && lane == 0) atomicExch(invalid_token, 1);
         out[index] = 0.0f;
         return;
     }
@@ -696,6 +710,7 @@ void moe_indexed_swiglu_gemv(
 
 void codec_gemv_f32(const float* x, const void* weight, DType dtype, float* out,
                      int rows, int out_cols, int in_cols, cudaStream_t stream) {
+    if (rows <= 0 || out_cols <= 0) return;
     (void)row_nbytes(dtype, in_cols);
     constexpr int warps = 4;
     const dim3 blocks((out_cols - 1) / warps + 1, std::min(rows, 65535));
@@ -706,12 +721,13 @@ void codec_gemv_f32(const float* x, const void* weight, DType dtype, float* out,
 }
 
 void codec_dequant_tile_f16(const void* weight, DType dtype, uint16_t* out,
-                             int first_row, int rows, int cols, cudaStream_t stream) {
+                             int first_row, int rows, int cols, cudaStream_t stream, float weight_scale) {
+    if (rows <= 0 || cols <= 0) return;
     (void)row_nbytes(dtype, cols);
     visit_weight_codec(dtype, [&]<class Codec>() {
         const dim3 blocks((cols / Codec::kBlockSize + 7) / 8, std::min(rows, 65535));
         k_codec_unpack<Codec, false><<<blocks, 256, 0, stream>>>(
-            static_cast<const uint8_t*>(weight), nullptr, out, rows, cols, first_row);
+            static_cast<const uint8_t*>(weight), nullptr, out, rows, cols, first_row, 0, nullptr, 1.f / weight_scale);
     });
 }
 
@@ -755,40 +771,41 @@ void codec_gemv_q8_1(const void* x, const void* weight, DType dtype, float* out,
 
 void embed_lookup_f32(const void* emb_table, DType table_dtype,
                       const int32_t* token_ids_dev, float* out,
-                      int M, int hidden, cudaStream_t stream) {
+                      int M, int hidden, int vocab_size, cudaStream_t stream, int* invalid_token) {
+    if (M <= 0 || hidden <= 0) return;
     if (is_weight_codec_dtype(table_dtype)) {
         (void)row_nbytes(table_dtype, hidden);
         visit_weight_codec(table_dtype, [&]<class Codec>() {
             const dim3 blocks((hidden / Codec::kBlockSize + 7) / 8, std::min(M, 65535));
             k_codec_unpack<Codec, true><<<blocks, 256, 0, stream>>>(
-                static_cast<const uint8_t*>(emb_table), token_ids_dev, out, M, hidden, 0);
+                static_cast<const uint8_t*>(emb_table), token_ids_dev, out, M, hidden, 0, vocab_size, invalid_token, 1.f);
         });
         return;
     }
     if (table_dtype == DType::Q4_A) {
         k_embed_lookup_repacked_f32<<<dim3(hidden / 256, M), 256, 0, stream>>>(
-            static_cast<const BlockQ4_A*>(emb_table), token_ids_dev, out, hidden / 256);
+            static_cast<const BlockQ4_A*>(emb_table), token_ids_dev, out, hidden / 256, vocab_size, invalid_token);
         return;
     }
     if (table_dtype == DType::Q8_A) {
         k_embed_lookup_repacked_f32<<<dim3(hidden / 256, M), 256, 0, stream>>>(
-            static_cast<const BlockQ8_A*>(emb_table), token_ids_dev, out, hidden / 256);
+            static_cast<const BlockQ8_A*>(emb_table), token_ids_dev, out, hidden / 256, vocab_size, invalid_token);
         return;
     }
     if (table_dtype == DType::Q4_KA) {
         k_embed_lookup_repacked_f32<<<dim3(hidden / 256, M), 256, 0, stream>>>(
-            static_cast<const BlockQ4_KA*>(emb_table), token_ids_dev, out, hidden / 256);
+            static_cast<const BlockQ4_KA*>(emb_table), token_ids_dev, out, hidden / 256, vocab_size, invalid_token);
         return;
     }
     if (table_dtype == DType::Q6_A) {
         k_embed_lookup_repacked_f32<<<dim3(hidden / 256, M), 256, 0, stream>>>(
-            static_cast<const BlockQ6_A*>(emb_table), token_ids_dev, out, hidden / 256);
+            static_cast<const BlockQ6_A*>(emb_table), token_ids_dev, out, hidden / 256, vocab_size, invalid_token);
         return;
     }
     int total = M * hidden;
     k_embed_lookup_f32<<<(total + 255) / 256, 256, 0, stream>>>(
         static_cast<const uint8_t*>(emb_table), static_cast<int>(table_dtype),
-        token_ids_dev, out, M, hidden);
+        token_ids_dev, out, M, hidden, vocab_size, invalid_token);
 }
 
 __global__ void k_scale_moe_routes(float* weights, const int* indices, const float* scales, int n) {

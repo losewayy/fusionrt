@@ -129,14 +129,14 @@ __global__ void k_gqa_splitk_reduce(
     }
 }
 
-template <typename Cache>
+template <typename Cache, bool ImageMask = false>
 __global__ void k_gqa_prefill_causal(
     const float* __restrict__ q, int q_stride,
     const Cache* __restrict__ k_cache,
     const Cache* __restrict__ v_cache,
     float* __restrict__ out,
     int M, int num_q_heads, int num_kv_heads, int head_dim,
-    int start_pos, float scale, CudaKvView cache, int sliding_window, bool causal)
+    int start_pos, float scale, CudaKvView cache, int sliding_window, bool causal, const int* image_bounds)
 {
     extern __shared__ float smem[];
     float* red_buf = smem;
@@ -157,8 +157,14 @@ __global__ void k_gqa_prefill_causal(
     }
     __syncthreads();
 
-    const int kv_end = start_pos + (causal ? m + 1 : M);
-    const int first_key = sliding_window > 0 ? max(0, kv_end - sliding_window) : 0;
+    int kv_end = start_pos + (causal ? m + 1 : M);
+    int first_key = sliding_window > 0 ? max(0, kv_end - sliding_window) : 0;
+    if constexpr (ImageMask) {
+        if (image_bounds[2 * m] >= 0) {
+            kv_end = image_bounds[2 * m + 1];
+            first_key = min(first_key, image_bounds[2 * m]);
+        }
+    }
     float m_i = -1e30f;
     float l_i = 0.0f;
     float o_j = 0.0f;
@@ -520,7 +526,7 @@ __device__ __forceinline__ void gqa_prefill_online(const float* q, int q_stride,
                                                   int rows, int nq, int nkv, int start, float scale, half* sh, int sliding_window) {
     using Tile = OnlineAttentionTile<HD, Warps>;
     constexpr int Q = Tile::Q, K = Tile::K;
-    constexpr bool HalfPV = HD == 256, HalfQK = HD == 256;
+    constexpr bool HalfPV = false, HalfQK = HD == 256;
     constexpr unsigned mask = 0xffffffffu;
     auto* sk = sh;
     auto* sv = sk + K * HD;
@@ -766,13 +772,13 @@ void gqa_prefill_causal_f32(
     const float* q, const void* k_cache, const void* v_cache, float* out,
     int M, int num_q_heads, int num_kv_heads, int head_dim,
     int start_pos, int /*max_seq*/, float scale, cudaStream_t stream,
-    int q_row_stride, DType kv_dtype, CudaKvView cache, int sliding_window, bool causal)
+    int q_row_stride, DType kv_dtype, CudaKvView cache, int sliding_window, bool causal, const int* image_bounds)
 {
     int qs = (q_row_stride > 0) ? q_row_stride : (num_q_heads * head_dim);
     auto launch = [&]<typename Cache>() {
         const auto* keys = static_cast<const Cache*>(k_cache);
         const auto* values = static_cast<const Cache*>(v_cache);
-        if (head_dim == 64 || head_dim == 128 || head_dim == 256 || head_dim == 512) {
+        if (!image_bounds && (head_dim == 64 || head_dim == 128 || head_dim == 256 || head_dim == 512)) {
             const int group = num_q_heads / num_kv_heads;
             const dim3 grid(static_cast<unsigned>((int64_t{M} * group + 7) / 8), num_kv_heads);
             auto tiled = [&]<int HD>() {
@@ -808,9 +814,15 @@ void gqa_prefill_causal_f32(
         const int threads = std::min(1024, std::max(32, ((head_dim + 31) / 32) * 32));
         const size_t smem_bytes = (32 + static_cast<size_t>(head_dim)) * sizeof(float);
         const dim3 grid(num_q_heads, M);
-        k_gqa_prefill_causal<<<grid, threads, smem_bytes, stream>>>(
-            q, qs, keys, values, out, M, num_q_heads, num_kv_heads, head_dim, start_pos, scale,
-            cache, causal ? sliding_window : 0, causal);
+        if (image_bounds) {
+            k_gqa_prefill_causal<Cache, true><<<grid, threads, smem_bytes, stream>>>(
+                q, qs, keys, values, out, M, num_q_heads, num_kv_heads, head_dim, start_pos, scale,
+                cache, sliding_window, true, image_bounds);
+        } else {
+            k_gqa_prefill_causal<Cache><<<grid, threads, smem_bytes, stream>>>(
+                q, qs, keys, values, out, M, num_q_heads, num_kv_heads, head_dim, start_pos, scale,
+                cache, causal ? sliding_window : 0, causal, nullptr);
+        }
     };
     if (kv_dtype == DType::Q8_0) launch.template operator()<int8_t>();
     else if (kv_dtype == DType::F16) launch.template operator()<half>();
@@ -842,6 +854,7 @@ void gqa_prefill_online_f32(const float* q, int q_stride, CudaKvView cache, floa
     if (head_dim == 64) dispatch.template operator()<64, 4>();
     else if (head_dim == 128) dispatch.template operator()<128, 4>();
     else if (head_dim == 256) dispatch.template operator()<256, 4>();
+    else throw std::invalid_argument("Online GQA prefill requires head_dim 64, 128, or 256");
 }
 
 }  // namespace fusionrt::cuda_ops

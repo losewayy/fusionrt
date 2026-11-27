@@ -207,7 +207,7 @@ void test_cuda_weight_codecs(CudaContext& ctx) {
         ids.data<int32_t>()[2] = 0;
         const auto dev_ids = ctx.upload(ids, false);
         const auto emb = arena.alloc_tensor({3, K}, DType::F32);
-        cuda_ops::embed_lookup_f32(w.ptr(), f.type, dev_ids.ptr<int32_t>(), emb.ptr<float>(), 3, K, ctx.stream());
+        cuda_ops::embed_lookup_f32(w.ptr(), f.type, dev_ids.ptr<int32_t>(), emb.ptr<float>(), 3, K, N, ctx.stream());
         const auto embedded = ctx.download(emb);
         for (int i = 0; i < 3; ++i)
             require_codec_close(f.type, "CUDA packed embedding",
@@ -698,7 +698,7 @@ void test_cuda_q2_k(CudaContext& ctx) {
     const int32_t id = 4;
     FUSIONRT_CUDA_CHECK(cudaMemcpyAsync(ids.ptr(), &id, sizeof(id), cudaMemcpyHostToDevice, ctx.stream()));
     auto embedding = arena.alloc_tensor({1, width}, DType::F32);
-    cuda_ops::embed_lookup_f32(dw.ptr(), DType::Q2_K, ids.ptr<int32_t>(), embedding.ptr<float>(), 1, width, ctx.stream());
+    cuda_ops::embed_lookup_f32(dw.ptr(), DType::Q2_K, ids.ptr<int32_t>(), embedding.ptr<float>(), 1, width, out, ctx.stream());
     const auto downloaded = ctx.download(embedding);
     if (!std::equal(downloaded.data<float>(), downloaded.data<float>() + width, w_f32.data<float>() + id * width))
         throw std::runtime_error("Q2_K embedding lookup differs from scalar");
@@ -745,7 +745,7 @@ void test_repacked_quants(CudaContext& ctx) {
 
         const std::string label = dtype_name(packed_type);
         const auto w = ctx.upload(packed, false);
-        cuda_ops::embed_lookup_f32(w.ptr(), packed_type, d_ids.ptr<int32_t>(), embeddings.ptr<float>(), 2, K, ctx.stream());
+        cuda_ops::embed_lookup_f32(w.ptr(), packed_type, d_ids.ptr<int32_t>(), embeddings.ptr<float>(), 2, K, N, ctx.stream());
         const auto embed = ctx.download(embeddings);
         std::vector<double> expect_embed(reference.end() - K, reference.end());
         expect_embed.insert(expect_embed.end(), reference.begin(), reference.begin() + K);

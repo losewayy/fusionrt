@@ -2,6 +2,7 @@
 
 #include "fusionrt/model_types.h"
 #include "fusionrt/sampler.h"
+#include <atomic>
 
 namespace fusionrt {
 
@@ -27,6 +28,7 @@ struct GenerationOptions {
     float spec_p_min = 0.1f;
     std::span<const InputEmbedding> inputs_embeds;
     bool warn_on_graph_fallback = false;
+    const std::atomic_bool* cancel = nullptr;
 };
 
 class FusionModel {
@@ -59,7 +61,8 @@ public:
                                             std::span<const InputEmbedding> inputs_embeds = {});
     std::vector<float> prefill_cached_cuda(CudaContext& ctx, const std::vector<int32_t>& prompt_ids,
                                           bool use_fused = true, int* prefilled_tokens = nullptr,
-                                          LayerTrace* trace = nullptr, OpTrace* op_trace = nullptr);
+                                          LayerTrace* trace = nullptr, OpTrace* op_trace = nullptr,
+                                          const std::atomic_bool* cancel = nullptr);
     std::vector<int32_t> generate_cuda(CudaContext& ctx, const std::vector<int32_t>& prompt_ids,
                                        int max_new_tokens, bool use_fused = true, bool use_graph = false,
                                        GenerationStats* stats = nullptr, bool keep_state = false, int start_pos = 0,

@@ -21,7 +21,8 @@ struct PayloadTooLarge : std::invalid_argument {
 };
 
 RequestHead parse_request_head(std::string_view text, std::optional<agent::Protocol>& protocol);
-JsonObject error_body(std::string_view status, const std::string& message, std::optional<agent::Protocol> protocol);
+JsonObject error_body(std::string_view status, const std::string& message, std::optional<agent::Protocol> protocol,
+                      std::string_view code = {});
 JsonObject health_body(const std::string& model, const HybridModelConfig& cfg, int slots, int max_active_tokens,
                        const ModelMemory& cache);
 std::vector<int32_t> encode_prompt(const BpeTokenizer& tokenizer, const std::string& text, int context);

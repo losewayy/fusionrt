@@ -2,9 +2,12 @@
 
 #include "cuda_session.h"
 #include "cuda_weights.h"
+#include <atomic>
 
 #ifdef FUSIONRT_ENABLE_CUDA
 namespace fusionrt {
+
+struct CudaPrefillCancelled {};
 
 class CudaExecutor {
 public:
@@ -26,16 +29,17 @@ public:
     void ensure_kv(CudaContext&, int first_write, int tokens);
     void execute_prefill_chunks(CudaContext&, const int32_t*, int count, int start_pos, bool fused,
                                 LayerTrace*, OpTrace*, bool compute_logits = true, bool checkpoint_pages = false,
-                                std::span<const InputEmbedding> = {});
+                                std::span<const InputEmbedding> = {}, const std::atomic_bool* cancel = nullptr);
     std::vector<float> prefill_cuda_impl(CudaContext&, const int32_t*, int count, int start_pos, bool fused,
                                        LayerTrace* = nullptr, OpTrace* = nullptr, bool checkpoint_pages = false,
-                                       std::span<const InputEmbedding> = {});
+                                       std::span<const InputEmbedding> = {}, const std::atomic_bool* cancel = nullptr);
     size_t inspect_scratch(CudaContext&);
     int32_t download_argmax(CudaContext&);
     int32_t sample_gpu(CudaContext&);
     void set_token(CudaContext&, const int32_t*);
     int64_t token_history_capacity() const { return work_.token_ids.shape[0]; }
-    void download_token_history(CudaContext&, int offset, std::span<int32_t>);
+    void clear_invalid_token(CudaContext&);
+    void download_token_history(CudaContext&, int offset, std::span<int32_t>, bool check_invalid = false);
     void store_token_history(CudaContext&, int offset);
 
     // These request handles own transient graph and execution state.
@@ -68,10 +72,11 @@ public:
     void clear_bench_graph(Bench&);
 
 private:
+    friend struct CudaReviewTestAccess;
     CudaModelWeights& weights_;
     CudaSessionManager& sessions_;
     struct Workspace {
-        Tensor hidden, logits, token_ids, position, kv_length;
+        Tensor hidden, logits, token_ids, position, kv_length, invalid_token;
         CudaGraphExec decode_graph;
         bool graph_captured = false;
         bool graph_fused = true;

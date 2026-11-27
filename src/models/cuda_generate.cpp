@@ -13,7 +13,9 @@ namespace fusionrt {
 
 std::vector<float> FusionModel::prefill_cached_cuda(CudaContext& ctx, const std::vector<int32_t>& prompt,
                                                     bool use_fused, int* prefilled_tokens, LayerTrace* trace,
-                                                    OpTrace* op_trace) {
+                                                    OpTrace* op_trace, const std::atomic_bool* cancel) {
+    sessions_->require_loaded();
+    if (cancel && cancel->load(std::memory_order_relaxed)) throw CudaPrefillCancelled{};
     if (prompt.empty()) throw std::invalid_argument("Prompt is empty");
     if (prompt.size() > static_cast<size_t>(cfg_.dense.max_seq_len))
         throw prompt_context_error(prompt.size(), cfg_.dense.max_seq_len);
@@ -29,7 +31,7 @@ std::vector<float> FusionModel::prefill_cached_cuda(CudaContext& ctx, const std:
         logits.assign(saved_logits.data<float>(), saved_logits.data<float>() + cfg_.vocab_size);
     } else {
         logits = executor_->prefill_cuda_impl(ctx, prompt.data() + prefix, length - prefix, prefix,
-                                             use_fused, trace, op_trace, checkpoint_pages);
+                                             use_fused, trace, op_trace, checkpoint_pages, {}, cancel);
         sessions_->save_cuda_checkpoint(ctx, length, &executor_->logits());
     }
     sessions_->retain_tokens(prompt, use_fused);
@@ -76,7 +78,9 @@ std::vector<int32_t> FusionModel::generate_cuda(CudaContext& ctx, const std::vec
                                                 int max_new_tokens, bool use_fused, bool use_graph,
                                                 GenerationStats* stats, bool keep_state, int start_pos,
                                                 int32_t stop_eos_id, const GenerationOptions& options) {
+    sessions_->require_loaded();
     options.sampling.validate();
+    const auto cancelled = [&] { return options.cancel && options.cancel->load(std::memory_order_relaxed); };
     if (max_new_tokens < 0 || start_pos < 0) throw std::invalid_argument("Invalid generation length or start position");
     auto* draft = options.draft_model;
     const auto* json = options.json_constraint;
@@ -160,17 +164,30 @@ std::vector<int32_t> FusionModel::generate_cuda(CudaContext& ctx, const std::vec
     auto tp0 = std::chrono::high_resolution_clock::now();
     int prefilled = prompt_len;
     OpTrace* prefill_trace = options.op_trace ? &prefill_profile : nullptr;
-    auto logits = reuse ? prefill_cached_cuda(ctx, tokens, use_fused, &prefilled, options.layer_trace, prefill_trace)
-                        : executor_->prefill_cuda_impl(ctx, tokens.data(), prompt_len, start_pos, use_fused,
-                                            options.layer_trace, prefill_trace, false, embeds);
-    // A failing callback or CUDA operation must not leave a reusable recurrent state.
-    sessions_->forget_tokens();
+    std::vector<float> logits;
     int draft_pos = 0;
-    if (speculative && draft && prompt_len < draft->cfg_.dense.max_seq_len) {
-        draft->reset_kv_and_state(ctx);
-        // Leave the first generated token pending, as on the target.
-        draft->executor_->execute_prefill_chunks(ctx, tokens.data(), prompt_len, 0, use_fused, nullptr, nullptr, false);
-        draft_pos = prompt_len;
+    try {
+        logits = reuse ? prefill_cached_cuda(ctx, tokens, use_fused, &prefilled, options.layer_trace, prefill_trace, options.cancel)
+                       : executor_->prefill_cuda_impl(ctx, tokens.data(), prompt_len, start_pos, use_fused,
+                                             options.layer_trace, prefill_trace, false, embeds, options.cancel);
+        // A failing callback or CUDA operation must not leave a reusable recurrent state.
+        sessions_->forget_tokens();
+        if (speculative && draft && prompt_len < draft->cfg_.dense.max_seq_len) {
+            draft->reset_kv_and_state(ctx);
+            // Leave the first generated token pending, as on the target.
+            draft->executor_->execute_prefill_chunks(ctx, tokens.data(), prompt_len, 0, use_fused, nullptr, nullptr,
+                                                     false, false, {}, options.cancel);
+            draft_pos = prompt_len;
+        }
+        if (cancelled()) throw CudaPrefillCancelled{};
+    } catch (const CudaPrefillCancelled&) {
+        sessions_->clear_cuda_history();
+        if (stats) {
+            *stats = {};
+            stats->prompt_tokens = prompt_len;
+            stats->cancelled = true;
+        }
+        return tokens;
     }
     int32_t next_tok = -1;
     if (max_new_tokens > 0) {
@@ -190,6 +207,7 @@ std::vector<int32_t> FusionModel::generate_cuda(CudaContext& ctx, const std::vec
         used_cuda_graph = executor_->decode(ctx, *request, pos++, use_graph, greedy, first_step);
     };
     auto emit = [&](int32_t token) {
+        if (cancelled()) return false;
         tokens.push_back(token);
         ++gen_count;
         if (json && !json->accept(grammar, token)) throw std::logic_error("Sampled a token outside the JSON grammar");
@@ -198,20 +216,24 @@ std::vector<int32_t> FusionModel::generate_cuda(CudaContext& ctx, const std::vec
         return gen_count < max_new_tokens && !(json && (grammar.sealed() || json->is_end(token)));
     };
     auto td0 = std::chrono::high_resolution_clock::now();
-    if (!speculative && greedy && use_graph && executor_->can_use_cuda_graph() && !options.on_token && stop_eos_id < 0 && max_new_tokens > 1 &&
+    if (!speculative && greedy && use_graph && executor_->can_use_cuda_graph() && !options.on_token && !options.cancel && stop_eos_id < 0 && max_new_tokens > 1 &&
         static_cast<int64_t>(pos) + max_new_tokens <= executor_->token_history_capacity()) {
         // Graph replay feeds the next greedy step and records IDs on the device.
+        executor_->clear_invalid_token(ctx);
         int first_pos = pos;
-        for (int step = 1; step < max_new_tokens; ++step) decode(step == 1);
+        for (int step = 1; step < max_new_tokens; ++step) {
+            decode(step == 1);
+            if (!used_cuda_graph) executor_->store_token_history(ctx, pos);
+        }
         tokens.push_back(next_tok);
         tokens.resize(static_cast<size_t>(prompt_len) + max_new_tokens);
         executor_->download_token_history(ctx, 1 + first_pos,
-            {tokens.data() + prompt_len + 1, static_cast<size_t>(max_new_tokens - 1)});
+            {tokens.data() + prompt_len + 1, static_cast<size_t>(max_new_tokens - 1)}, true);
         if (std::find(tokens.begin() + prompt_len, tokens.end(), -1) != tokens.end())
             throw std::runtime_error("Sampling found no selectable logits");
         gen_count = max_new_tokens;
     } else if (!speculative) {
-        for (int step = 0; step < max_new_tokens; ++step) {
+        for (int step = 0; step < max_new_tokens && !cancelled(); ++step) {
             if (!emit(next_tok)) break;
             if (!greedy) {
                 executor_->set_token(ctx, &next_tok);
@@ -250,7 +272,7 @@ std::vector<int32_t> FusionModel::generate_cuda(CudaContext& ctx, const std::vec
         const bool draft_greedy = options.sampling.greedy();
         const bool draft_graph = use_graph && draft && draft->executor_->can_use_cuda_graph();
         auto draft_step = [&](const int32_t* token, bool need_argmax, bool first_step = true) {
-            draft->executor_->decode(ctx, *draft_request, draft_pos++, draft_graph, need_argmax, first_step, token);
+            return draft->executor_->decode(ctx, *draft_request, draft_pos++, draft_graph, need_argmax, first_step, token);
         };
         std::vector<int32_t> input, row_ids, draft_history;
         std::vector<float> rows;
@@ -261,7 +283,7 @@ std::vector<int32_t> FusionModel::generate_cuda(CudaContext& ctx, const std::vec
         int ngram_depth = 1, ngram_misses = 0, ngram_pause = 0;
         bool pending_on_device = greedy, reset_decode_position = true;
         bool running = max_new_tokens > 0 && emit(next_tok);
-        while (running) {
+        while (running && !cancelled()) {
             const int remaining = max_new_tokens - gen_count;
             const int start = pos;
             const bool ngram_probe = options.spec_ngram > 0 && ngram_pause == 0;
@@ -272,19 +294,22 @@ std::vector<int32_t> FusionModel::generate_cuda(CudaContext& ctx, const std::vec
             draft_probs.clear();
             if (draft_sessions && limit > 0 && start < draft->cfg_.dense.max_seq_len) {
                 limit = std::min(limit, draft->cfg_.dense.max_seq_len - start);
-                while (draft_pos < start) draft_step(&tokens[draft_pos], false);
+                while (draft_pos < start && !cancelled()) draft_step(&tokens[draft_pos], false);
+                if (cancelled()) break;
                 draft_sessions->save_recurrent(ctx, draft_snapshot);
                 if (draft_greedy) {
                     for (int i = 0; i < limit; ++i) {
-                        draft_step(i == 0 ? input.data() : nullptr, true, i == 0);
-                        if (!draft_graph) draft->executor_->store_token_history(ctx, 1 + start + i);
+                        if (cancelled()) break;
+                        if (!draft_step(i == 0 ? input.data() : nullptr, true, i == 0))
+                            draft->executor_->store_token_history(ctx, 1 + start + i);
                     }
+                    if (cancelled()) break;
                     input.resize(1 + limit);
                     draft->executor_->download_token_history(ctx, 1 + start,
                         {input.data() + 1, static_cast<size_t>(limit)});
                 } else {
                     draft_history = tokens;
-                    for (int i = 0; i < limit; ++i) {
+                    for (int i = 0; i < limit && !cancelled(); ++i) {
                         draft_step(&input.back(), false);
                         auto host = ctx.download(draft->executor_->logits());
                         auto q = Sampler::distribution(host.data<float>(), cfg_.vocab_size, draft_history, options.sampling);
@@ -299,12 +324,12 @@ std::vector<int32_t> FusionModel::generate_cuda(CudaContext& ctx, const std::vec
                 }
             } else if (native_mtp && limit > 0) {
                 executor_->ensure_kv(ctx, mtp_pos, start + limit);
-                while (mtp_pos < start) {
+                while (mtp_pos < start && !cancelled()) {
                     executor_->mtp_step(ctx, *mtp, mtp_pos, tokens[mtp_pos], mtp_pos - 1,
                                         false, false, use_fused, *verify);
                     ++mtp_pos;
                 }
-                for (int i = 0; i < limit; ++i) {
+                for (int i = 0; i < limit && !cancelled(); ++i) {
                     if (executor_->mtp_step(ctx, *mtp, start + i, input.back(), start - 1,
                                             i != 0, true, use_fused, *verify))
                         ++mtp_stats.mtp_draft_graph_steps;
@@ -327,6 +352,7 @@ std::vector<int32_t> FusionModel::generate_cuda(CudaContext& ctx, const std::vec
             } else if (ngram_probe && limit > 0) {
                 lookup_draft(tokens, limit, input);
             }
+            if (cancelled()) break;
             const int proposed = static_cast<int>(input.size()) - 1;
             if (proposed == 0 && !native_mtp) {
                 if (ngram_probe && limit > 0 && ++ngram_misses >= 3) {
@@ -428,7 +454,8 @@ std::vector<int32_t> FusionModel::generate_cuda(CudaContext& ctx, const std::vec
                 << " mean_ms=" << verify_ms[m] / verify_calls[m] << '\n';
         }
     }
-    if (reuse) {
+    if (cancelled()) sessions_->clear_cuda_history();
+    else if (reuse) {
         // The most recently sampled token has not been forwarded into KV/SSM state.
         if (pos > prompt_len) sessions_->save_cuda_checkpoint(ctx, pos, &executor_->logits());
         sessions_->retain_tokens({tokens.data(), static_cast<size_t>(pos)}, use_fused);
@@ -453,6 +480,9 @@ std::vector<int32_t> FusionModel::generate_cuda(CudaContext& ctx, const std::vec
         stats->mtp_reused_kv_rows = mtp_stats.mtp_reused_kv_rows;
         stats->mtp_rewound_kv_rows = mtp_stats.mtp_rewound_kv_rows;
         stats->used_cuda_graph = used_cuda_graph;
+        stats->cancelled = cancelled();
+        stats->json_complete = json && grammar.complete();
+        stats->speculative_active = speculative;
         stats->prefill_ms = prefill_ms;
         stats->decode_ms = decode_ms;
         stats->prefill_tok_per_s = (prefill_ms > 0.0) ? (static_cast<double>(prefilled) * 1000.0 / prefill_ms) : 0.0;
@@ -480,12 +510,22 @@ std::vector<GenerationStats> FusionModel::bench_model_cuda(CudaContext& ctx, int
     auto bench = executor_->begin_bench(ctx, pp);
     auto* host_args = executor_->bench_args(*bench);
     use_graph = use_graph && executor_->can_use_cuda_graph();
+    const auto capture = [&](int position, bool prefill) {
+        if (!use_graph) return;
+        try {
+            executor_->capture_bench(ctx, *bench, position, prefill);
+        } catch (const std::runtime_error& error) {
+            executor_->clear_bench_graph(*bench);
+            use_graph = false;
+            std::clog << "CUDA Graph benchmark capture failed: " << error.what() << '\n';
+        }
+    };
     reset_kv_and_state(ctx);
 
     if (pp > 0) {
         executor_->ensure_kv(ctx, 0, pp);
         std::copy(prompt.begin(), prompt.end(), host_args);
-        if (use_graph) executor_->capture_bench(ctx, *bench, pp, true);
+        capture(pp, true);
         for (int rep = -1; rep < reps; ++rep) {
             sessions_->zero_cuda_gdn(ctx);
             ctx.synchronize();
@@ -507,7 +547,7 @@ std::vector<GenerationStats> FusionModel::bench_model_cuda(CudaContext& ctx, int
     if (tg > 0) {
         executor_->ensure_kv(ctx, 0, decode_prefix + tg);
         executor_->prepare_bench_decode(ctx, *bench);
-        if (use_graph) executor_->capture_bench(ctx, *bench, decode_prefix, false);
+        capture(decode_prefix, false);
         CudaSessionManager::HostRecurrentState recurrent_prefix;
         if (!prefix.empty()) {
             sessions_->zero_cuda_gdn(ctx);
@@ -555,6 +595,7 @@ std::vector<GenerationStats> FusionModel::bench_model_cuda(CudaContext& ctx, int
             (void)executor_->prefill_cuda_impl(ctx, prompt.data(), pp, 0, true, nullptr, trace);
         }
     }
+    for (auto& result : results) result.used_cuda_graph = use_graph;
     return results;
 }
 

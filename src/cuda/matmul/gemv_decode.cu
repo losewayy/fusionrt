@@ -6,7 +6,20 @@ namespace fusionrt::cuda_ops {
 
 namespace {
 
+template<bool Aligned>
+__device__ __forceinline__ float4 load_f32x4(const float* p) {
+    if constexpr (Aligned) return __ldg(reinterpret_cast<const float4*>(p));
+    else return {p[0], p[1], p[2], p[3]};
+}
+
+bool aligned_rows(const float* a, const float* b, const void* c, int stride) {
+    // All rows can use a vector load only when both the bases and the row stride align.
+    return stride % 4 == 0 &&
+        ((reinterpret_cast<uintptr_t>(a) | reinterpret_cast<uintptr_t>(b) | reinterpret_cast<uintptr_t>(c)) & 15u) == 0;
+}
+
 // Unfused GEMV for M=1..8 (warp-per-row for each output row)
+template<bool Aligned>
 __global__ void k_linear_gemv_f32(const float* __restrict__ x, const float* __restrict__ w,
                                   float* __restrict__ y, int M, int N, int K) {
     int wid = (blockIdx.x * blockDim.x + threadIdx.x) >> 5;
@@ -17,12 +30,11 @@ __global__ void k_linear_gemv_f32(const float* __restrict__ x, const float* __re
     float acc[8] = {0.f};
 
     int k4 = K >> 2;
-    const float4* wr4 = reinterpret_cast<const float4*>(wr);
     for (int i = lane; i < k4; i += 32) {
-        float4 wv = wr4[i];
+        float4 wv = load_f32x4<Aligned>(wr + 4 * i);
         int base_k = i << 2;
         for (int m = 0; m < M; ++m) {
-            float4 xv = *reinterpret_cast<const float4*>(x + m * K + base_k);
+            float4 xv = load_f32x4<Aligned>(x + static_cast<int64_t>(m) * K + base_k);
             acc[m] += xv.x * wv.x + xv.y * wv.y + xv.z * wv.z + xv.w * wv.w;
         }
     }
@@ -71,7 +83,7 @@ __global__ void k_dequant_q4_0_to_f32(const BlockQ4_0* __restrict__ src, float* 
 // Each CTA has WARPS_PER_BLOCK = 8 warps (256 threads) computing 8 output channels.
 // Uses dot(x * inv_rms * norm_w, w) == inv_rms * dot(x * norm_w, w) so only
 // inv_rms[M] (32B) needs shared memory, preserving full SM occupancy on sm_120.
-template <int WARPS_PER_BLOCK>
+template <int WARPS_PER_BLOCK, bool Aligned>
 __global__ void k_fused_rmsnorm_linear_f32(const float* __restrict__ x,
                                            const float* __restrict__ norm_w,
                                            const float* __restrict__ w,
@@ -88,9 +100,8 @@ __global__ void k_fused_rmsnorm_linear_f32(const float* __restrict__ x,
         const float* xm = x + m * K;
         float sum_sq = 0.0f;
         int k4 = K >> 2;
-        const float4* xm4 = reinterpret_cast<const float4*>(xm);
         for (int i = tid; i < k4; i += blockDim.x) {
-            float4 v = xm4[i];
+            float4 v = load_f32x4<Aligned>(xm + 4 * i);
             sum_sq += v.x * v.x + v.y * v.y + v.z * v.z + v.w * v.w;
         }
         for (int k = (k4 << 2) + tid; k < K; k += blockDim.x) {
@@ -111,14 +122,12 @@ __global__ void k_fused_rmsnorm_linear_f32(const float* __restrict__ x,
     float acc[8] = {0.f};
 
     int k4 = K >> 2;
-    const float4* wr4 = reinterpret_cast<const float4*>(wr);
-    const float4* nw4 = reinterpret_cast<const float4*>(norm_w);
     for (int i = lane; i < k4; i += 32) {
-        float4 wv = wr4[i];
-        float4 nw = nw4[i];
+        float4 wv = load_f32x4<Aligned>(wr + 4 * i);
+        float4 nw = load_f32x4<Aligned>(norm_w + 4 * i);
         wv.x *= nw.x; wv.y *= nw.y; wv.z *= nw.z; wv.w *= nw.w;
         for (int m = 0; m < M; ++m) {
-            float4 xv = reinterpret_cast<const float4*>(x + m * K)[i];
+            float4 xv = load_f32x4<Aligned>(x + static_cast<int64_t>(m) * K + 4 * i);
             acc[m] += xv.x * wv.x + xv.y * wv.y + xv.z * wv.z + xv.w * wv.w;
         }
     }
@@ -518,7 +527,7 @@ __device__ __forceinline__ float w_to_f32<half>(half v) { return __half2float(v)
 template <>
 __device__ __forceinline__ float w_to_f32<__nv_bfloat16>(__nv_bfloat16 v) { return __bfloat162float(v); }
 
-template <typename WType, int WARPS_PER_BLOCK, bool HAS_NORM>
+template <typename WType, int WARPS_PER_BLOCK, bool HAS_NORM, bool Aligned>
 __global__ void k_linear_gemv_w16_vec(const float* __restrict__ x, const float* __restrict__ norm_w,
                                       const WType* __restrict__ w, float* __restrict__ y,
                                       int M, int N, int K, float eps) {
@@ -533,9 +542,8 @@ __global__ void k_linear_gemv_w16_vec(const float* __restrict__ x, const float* 
             const float* xm = x + static_cast<int64_t>(m) * K;
             float sum_sq = 0.0f;
             int k4 = K >> 2;
-            const float4* xm4 = reinterpret_cast<const float4*>(xm);
             for (int i = tid; i < k4; i += blockDim.x) {
-                float4 v = __ldg(xm4 + i);
+                float4 v = load_f32x4<Aligned>(xm + 4 * i);
                 sum_sq += v.x * v.x + v.y * v.y + v.z * v.z + v.w * v.w;
             }
             for (int k = (k4 << 2) + tid; k < K; k += blockDim.x) {
@@ -553,7 +561,7 @@ __global__ void k_linear_gemv_w16_vec(const float* __restrict__ x, const float* 
     const WType* wr = w + static_cast<int64_t>(n) * K;
     float acc[8] = {0.f};
 
-    if ((K & 7) == 0 && (reinterpret_cast<uintptr_t>(wr) & 15u) == 0 && (reinterpret_cast<uintptr_t>(x) & 15u) == 0) {
+    if constexpr (Aligned) {
         int k8 = K >> 3;
         const uint4* wr8 = reinterpret_cast<const uint4*>(wr);
         for (int i = lane; i < k8; i += 32) {
@@ -564,8 +572,8 @@ __global__ void k_linear_gemv_w16_vec(const float* __restrict__ x, const float* 
             #pragma unroll
             for (int j = 0; j < 8; ++j) wv[j] = w_to_f32<WType>(wp[j]);
             if constexpr (HAS_NORM) {
-                float4 nw0 = __ldg(reinterpret_cast<const float4*>(norm_w + bk));
-                float4 nw1 = __ldg(reinterpret_cast<const float4*>(norm_w + bk + 4));
+                float4 nw0 = load_f32x4<Aligned>(norm_w + bk);
+                float4 nw1 = load_f32x4<Aligned>(norm_w + bk + 4);
                 wv[0] *= nw0.x; wv[1] *= nw0.y; wv[2] *= nw0.z; wv[3] *= nw0.w;
                 wv[4] *= nw1.x; wv[5] *= nw1.y; wv[6] *= nw1.z; wv[7] *= nw1.w;
             }
@@ -1057,7 +1065,10 @@ void linear_f32(const float* x, const float* w, float* y,
     if (M <= 8) {
         constexpr int WARPS = 8;
         int blocks = (N + WARPS - 1) / WARPS;
-        k_linear_gemv_f32<<<blocks, WARPS * 32, 0, stream>>>(x, w, y, M, N, K);
+        if (aligned_rows(x, w, nullptr, K))
+            k_linear_gemv_f32<true><<<blocks, WARPS * 32, 0, stream>>>(x, w, y, M, N, K);
+        else
+            k_linear_gemv_f32<false><<<blocks, WARPS * 32, 0, stream>>>(x, w, y, M, N, K);
     } else {
         matmul::launch_gemm_tiled_f32(x, w, y, M, N, K, stream);
     }
@@ -1158,9 +1169,13 @@ void fused_rmsnorm_linear_f32(const float* x, const float* norm_w, const float* 
     int blocks = (N + WARPS - 1) / WARPS;
     for (int m0 = 0; m0 < M; m0 += 8) {
         int mc = std::min(8, M - m0);
-        k_fused_rmsnorm_linear_f32<WARPS><<<blocks, WARPS * 32, 0, stream>>>(
-            x + static_cast<int64_t>(m0) * K, norm_w, weight,
-            y + static_cast<int64_t>(m0) * N, mc, N, K, eps);
+        const auto launch = [&]<bool Aligned>() {
+            k_fused_rmsnorm_linear_f32<WARPS, Aligned><<<blocks, WARPS * 32, 0, stream>>>(
+                x + static_cast<int64_t>(m0) * K, norm_w, weight,
+                y + static_cast<int64_t>(m0) * N, mc, N, K, eps);
+        };
+        if (aligned_rows(x, norm_w, weight, K)) launch.template operator()<true>();
+        else launch.template operator()<false>();
     }
 }
 
@@ -1506,20 +1521,31 @@ void fused_gemv_q8_a(const float* x, const void* w_q8_a, float* y,
     }
 }
 
+template<class W, bool Norm>
+static void linear_w16_decode(const float* x, const float* norm, const uint16_t* w, float* y,
+                              int M, int N, int K, float eps, cudaStream_t stream) {
+    constexpr int warps = 8;
+    const int blocks = (N + warps - 1) / warps;
+    const bool aligned = K % 8 == 0 && aligned_rows(x, norm, w, K);
+    for (int m = 0; m < M; m += 8) {
+        const int rows = std::min(8, M - m);
+        const auto launch = [&]<bool Aligned>() {
+            k_linear_gemv_w16_vec<W, warps, Norm, Aligned><<<blocks, warps * 32, 0, stream>>>(
+                x + static_cast<int64_t>(m) * K, norm, reinterpret_cast<const W*>(w),
+                y + static_cast<int64_t>(m) * N, rows, N, K, eps);
+        };
+        if (aligned) launch.template operator()<true>();
+        else launch.template operator()<false>();
+    }
+}
+
 void linear_w_f16_f32(const float* x, const uint16_t* w, float* y,
                       int M, int N, int K, cudaStream_t stream) {
     if (M >= 16 && (K & 31) == 0) {
         matmul::launch_wmma<0, false>(x, nullptr, w, y, M, N, K, 0.0f, stream);
         return;
     }
-    constexpr int WARPS = 8;
-    int blocks = (N + WARPS - 1) / WARPS;
-    for (int m0 = 0; m0 < M; m0 += 8) {
-        int mc = std::min(8, M - m0);
-        k_linear_gemv_w16_vec<half, WARPS, false><<<blocks, WARPS * 32, 0, stream>>>(
-            x + static_cast<int64_t>(m0) * K, nullptr, reinterpret_cast<const half*>(w),
-            y + static_cast<int64_t>(m0) * N, mc, N, K, 0.0f);
-    }
+    linear_w16_decode<half, false>(x, nullptr, w, y, M, N, K, 0.0f, stream);
 }
 
 void linear_w_bf16_f32(const float* x, const uint16_t* w, float* y,
@@ -1528,14 +1554,7 @@ void linear_w_bf16_f32(const float* x, const uint16_t* w, float* y,
         matmul::launch_wmma<1, false>(x, nullptr, w, y, M, N, K, 0.0f, stream);
         return;
     }
-    constexpr int WARPS = 8;
-    int blocks = (N + WARPS - 1) / WARPS;
-    for (int m0 = 0; m0 < M; m0 += 8) {
-        int mc = std::min(8, M - m0);
-        k_linear_gemv_w16_vec<__nv_bfloat16, WARPS, false><<<blocks, WARPS * 32, 0, stream>>>(
-            x + static_cast<int64_t>(m0) * K, nullptr, reinterpret_cast<const __nv_bfloat16*>(w),
-            y + static_cast<int64_t>(m0) * N, mc, N, K, 0.0f);
-    }
+    linear_w16_decode<__nv_bfloat16, false>(x, nullptr, w, y, M, N, K, 0.0f, stream);
 }
 
 void fused_rmsnorm_linear_f16(const float* x, const float* norm_w, const uint16_t* weight_f16,
@@ -1544,14 +1563,7 @@ void fused_rmsnorm_linear_f16(const float* x, const float* norm_w, const uint16_
         matmul::launch_wmma<0, true>(x, norm_w, weight_f16, y, M, N, K, eps, stream);
         return;
     }
-    constexpr int WARPS = 8;
-    int blocks = (N + WARPS - 1) / WARPS;
-    for (int m0 = 0; m0 < M; m0 += 8) {
-        int mc = std::min(8, M - m0);
-        k_linear_gemv_w16_vec<half, WARPS, true><<<blocks, WARPS * 32, 0, stream>>>(
-            x + static_cast<int64_t>(m0) * K, norm_w, reinterpret_cast<const half*>(weight_f16),
-            y + static_cast<int64_t>(m0) * N, mc, N, K, eps);
-    }
+    linear_w16_decode<half, true>(x, norm_w, weight_f16, y, M, N, K, eps, stream);
 }
 
 void fused_rmsnorm_linear_bf16(const float* x, const float* norm_w, const uint16_t* weight_bf16,
@@ -1560,14 +1572,7 @@ void fused_rmsnorm_linear_bf16(const float* x, const float* norm_w, const uint16
         matmul::launch_wmma<1, true>(x, norm_w, weight_bf16, y, M, N, K, eps, stream);
         return;
     }
-    constexpr int WARPS = 8;
-    int blocks = (N + WARPS - 1) / WARPS;
-    for (int m0 = 0; m0 < M; m0 += 8) {
-        int mc = std::min(8, M - m0);
-        k_linear_gemv_w16_vec<__nv_bfloat16, WARPS, true><<<blocks, WARPS * 32, 0, stream>>>(
-            x + static_cast<int64_t>(m0) * K, norm_w, reinterpret_cast<const __nv_bfloat16*>(weight_bf16),
-            y + static_cast<int64_t>(m0) * N, mc, N, K, eps);
-    }
+    linear_w16_decode<__nv_bfloat16, true>(x, norm_w, weight_bf16, y, M, N, K, eps, stream);
 }
 
 }  // namespace fusionrt::cuda_ops

@@ -330,6 +330,7 @@ GenerationParams parse_generation(const JsonObject& obj, const char* limit_key) 
     number("top_p", params.sampling.top_p);
     number("min_p", params.sampling.min_p);
     number("repeat_penalty", params.sampling.repeat_penalty);
+    if (params.sampling.repeat_penalty < 1.0f) throw std::invalid_argument("repeat_penalty must be at least 1");
     params.sampling.top_k = static_cast<int>(integer(obj, "top_k", params.sampling.top_k, std::numeric_limits<int>::max()));
     params.sampling.seed = static_cast<uint64_t>(integer(obj, "seed", params.sampling.seed, INT64_MAX));
     params.sampling.validate();

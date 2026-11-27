@@ -286,13 +286,13 @@ inline uint16_t fp32_to_fp16(float f) {
         if (exp < -10) return static_cast<uint16_t>(sign);
         mant |= 0x800000u;
         uint32_t shift = static_cast<uint32_t>(14 - exp);
-        uint32_t rounded = (mant + (1u << (shift - 1))) >> shift;
+        uint32_t rounded = (mant + ((1u << (shift - 1)) - 1) + ((mant >> shift) & 1u)) >> shift;
         return static_cast<uint16_t>(sign | rounded);
     }
     if (exp >= 31) {
         return static_cast<uint16_t>(sign | 0x7C00u);
     }
-    uint32_t rounded = mant + 0x1000u;
+    uint32_t rounded = mant + 0xFFFu + ((mant >> 13) & 1u);
     if (rounded & 0x800000u) {
         rounded = 0;
         exp += 1;

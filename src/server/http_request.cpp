@@ -48,11 +48,14 @@ RequestHead parse_request_head(std::string_view text, std::optional<agent::Proto
     return request;
 }
 
-JsonObject error_body(std::string_view status, const std::string& message, std::optional<agent::Protocol> protocol) {
+JsonObject error_body(std::string_view status, const std::string& message, std::optional<agent::Protocol> protocol,
+                      std::string_view code) {
     const bool anthropic = protocol == agent::Protocol::messages;
     const char* type = status.starts_with('5') ? (anthropic ? "api_error" : "server_error") : "invalid_request_error";
     if (anthropic && status == PayloadTooLarge::status) type = "request_too_large";
-    JsonObject body{{"error", JsonObject{{"message", message}, {"type", type}}}};
+    JsonObject detail{{"message", message}, {"type", type}};
+    if (!code.empty()) detail["code"] = std::string(code);
+    JsonObject body{{"error", std::move(detail)}};
     if (anthropic) body["type"] = "error";
     return body;
 }

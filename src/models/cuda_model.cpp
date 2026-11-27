@@ -51,7 +51,7 @@ void FusionModel::set_kv_vram_budget_bytes(size_t bytes) { sessions_->set_kv_vra
 void FusionModel::set_kv_host_budget_bytes(size_t bytes) { sessions_->set_kv_host_budget_bytes(bytes); }
 void FusionModel::set_kv_commitment_tokens(int tokens) { sessions_->set_kv_commitment_tokens(tokens); }
 void FusionModel::enable_native_mtp(bool enabled) { weights_->enable_native_mtp(enabled); }
-bool FusionModel::has_native_mtp() const { return weights_->has_native_mtp(); }
+bool FusionModel::has_native_mtp() const { return sessions_->initialized() && weights_->has_native_mtp(); }
 void FusionModel::validate_cuda_kv_capacity(int tokens) const { sessions_->validate_cuda_kv_capacity(tokens); }
 void FusionModel::set_moe_gpu_experts(int count) { weights_->set_moe_gpu_experts(count); }
 void FusionModel::reset_kv_and_state(CudaContext& ctx) { sessions_->reset_kv_and_state(ctx); }
@@ -80,6 +80,7 @@ ModelMemory FusionModel::cuda_cache_memory() const {
 }
 
 ModelMemory FusionModel::inspect_cuda(CudaContext& ctx) {
+    sessions_->require_loaded();
     auto result = cuda_cache_memory();
     weights_->inspect_cuda(ctx, result);
     result.static_scratch_bytes = executor_->inspect_scratch(ctx);

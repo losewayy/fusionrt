@@ -142,7 +142,7 @@ void execute_ir_graph_cuda(
     const std::vector<CudaSparseMoELayer>& moe_layers,
     bool use_fused, OpTrace* op_trace = nullptr, CudaOpTimer* timer = nullptr,
     LayerTrace* layer_trace = nullptr, bool compute_logits = true, bool all_logits = false,
-    const CudaIRSegment* segment = nullptr, float* nextn_out = nullptr, GdnReplay* replay = nullptr);
+    const CudaIRSegment* segment = nullptr, float* nextn_out = nullptr, GdnReplay* replay = nullptr, const int* image_bounds = nullptr);
 
 }  // namespace fusionrt
 #endif

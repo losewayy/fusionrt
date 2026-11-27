@@ -54,13 +54,14 @@ JsonObject chat_usage(const AgentResult& result) {
 }
 
 const char* chat_reason(const AgentResult& result) {
-    if (result.finish == Finish::truncated_tool_call) return "length";
+    if (result.finish == Finish::truncated_tool_call || result.finish == Finish::cancelled) return "length";
     if (result.has_calls()) return "tool_calls";
     return result.finish == Finish::length ? "length" : "stop";
 }
 
 const char* messages_reason(const AgentResult& result) {
-    if (result.finish == Finish::truncated_tool_call) return "max_tokens";
+    if (result.finish == Finish::truncated_tool_call || result.finish == Finish::cancelled) return "max_tokens";
+    if (result.finish == Finish::stop_sequence) return "stop_sequence";
     if (result.has_calls()) return "tool_use";
     return result.finish == Finish::length ? "max_tokens" : "end_turn";
 }
@@ -117,9 +118,10 @@ JsonObject AgentResponse::responses_body(const char* status) const {
             {"output_tokens", result_.output_tokens}, {"output_tokens_details", JsonObject{{"reasoning_tokens", 0}}},
             {"total_tokens", result_.input_tokens + result_.output_tokens}};
         if (std::string_view(status) == "incomplete") {
-            body["incomplete_details"] = JsonObject{{"reason", "max_output_tokens"}};
+            body["incomplete_details"] = JsonObject{{"reason", result_.finish == Finish::cancelled ? "cancelled" : "max_output_tokens"}};
         }
     }
+    if (std::string_view(status) != "in_progress" && !diagnostics_.empty()) body["fusionrt_diagnostics"] = diagnostics_;
     return body;
 }
 
@@ -128,10 +130,13 @@ JsonObject AgentResponse::messages_body(bool starting) const {
     if (!starting) {
         for (const auto& block : result_.output) content.emplace_back(messages_block(block, true));
     }
-    return {{"id", id_}, {"type", "message"}, {"role", "assistant"}, {"model", model_},
+    JsonObject body{{"id", id_}, {"type", "message"}, {"role", "assistant"}, {"model", model_},
             {"content", std::move(content)}, {"stop_reason", starting ? JsonValue() : messages_reason(result_)},
-            {"stop_sequence", nullptr}, {"usage", JsonObject{{"input_tokens", result_.input_tokens},
+            {"stop_sequence", starting || result_.stop_sequence.empty() ? JsonValue() : JsonValue(result_.stop_sequence)},
+            {"usage", JsonObject{{"input_tokens", result_.input_tokens},
                                             {"output_tokens", starting ? 0 : result_.output_tokens}}}};
+    if (!starting && !diagnostics_.empty()) body["fusionrt_diagnostics"] = diagnostics_;
+    return body;
 }
 
 void AgentResponse::start(int input_tokens) {
@@ -237,13 +242,17 @@ void AgentResponse::call(ToolCall call) {
     }
 }
 
-void AgentResponse::finish(Finish reason, int output_tokens) {
+void AgentResponse::finish(Finish reason, int output_tokens, std::string stop_sequence, JsonObject diagnostics) {
     result_.finish = reason;
+    result_.stop_sequence = std::move(stop_sequence);
+    diagnostics_ = std::move(diagnostics);
     result_.output_tokens = output_tokens;
     close_block();
     if (!event_) return;
     if (protocol_ == Protocol::chat) {
-        send("", chat_chunk({}, chat_reason(result_)));
+        auto terminal = chat_chunk({}, chat_reason(result_));
+        if (!diagnostics_.empty()) terminal["fusionrt_diagnostics"] = diagnostics_;
+        send("", std::move(terminal));
         if (stream_usage_) {
             auto chunk = chat_chunk({}, nullptr);
             chunk["choices"] = JsonArray{};
@@ -252,12 +261,16 @@ void AgentResponse::finish(Finish reason, int output_tokens) {
         }
         send("", std::string_view("[DONE]"));
     } else if (protocol_ == Protocol::responses) {
-        const bool incomplete = reason == Finish::truncated_tool_call || (reason == Finish::length && !result_.has_calls());
-        send(incomplete ? "response.incomplete" : "response.completed",
-            {{"response", responses_body(incomplete ? "incomplete" : "completed")}});
+        const bool incomplete = reason == Finish::cancelled || reason == Finish::truncated_tool_call || (reason == Finish::length && !result_.has_calls());
+        JsonObject terminal{{"response", responses_body(incomplete ? "incomplete" : "completed")}};
+        if (!diagnostics_.empty()) terminal["fusionrt_diagnostics"] = diagnostics_;
+        send(incomplete ? "response.incomplete" : "response.completed", std::move(terminal));
     } else {
-        send("message_delta", {{"delta", JsonObject{{"stop_reason", messages_reason(result_)}, {"stop_sequence", nullptr}}},
-            {"usage", JsonObject{{"output_tokens", output_tokens}}}});
+        JsonObject terminal{{"delta", JsonObject{{"stop_reason", messages_reason(result_)},
+            {"stop_sequence", result_.stop_sequence.empty() ? JsonValue() : JsonValue(result_.stop_sequence)}}},
+            {"usage", JsonObject{{"output_tokens", output_tokens}}}};
+        if (!diagnostics_.empty()) terminal["fusionrt_diagnostics"] = diagnostics_;
+        send("message_delta", std::move(terminal));
         send("message_stop", JsonObject{});
     }
 }
@@ -278,7 +291,7 @@ void AgentResponse::error(std::string_view message) {
 JsonValue AgentResponse::body() const {
     if (protocol_ == Protocol::messages) return messages_body(false);
     if (protocol_ == Protocol::responses) {
-        const bool incomplete = result_.finish == Finish::truncated_tool_call ||
+        const bool incomplete = result_.finish == Finish::cancelled || result_.finish == Finish::truncated_tool_call ||
                                 (result_.finish == Finish::length && !result_.has_calls());
         return responses_body(incomplete ? "incomplete" : "completed");
     }
@@ -292,9 +305,11 @@ JsonValue AgentResponse::body() const {
     JsonObject message{{"role", "assistant"}, {"content", text.empty() && !calls.empty() ? JsonValue() : JsonValue(text)}};
     if (!reasoning.empty()) message["reasoning_content"] = std::move(reasoning);
     if (!calls.empty()) message["tool_calls"] = std::move(calls);
-    return JsonObject{{"id", id_}, {"object", "chat.completion"}, {"created", created_}, {"model", model_},
+    JsonObject body{{"id", id_}, {"object", "chat.completion"}, {"created", created_}, {"model", model_},
         {"choices", JsonArray{JsonObject{{"index", 0}, {"message", std::move(message)},
                                          {"finish_reason", chat_reason(result_)}}}}, {"usage", chat_usage(result_)}};
+    if (!diagnostics_.empty()) body["fusionrt_diagnostics"] = diagnostics_;
+    return body;
 }
 
 }  // namespace fusionrt::agent

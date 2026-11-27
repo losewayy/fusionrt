@@ -10,6 +10,7 @@ int main() {
     std::cout << std::unitbuf;
     try {
         test_quant_and_io();
+        test_wave1_inputs();
         test_gdn_loader_shapes();
         test_frontier_gguf();
         test_q2_k_format();
@@ -63,6 +64,8 @@ int main() {
         test_stage7c_mla();
 #ifdef FUSIONRT_ENABLE_CUDA
         test_review_cuda_kernels(cuda_ctx);
+        test_wave1_cuda(cuda_ctx);
+        test_wave1_http(cuda_ctx);
         test_stage7a_speculative();
         test_review_speculation();
         test_stage7b_cuda_vision();

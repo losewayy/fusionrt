@@ -66,7 +66,7 @@ void reserve_vulkan_model(VkContext& ctx, const LoadedModelRaw& raw) {
             else { matrix(l.q_proj); matrix(l.k_proj); matrix(l.v_proj); }
             for (const auto* bias : {&l.q_bias, &l.k_bias, &l.v_bias})
                 if (!bias->bytes().empty()) add(bias->desc.nbytes());
-            if (dense.qk_norm && !l.q_norm.bytes().empty()) { add(f32(l.q_norm)); add(f32(l.k_norm)); }
+            if (!l.q_norm.bytes().empty() && !l.k_norm.bytes().empty()) { add(f32(l.q_norm)); add(f32(l.k_norm)); }
             matrix(l.o_proj);
             if (l.router_w.bytes().empty()) dense_ffn(l);
             else routed(l);
@@ -184,6 +184,7 @@ static void upload_raw_model_to_vulkan(VkContext& ctx, const LoadedModelRaw& raw
             VkDenseGQALayer L;
             L.cfg = cfg_out.dense;
             L.cfg.gated_q_attn = lr.gated_q_attn;
+            L.cfg.qk_norm = !lr.q_norm.bytes().empty() && !lr.k_norm.bytes().empty();
             L.attn_norm_w = ctx.upload(to_f32_host(lr.attn_norm), true);
             const bool packed_fp32 = pack_vk_qkv(lr, H);
             if (packed_fp32) {
@@ -197,7 +198,7 @@ static void upload_raw_model_to_vulkan(VkContext& ctx, const LoadedModelRaw& raw
             if (!lr.q_bias.bytes().empty()) L.q_bias = ctx.upload(lr.q_bias, true);
             if (!lr.k_bias.bytes().empty()) L.k_bias = ctx.upload(lr.k_bias, true);
             if (!lr.v_bias.bytes().empty()) L.v_bias = ctx.upload(lr.v_bias, true);
-            if (L.cfg.qk_norm && !lr.q_norm.bytes().empty()) {
+            if (L.cfg.qk_norm) {
                 L.q_norm_w = ctx.upload(to_f32_host(lr.q_norm), true);
                 L.k_norm_w = ctx.upload(to_f32_host(lr.k_norm), true);
             } else {

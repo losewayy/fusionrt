@@ -135,11 +135,11 @@ void codec_gemv_q8_1(const void* x, const void* weight, DType dtype, float* out,
 void codec_mmq_q8_1(const void* x, const void* weight, DType dtype, float* out,
                      int M, int N, int K, cudaStream_t stream);
 void codec_dequant_tile_f16(const void* weight, DType dtype, uint16_t* out,
-                             int first_row, int rows, int cols, cudaStream_t stream);
+                             int first_row, int rows, int cols, cudaStream_t stream, float weight_scale = 1.f);
 
 void embed_lookup_f32(const void* emb_table, DType table_dtype,
                       const int32_t* token_ids_dev, float* out,
-                      int M, int hidden, cudaStream_t stream);
+                      int M, int hidden, int vocab_size, cudaStream_t stream, int* invalid_token = nullptr);
 
 // -----------------------------------------------------------------------------
 // Fused Hardware-Focused Kernels (sm_120)
@@ -283,7 +283,7 @@ void dequantize_to_f16(const void* w, DType dt, uint16_t* out_f16, int N, int K,
 void rmsnorm_or_copy_to_f16(const float* x, const float* norm_w, uint16_t* out_f16,
                             int M, int K, float eps, cudaStream_t stream);
 void cublas_linear_f16_f32(cublasHandle_t handle, const uint16_t* x_f16, const uint16_t* w_f16,
-                           float* y, int M, int N, int K, int output_stride = 0);
+                           float* y, int M, int N, int K, int output_stride = 0, float alpha = 1.f);
 
 // GQA Flash / Split-K Decode.
 // A Q8_1 output uses at least two splits and a head_dim divisible by 32.
@@ -309,7 +309,7 @@ void gqa_prefill_causal_f32(
     int M, int num_q_heads, int num_kv_heads, int head_dim,
     int start_pos, int max_seq, float scale, cudaStream_t stream,
     int q_row_stride = 0, DType kv_dtype = DType::F32, CudaKvView cache = {}, int sliding_window = 0,
-    bool causal = true);
+    bool causal = true, const int* image_bounds = nullptr);
 
 // Online Tensor Core prefill with FP32 softmax and accumulation.
 void gqa_prefill_online_f32(const float* q, int q_stride, CudaKvView cache, float* out,

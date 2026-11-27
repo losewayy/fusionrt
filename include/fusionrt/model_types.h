@@ -92,8 +92,12 @@ struct HybridModelConfig {
     float final_logit_softcapping = 0.0f;
 };
 
-inline std::invalid_argument prompt_context_error(size_t tokens, int context) {
-    return std::invalid_argument("Prompt (" + std::to_string(tokens) + " tokens) exceeds model context (" +
+struct PromptContextError : std::invalid_argument {
+    using std::invalid_argument::invalid_argument;
+};
+
+inline PromptContextError prompt_context_error(size_t tokens, int context) {
+    return PromptContextError("Prompt (" + std::to_string(tokens) + " tokens) exceeds model context (" +
                                  std::to_string(context) + ")");
 }
 
@@ -118,6 +122,9 @@ struct GenerationStats {
     int spec_proposed = 0;
     int spec_accepted = 0;
     bool used_cuda_graph = false;
+    bool cancelled = false;
+    bool json_complete = false;
+    bool speculative_active = false;
     std::array<int, 7> mtp_proposed_by_depth{}, mtp_accepted_by_depth{};
     std::array<int, 7> mtp_checked_by_depth{};
     int mtp_cutoffs = 0;
@@ -148,6 +155,7 @@ struct LayerTrace {
 struct InputEmbedding {
     int start = 0;  // Offset into prompt token IDs.
     Tensor rows;
+    bool bidirectional = false;
 };
 
 struct ModelMemory {

@@ -742,6 +742,7 @@ __global__ void k_gdn_chunk_coefficients(
     __shared__ float keys[C][DK + 4], queries[C][DK + 4];
     __shared__ float lower[C][C + 4], inverse[C][C + 1];
     __shared__ float decay[C], rate[C];
+    __shared__ bool direct_decays;
     int vh = blockIdx.x, kh = tiled_value_heads ? vh % nk : vh / (nv / nk), base = blockIdx.y * C;
     int count = min(C, M - base);
     int tid = threadIdx.x, lane = tid & 31, warp = tid / 32;
@@ -768,15 +769,26 @@ __global__ void k_gdn_chunk_coefficients(
             g = -expf(A_log[vh]) * softplus_f(a[static_cast<int64_t>(m) * a_stride + vh] + dt_bias[vh]);
             rate[lane] = 1.0f / (1.0f + expf(-b[static_cast<int64_t>(m) * b_stride + vh]));
         }
+        const float log_step = g;
         for (int step = 1; step < C; step *= 2) {
             float prev = __shfl_up_sync(0xffffffffu, g, step);
             if (lane >= step) g += prev;
         }
-        decay[lane] = g;
-        float last = __shfl_sync(0xffffffffu, g, count - 1);
+        const float last = __shfl_sync(0xffffffffu, g, count - 1);
+        // At this magnitude, FP32 prefix spacing can erase a measurable decay.
+        const bool direct = last <= -0x1p12f;
+        if (lane == 0) direct_decays = direct;
+        decay[lane] = direct ? log_step : g;
+        float tail = 0.0f;
+        if (direct) {
+            for (int i = 1; i < count; ++i) {
+                const float term = __shfl_sync(0xffffffffu, log_step, i);
+                if (i > lane) tail += term;
+            }
+        } else tail = last - g;
         if (lane < count) {
             before[lane] = expf(g);
-            after[lane] = expf(last - g);
+            after[lane] = expf(tail);
         }
     }
     __syncthreads();
@@ -797,7 +809,11 @@ __global__ void k_gdn_chunk_coefficients(
         }
         auto write = [&](int i, int j, float dot_kk, float dot_qk) {
             if (i < count && j <= i) {
-                float g = expf(decay[i] - decay[j]);
+                float interval = 0.f;
+                if (direct_decays) {
+                    for (int t = j + 1; t <= i; ++t) interval += decay[t];
+                } else interval = decay[i] - decay[j];
+                const float g = expf(interval);
                 lower[i][j] = rate[i] * g * dot_kk;
                 attention[i * C + j] = g * dot_qk;
             }

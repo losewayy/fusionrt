@@ -162,8 +162,8 @@ static void codec_linear(CudaContext& ctx, const float* x, const float* norm, co
         cuda_ops::rmsnorm_or_copy_to_f16(x, norm, x16, M, K, eps, ctx.stream());
         for (int first = 0; first < N; first += tile) {
             const int count = std::min(tile, N - first);
-            cuda_ops::codec_dequant_tile_f16(w.ptr(), w.dtype, w16, first, count, K, ctx.stream());
-            cuda_ops::cublas_linear_f16_f32(ctx.cublas(), x16, w16, y + first, M, count, K, N);
+            cuda_ops::codec_dequant_tile_f16(w.ptr(), w.dtype, w16, first, count, K, ctx.stream(), w.codec_tile_scale);
+            cuda_ops::cublas_linear_f16_f32(ctx.cublas(), x16, w16, y + first, M, count, K, N, w.codec_tile_scale);
         }
     } else {
         if (norm) {
