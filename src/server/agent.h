@@ -6,6 +6,7 @@
 #include "fusionrt/tokenizer.h"
 
 #include <functional>
+#include <limits>
 #include <optional>
 #include <string_view>
 
@@ -44,7 +45,7 @@ struct Message {
 enum class Choice { automatic, none, required, named };
 
 struct GenerationParams {
-    int max_tokens = 512;
+    int max_tokens = std::numeric_limits<int>::max();
     SamplingParams sampling;
     std::vector<std::string> stops;
     bool stream = false;

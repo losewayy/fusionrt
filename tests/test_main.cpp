@@ -2479,7 +2479,17 @@ void test_review_input_validation() {
     };
     reject([&] { parse(R"({"input":"test","text":{"format":{"type":"json_schema","schema":{"type":"object","required":["x"]}}}})", Protocol::responses); });
     reject([&] { parse(R"({"messages":[{"role":"user","content":"test"}],"response_format":{"type":"json_object"},"tools":[{"type":"function","function":{"name":"demo"}}],"tool_choice":"auto"})", Protocol::chat); });
-    auto params = parse(R"({"messages":[{"role":"user","content":"test"}],"response_format":{"type":"json_object"}})", Protocol::chat).generation;
+    const auto omitted = parse(R"({"messages":[{"role":"user","content":"test"}]})", Protocol::chat);
+    const auto capped = parse(R"({"messages":[{"role":"user","content":"test"}],"max_completion_tokens":128})", Protocol::chat);
+    if (agent::generation_limit(omitted.generation, 2048, 127) != 1921 ||
+        agent::generation_limit(capped.generation, 2048, 127) != 128 ||
+        agent::generation_limit(capped.generation, 200, 127) != 73)
+        throw std::runtime_error("HTTP output limits must use remaining context and respect explicit caps");
+    reject([&] { parse(R"({"messages":[{"role":"user","content":"test"}],"max_completion_tokens":-1})", Protocol::chat); });
+    const auto zero = parse(R"({"messages":[{"role":"user","content":"test"}],"max_completion_tokens":0})", Protocol::chat);
+    if (agent::generation_limit(zero.generation, 2048, 127) != 0)
+        throw std::runtime_error("An explicit zero output limit must be preserved");
+    auto params = parse(R"({"messages":[{"role":"user","content":"test"}],"response_format":{"type":"json_object"},"max_completion_tokens":0})", Protocol::chat).generation;
     for (const bool stream : {false, true}) {
         params.stream = stream;
         params.max_tokens = 0;
