@@ -13,7 +13,7 @@ using namespace model_io;
 namespace {
 
 bool expand_vk_weight(DType dtype) {
-    return dtype == DType::F16 || dtype == DType::BF16 || dtype == DType::Q4_1 ||
+    return is_weight_codec_dtype(dtype) || dtype == DType::F16 || dtype == DType::BF16 || dtype == DType::Q4_1 ||
            dtype == DType::Q2_K || dtype == DType::Q4_K || dtype == DType::Q5_K || dtype == DType::Q6_K;
 }
 
@@ -308,6 +308,10 @@ void FusionModel::init_synthetic_vulkan(VkContext& ctx, uint64_t seed) {
 bool FusionModel::load_gguf_vulkan(VkContext& ctx, const std::string& path, std::string* err, int max_seq_override) {
     LoadedModelRaw raw;
     if (!parse_gguf_model_raw(path, max_seq_override, raw, err)) return false;
+    if (raw.hadamard_folded) {
+        if (err) *err = "Hadamard-folded GGUF weights require the CUDA backend";
+        return false;
+    }
     if (raw.cfg.model_architecture == "gemma4") {
         if (err) *err = "Gemma 4 GGUF requires the CUDA backend";
         return false;

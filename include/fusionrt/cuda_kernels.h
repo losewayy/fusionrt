@@ -112,6 +112,17 @@ void argmax_f32(const float* x, int n, int32_t* out_idx, cudaStream_t stream,
                  void* scratch = nullptr, int* pos = nullptr, int* kv_len = nullptr, int history_size = 0);
 
 // GPU embedding lookup supporting F32, F16, BF16, Q8_0, Q4_0 tables -> F32 [M, hidden]
+void blockwise_hadamard_f32(const float* x, const int8_t* signs, float* out, int rows, int cols,
+                            int block, cudaStream_t stream, bool inverse = false,
+                            int head_dim = 0, int key_heads = 0);
+void fused_rmsnorm_hadamard_f32(const float* x, const float* weight, const int8_t* signs, float* out,
+                               int rows, int cols, int block, float eps, cudaStream_t stream);
+
+void codec_gemv_f32(const float* x, const void* weight, DType dtype, float* out,
+                     int rows, int out_cols, int in_cols, cudaStream_t stream);
+void codec_dequant_tile_f16(const void* weight, DType dtype, uint16_t* out,
+                             int first_row, int rows, int cols, cudaStream_t stream);
+
 void embed_lookup_f32(const void* emb_table, DType table_dtype,
                       const int32_t* token_ids_dev, float* out,
                       int M, int hidden, cudaStream_t stream);
@@ -257,7 +268,7 @@ void dequantize_to_f16(const void* w, DType dt, uint16_t* out_f16, int N, int K,
 void rmsnorm_or_copy_to_f16(const float* x, const float* norm_w, uint16_t* out_f16,
                             int M, int K, float eps, cudaStream_t stream);
 void cublas_linear_f16_f32(cublasHandle_t handle, const uint16_t* x_f16, const uint16_t* w_f16,
-                           float* y, int M, int N, int K);
+                           float* y, int M, int N, int K, int output_stride = 0);
 
 // GQA Flash / Split-K Decode.
 // A Q8_1 output uses at least two splits and a head_dim divisible by 32.

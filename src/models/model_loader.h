@@ -34,6 +34,7 @@ struct LoadedModelRaw {
     HostTensor lm_head_w;
     HostTensor rope_factors;
     GemmaLayerInputWeights<HostTensor> gemma_inputs;
+    bool hadamard_folded = false;
     std::vector<LoadedLayerRaw> layers;
 };
 
@@ -42,6 +43,9 @@ HostTensor make_rand_f32(const std::vector<int64_t>& shape, std::mt19937_64& rng
 HostTensor make_ones_f32(const std::vector<int64_t>& shape);
 HostTensor make_zeros_f32(const std::vector<int64_t>& shape);
 HostTensor quantize_host_matrix(const HostTensor&, DType);
+inline bool same_weight_basis(const HostTensor& a, const HostTensor& b) {
+    return a.desc.hadamard_block == b.desc.hadamard_block && a.hadamard_signs == b.hadamard_signs;
+}
 HostTensor concat_rows_same_dtype(const std::vector<HostTensor>& parts);
 HostTensor to_f32_host(const HostTensor&);
 bool parse_gguf_model_raw(const std::string&, int max_seq_override, LoadedModelRaw&, std::string* err);

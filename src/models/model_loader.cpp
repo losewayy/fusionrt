@@ -1,4 +1,8 @@
 #include "model_loader.h"
+#include "fusionrt/weight_codec.h"
+#include "fusionrt/hadamard.h"
+#include <unordered_set>
+#include <optional>
 #include "../core/gdn_shape.h"
 #include "fusionrt/gguf.h"
 #include "fusionrt/json.h"
@@ -142,13 +146,15 @@ HostTensor concat_rows_same_dtype(const std::vector<HostTensor>& parts) {
     int64_t total_rows = 0;
     size_t total_bytes = 0;
     for (const auto& p : parts) {
-        if (p.desc.dtype != dt || p.desc.ndim != 2 || p.desc.shape[1] != cols) {
+        if (p.desc.dtype != dt || p.desc.ndim != 2 || p.desc.shape[1] != cols || !same_weight_basis(p, parts[0])) {
             throw std::runtime_error("concat_rows_same_dtype: incompatible tensor shapes/dtypes");
         }
         total_rows += p.desc.shape[0];
         total_bytes += p.bytes().size();
     }
     HostTensor out = HostTensor::create({total_rows, cols}, dt);
+    out.desc.hadamard_block = parts[0].desc.hadamard_block;
+    out.hadamard_signs = parts[0].hadamard_signs;
     size_t off = 0;
     for (const auto& p : parts) {
         std::memcpy(out.storage.data() + off, p.bytes().data(), p.bytes().size());
@@ -158,6 +164,8 @@ HostTensor concat_rows_same_dtype(const std::vector<HostTensor>& parts) {
 }
 
 HostTensor to_f32_host(const HostTensor& ht) {
+    if (ht.desc.hadamard_block)
+        throw std::runtime_error("Folded tensor requires a Hadamard-aware operation: " + ht.desc.name);
     if (ht.desc.dtype == DType::F32) return ht;
     std::vector<int64_t> dims(ht.desc.shape.begin(), ht.desc.shape.begin() + ht.desc.ndim);
     HostTensor out = HostTensor::create(dims, DType::F32);
@@ -166,6 +174,12 @@ HostTensor to_f32_host(const HostTensor& ht) {
         convert_f16_to_f32(reinterpret_cast<const uint16_t*>(ht.bytes().data()), out.data<float>(), n);
     } else if (ht.desc.dtype == DType::BF16) {
         convert_bf16_to_f32(reinterpret_cast<const uint16_t*>(ht.bytes().data()), out.data<float>(), n);
+    } else if (is_weight_codec_dtype(ht.desc.dtype)) {
+        visit_weight_codec(ht.desc.dtype, [&]<class Codec>() {
+            for (int64_t block = 0; block < n / Codec::kBlockSize; ++block)
+                Codec::dequant_block(ht.bytes().data() + block * Codec::kBlockBytes,
+                                     out.data<float>() + block * Codec::kBlockSize);
+        });
     } else {
         int64_t cols = dims.back();
         int64_t rows = n / cols;
@@ -226,6 +240,95 @@ struct GgufArchitecture {
     bool recurrent = false;
 };
 
+struct GgufHadamard {
+    int block = 0;
+    bool gdn_v_grouped = false;
+    bool explicit_signs = false;
+    std::map<int64_t, std::shared_ptr<const std::vector<int8_t>>> signs;
+    std::unordered_set<std::string> pending;
+
+    explicit GgufHadamard(const GgufFile& gf) {
+        constexpr std::string_view prefix = "prism.hadamard.";
+        const auto& meta = gf.metadata();
+        const auto first = meta.lower_bound(std::string(prefix));
+        if (first == meta.end() || !first->first.starts_with(prefix)) return;
+        const auto version = gf.get_int("prism.hadamard.version");
+        const auto tied = gf.get_bool("prism.hadamard.tied_output");
+        const auto sign_mode = gf.get_string("prism.hadamard.sign_mode");
+        explicit_signs = sign_mode == "explicit";
+        if ((version != 1 && version != 2) || (version == 2) != tied ||
+            gf.get_string("prism.hadamard.transform") != "normalized-sylvester-walsh-hadamard" ||
+            gf.get_string("prism.hadamard.axis") != "input-last-dimension" ||
+            (!explicit_signs && sign_mode != "identity"))
+            throw std::runtime_error("Unsupported prism.hadamard version, transform, axis or sign mode");
+        const auto group = gf.get_int("prism.hadamard.block_size");
+        if (group < 64 || group > 1024) throw std::runtime_error("Invalid prism.hadamard.block_size");
+        block = static_cast<int>(group);
+        validate_hadamard_shape(1, block, block);
+        gdn_v_grouped = gf.get_bool("prism.hadamard.gdn_v_grouped");
+        auto uints = [&](const std::string& key) {
+            std::vector<uint32_t> result;
+            if (const auto it = meta.find(key); it != meta.end()) {
+                if (const auto* values = std::get_if<std::vector<uint32_t>>(&it->second)) return *values;
+                if (const auto* values = std::get_if<std::vector<int32_t>>(&it->second))
+                    result.assign(values->begin(), values->end());
+            }
+            return result;
+        };
+        if (explicit_signs) parse_signs(uints("prism.hadamard.sign_widths"), uints("prism.hadamard.sign_values"));
+
+        const auto add = [&](const std::string& name) {
+            const auto* t = gf.find_tensor(name);
+            if (!t || t->shape.size() != 2 || t->shape.back() % block != 0 ||
+                (explicit_signs && !signs.contains(t->shape.back())) ||
+                !(t->dtype == DType::Q2_0 || t->dtype == DType::PQ2_0 || t->dtype == DType::PTQ1_0) ||
+                !pending.insert(name).second)
+                throw std::runtime_error("Unsupported or invalid Hadamard-folded tensor: " + name);
+        };
+        const auto names = gf.get_string_array("prism.hadamard.weight_names");
+        const auto inverse = gf.get_string_array("prism.hadamard.inverse_weight_names");
+        if (names.empty()) throw std::runtime_error("Missing prism.hadamard.weight_names");
+        for (const auto& name : names) {
+            if (name == "token_embd.weight")
+                throw std::runtime_error("Use prism.hadamard.inverse_weight_names for embeddings");
+            add(name);
+        }
+        for (const auto& name : inverse) {
+            if (name != "token_embd.weight") throw std::runtime_error("Unsupported inverse Hadamard lookup: " + name);
+            add(name);
+        }
+        const bool has_output = gf.find_tensor("output.weight") != nullptr;
+        if ((tied && (has_output || inverse.empty())) || (!tied && !has_output && !inverse.empty()))
+            throw std::runtime_error("Invalid prism.hadamard tied output metadata");
+    }
+
+    void parse_signs(const std::vector<uint32_t>& widths, const std::vector<uint32_t>& values) {
+        if (widths.empty()) throw std::runtime_error("Missing prism.hadamard.sign_widths");
+        size_t offset = 0;
+        for (const auto width : widths) {
+            if (width == 0 || width % block != 0 || width > values.size() - offset || signs.contains(width))
+                throw std::runtime_error("Invalid prism.hadamard sign geometry");
+            auto vector = std::make_shared<std::vector<int8_t>>();
+            vector->reserve(width);
+            for (size_t i = 0; i < width; ++i) {
+                const auto value = values[offset++];
+                if (value != 1 && value != UINT32_MAX)
+                    throw std::runtime_error("prism.hadamard sign must be -1 or 1");
+                vector->push_back(value == 1 ? 1 : -1);
+            }
+            signs.emplace(width, std::move(vector));
+        }
+        if (offset != values.size()) throw std::runtime_error("prism.hadamard.sign_values length mismatch");
+    }
+
+    void attach(HostTensor& tensor, const std::string& name) {
+        if (block && pending.erase(name)) {
+            tensor.desc.hadamard_block = block;
+            if (explicit_signs) tensor.hadamard_signs = signs.at(tensor.desc.shape[tensor.desc.ndim - 1]);
+        }
+    }
+};
+
 constexpr GgufArchitecture supported_architectures[] = {
     {"llama", false}, {"qwen2", true}, {"qwen3", true}, {"qwen35", true, true},
     {"qwen3moe", true}, {"deepseek2", false}, {"mistral", true}, {"phi3", true},
@@ -280,11 +383,25 @@ bool parse_gguf_model_raw(const std::string& path, int max_seq_override, LoadedM
         return false;
     }
 
-    out.tok_embeddings = gf.view_tensor("token_embd.weight");
-    out.final_norm_w = to_f32_host(gf.view_tensor("output_norm.weight"));
-    if (gf.find_tensor("output.weight")) {
-        out.lm_head_w = gf.view_tensor("output.weight");
+    std::optional<GgufHadamard> hadamard;
+    try {
+        hadamard.emplace(gf);
+        if (hadamard->block && (gemma4 || deepseek2 || get_arch_int("expert_count", 0) > 0))
+            throw std::runtime_error("Hadamard-folded weights require dense or GDN CUDA projections");
+    } catch (const std::exception& e) {
+        if (err) *err = e.what();
+        return false;
     }
+    out.hadamard_folded = hadamard->block != 0;
+    auto req = [&](const std::string& name) -> HostTensor {
+        if (!gf.find_tensor(name)) throw std::runtime_error("GGUF missing required tensor: " + name);
+        auto t = gf.view_tensor(name);
+        hadamard->attach(t, name);
+        return t;
+    };
+    out.tok_embeddings = req("token_embd.weight");
+    out.final_norm_w = to_f32_host(gf.view_tensor("output_norm.weight"));
+    if (gf.find_tensor("output.weight")) out.lm_head_w = req("output.weight");
 
     int64_t emb_vocab = out.tok_embeddings.desc.shape[0];
     int64_t emb_hidden = out.tok_embeddings.desc.shape[1];
@@ -422,13 +539,6 @@ bool parse_gguf_model_raw(const std::string& path, int max_seq_override, LoadedM
 
     bool saw_gdn = false, saw_moe = false;
     out.layers.resize(static_cast<size_t>(num_layers));
-
-    auto req = [&](const std::string& name) -> HostTensor {
-        if (!gf.find_tensor(name)) {
-            throw std::runtime_error("GGUF missing required tensor: " + name);
-        }
-        return gf.view_tensor(name);
-    };
 
     auto layer_int = [&](const std::string& suffix, int index, int fallback) -> int {
         auto meta = gf.metadata().find(prefix + suffix);
@@ -797,20 +907,16 @@ bool parse_gguf_model_raw(const std::string& path, int max_seq_override, LoadedM
                 const int q_dim = layer_nq * layer_hd;
                 const int kv_dim = layer_nkv * layer_hd;
                 if (gf.find_tensor(p + "attn_qkv.weight")) {
-                    L.qkv_proj = gf.view_tensor(p + "attn_qkv.weight");
+                    L.qkv_proj = req(p + "attn_qkv.weight");
                     // Split q, k, v host slices for unfused/Vulkan paths
                     if (L.qkv_proj.desc.ndim != 2 || L.qkv_proj.desc.shape[1] != H ||
                         L.qkv_proj.desc.shape[0] != q_dim + 2 * kv_dim) {
                         throw std::runtime_error("Invalid GGUF packed QKV shape: " + p + "attn_qkv.weight");
                     }
-                    size_t row_b = row_nbytes(L.qkv_proj.desc.dtype, H);
-                    L.q_proj = HostTensor::create({q_dim, H}, L.qkv_proj.desc.dtype);
-                    std::memcpy(L.q_proj.storage.data(), L.qkv_proj.bytes().data(), static_cast<size_t>(q_dim) * row_b);
+                    L.q_proj = L.qkv_proj.slice_dim0(0, q_dim);
                     if (owns_kv) {
-                        L.k_proj = HostTensor::create({kv_dim, H}, L.qkv_proj.desc.dtype);
-                        L.v_proj = HostTensor::create({kv_dim, H}, L.qkv_proj.desc.dtype);
-                        std::memcpy(L.k_proj.storage.data(), L.qkv_proj.bytes().data() + static_cast<size_t>(q_dim) * row_b, static_cast<size_t>(kv_dim) * row_b);
-                        std::memcpy(L.v_proj.storage.data(), L.qkv_proj.bytes().data() + static_cast<size_t>(q_dim + kv_dim) * row_b, static_cast<size_t>(kv_dim) * row_b);
+                        L.k_proj = L.qkv_proj.slice_dim0(q_dim, kv_dim);
+                        L.v_proj = L.qkv_proj.slice_dim0(q_dim + kv_dim, kv_dim);
                     }
                 } else {
                     L.q_proj = req(p + "attn_q.weight");
@@ -870,7 +976,7 @@ bool parse_gguf_model_raw(const std::string& path, int max_seq_override, LoadedM
                     L.gate_up = std::move(up);  // Phi-3 stores gate and up in one tensor.
                 } else {
                     auto gate = req(p + "ffn_gate.weight");
-                    if (gate.desc.dtype == up.desc.dtype) {
+                    if (gate.desc.dtype == up.desc.dtype && same_weight_basis(gate, up)) {
                         L.gate_up = concat_rows_same_dtype({gate, up});
                     } else {
                         L.gate = std::move(gate);
@@ -885,13 +991,23 @@ bool parse_gguf_model_raw(const std::string& path, int max_seq_override, LoadedM
             if (!valid_gate_up || !matrix(L.down, H, layer_inter)) {
                 throw std::runtime_error("Invalid GGUF FFN projection shapes: " + p);
             }
-            if (L.kind == 1) validate_gdn_layer(L, get_arch_int("ssm.conv_kernel", 4), out.cfg.gdn, p);
+            if (L.kind == 1) {
+                validate_gdn_layer(L, get_arch_int("ssm.conv_kernel", 4), out.cfg.gdn, p);
+                if (hadamard->gdn_v_grouped && out.cfg.gdn.tiled_value_heads && L.o_proj.desc.hadamard_block) {
+                    L.o_proj.desc.hadamard_head_dim = out.cfg.gdn.head_v_dim;
+                    L.o_proj.desc.hadamard_key_heads = out.cfg.gdn.num_k_heads;
+                }
+            }
         }
     } catch (const std::exception& e) {
         if (err) *err = e.what();
         return false;
     }
 
+    if (!hadamard->pending.empty()) {
+        if (err) *err = "Hadamard-folded tensor has no supported projection: " + *hadamard->pending.begin();
+        return false;
+    }
     if (saw_gdn) out.cfg.arch = "hybrid";
     else if (saw_moe) out.cfg.arch = "moe";
     else out.cfg.arch = "dense";

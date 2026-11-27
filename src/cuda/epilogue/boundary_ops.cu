@@ -1,10 +1,63 @@
 #include "../matmul/weight_tiles.cuh"
+#include "fusionrt/weight_codec.h"
+#include "fusionrt/hadamard.h"
 
 #include <algorithm>
 
 namespace fusionrt::cuda_ops {
 
 namespace {
+
+template<bool Normalize>
+__global__ void k_hadamard(const float* x, const float* weight, const int8_t* signs,
+                           float* out, int cols, int block, float eps, bool inverse,
+                           int head_dim, int key_heads) {
+    __shared__ float values[1024];
+    __shared__ float reduction[32];
+    const int groups = cols / block;
+    const int row = Normalize ? blockIdx.x : blockIdx.x / groups;
+    const int first = Normalize ? 0 : blockIdx.x % groups;
+    const int last = Normalize ? groups : first + 1;
+    x += static_cast<int64_t>(row) * cols;
+    out += static_cast<int64_t>(row) * cols;
+    float inv_rms = 1.0f;
+    if constexpr (Normalize) {
+        float sum = 0;
+        for (int i = threadIdx.x; i < cols; i += blockDim.x) sum += x[i] * x[i];
+        inv_rms = rsqrtf(block_reduce_sum(sum, reduction) / cols + eps);
+        __syncthreads();
+    }
+    const float scale = rsqrtf(static_cast<float>(block));
+    for (int group = first; group < last; ++group) {
+        const int start = group * block;
+        for (int i = threadIdx.x; i < block; i += blockDim.x) {
+            const int col = start + i;
+            int src = col;
+            if (key_heads) {
+                // The GDN state is tiled by repeat, while the folded SSM projection groups repeats by key head.
+                const int repeats = cols / head_dim / key_heads;
+                const int head = col / head_dim;
+                src = (head % repeats * key_heads + head / repeats) * head_dim + col % head_dim;
+            }
+            float v = x[src];
+            if constexpr (Normalize) v *= inv_rms * weight[col];
+            values[i] = signs && !inverse ? v * signs[col] : v;
+        }
+        __syncthreads();
+        for (int span = 1; span < block; span *= 2) {
+            for (int pair = threadIdx.x; pair < block / 2; pair += blockDim.x) {
+                const int lo = 2 * (pair / span) * span + pair % span;
+                const float a = values[lo], b = values[lo + span];
+                values[lo] = a + b;
+                values[lo + span] = a - b;
+            }
+            __syncthreads();
+        }
+        for (int i = threadIdx.x; i < block; i += blockDim.x)
+            out[start + i] = values[i] * scale * (signs && inverse ? signs[start + i] : 1);
+        __syncthreads();
+    }
+}
 
 __global__ void k_layernorm(const float* x, const float* weight, const float* bias, float* out,
                             int cols, float eps) {
@@ -440,7 +493,51 @@ __device__ float moe_warp_dot(const float* x, const void* weights, int row, int 
     return warp_reduce_sum(acc);
 }
 
+template<class Codec>
+__device__ float codec_warp_dot(const float* x, const uint8_t* weight, int row, int cols) {
+    const int lane = threadIdx.x & 31;
+    const int blocks = cols / Codec::kBlockSize;
+    const auto* b = weight + static_cast<size_t>(row) * blocks * Codec::kBlockBytes;
+    float sum = 0.0f;
+    for (int block = 0; block < blocks; ++block, b += Codec::kBlockBytes) {
+        for (int i = lane; i < Codec::kBlockSize; i += 32)
+            sum += x[block * Codec::kBlockSize + i] * Codec::value(b, i);
+    }
+    return warp_reduce_sum(sum);
+}
+
+template<class Codec>
+__global__ void k_codec_gemv(const float* x, const uint8_t* w, float* out, int rows, int n, int k) {
+    const int64_t i = static_cast<int64_t>(blockIdx.x) * (blockDim.x / 32) + threadIdx.x / 32;
+    if (i >= static_cast<int64_t>(rows) * n) return;
+    const float sum = codec_warp_dot<Codec>(x + i / n * k, w, static_cast<int>(i % n), k);
+    if ((threadIdx.x & 31) == 0) out[i] = sum;
+}
+
+template<class Codec, bool Embedding>
+__global__ void k_codec_unpack(const uint8_t* w, const int32_t* ids,
+                               void* out, int rows, int cols, int first) {
+    const int64_t i = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (i >= static_cast<int64_t>(rows) * cols) return;
+    const int64_t row = Embedding ? ids[i / cols] : i / cols + first;
+    const auto col = i % cols;
+    const auto block = (row * cols + col) / Codec::kBlockSize;
+    const float v = Codec::value(w + block * Codec::kBlockBytes, static_cast<int>(col % Codec::kBlockSize));
+    if constexpr (Embedding) static_cast<float*>(out)[i] = v;
+    else static_cast<half*>(out)[i] = __float2half_rn(v);
+}
+
+template<bool CodecWeights>
 __device__ float moe_warp_dot(const float* x, const void* w, DType type, int row, int cols) {
+    if constexpr (CodecWeights) {
+        switch (type) {
+#define FUSIONRT_CODEC_CASE(name, id, block, bytes) case DType::name: \
+    return codec_warp_dot<WeightCodec<DType::name>>(x, static_cast<const uint8_t*>(w), row, cols);
+            FUSIONRT_WEIGHT_CODEC_FORMATS(FUSIONRT_CODEC_CASE)
+#undef FUSIONRT_CODEC_CASE
+            default: break;
+        }
+    }
     switch (type) {
         case DType::F32: return moe_warp_dot<-1>(x, w, row, cols);
         case DType::F16: return moe_warp_dot<0>(x, w, row, cols);
@@ -456,6 +553,7 @@ __device__ float moe_warp_dot(const float* x, const void* w, DType type, int row
     }
 }
 
+template<bool CodecWeights>
 __global__ void k_moe_indexed_gate_up_swiglu(
     const float* __restrict__ x,
     const int* __restrict__ topk_idx,
@@ -474,14 +572,15 @@ __global__ void k_moe_indexed_gate_up_swiglu(
     int e = topk_idx[k_slot] - first_expert;
     if (e < 0 || e >= resident) return;
     const int gate_row = (up_w ? e : 2 * e) * inter + c;
-    const float g_acc = moe_warp_dot(x, gate_w, gate_type, gate_row, hidden);
-    const float u_acc = up_w ? moe_warp_dot(x, up_w, up_type, gate_row, hidden) :
-                               moe_warp_dot(x, gate_w, gate_type, gate_row + inter, hidden);
+    const float g_acc = moe_warp_dot<CodecWeights>(x, gate_w, gate_type, gate_row, hidden);
+    const float u_acc = up_w ? moe_warp_dot<CodecWeights>(x, up_w, up_type, gate_row, hidden) :
+                               moe_warp_dot<CodecWeights>(x, gate_w, gate_type, gate_row + inter, hidden);
     if (lane == 0) {
         scratch_inter[k_slot * inter + c] = silu_f(g_acc) * u_acc;
     }
 }
 
+template<bool CodecWeights>
 __global__ void k_moe_indexed_down_combine(
     const float* __restrict__ scratch_inter,
     const int* __restrict__ topk_idx,
@@ -498,7 +597,7 @@ __global__ void k_moe_indexed_down_combine(
     for (int k_slot = 0; k_slot < top_k; ++k_slot) {
         int e = topk_idx[k_slot] - first_expert;
         if (e < 0 || e >= resident) continue;
-        total += moe_warp_dot(scratch_inter + k_slot * inter, down_w, down_type,
+        total += moe_warp_dot<CodecWeights>(scratch_inter + k_slot * inter, down_w, down_type,
                               e * hidden + wid, inter) * topk_weight[k_slot];
     }
     if (lane == 0) out[wid] = total;
@@ -975,17 +1074,77 @@ void moe_indexed_swiglu_gemv(
     constexpr int WARPS = 8;
     int total_up_rows = top_k * inter;
     int up_blocks = (total_up_rows + WARPS - 1) / WARPS;
-    k_moe_indexed_gate_up_swiglu<<<up_blocks, WARPS * 32, 0, stream>>>(
-        x, topk_idx, gate_w, gate_type, up_w, up_type, scratch_inter, hidden, inter, top_k, resident, first_expert);
+    auto gate_up = [&]<bool CodecWeights>() {
+        k_moe_indexed_gate_up_swiglu<CodecWeights><<<up_blocks, WARPS * 32, 0, stream>>>(
+            x, topk_idx, gate_w, gate_type, up_w, up_type, scratch_inter, hidden, inter, top_k, resident, first_expert);
+    };
+    if (is_weight_codec_dtype(gate_type) || (up_w && is_weight_codec_dtype(up_type)))
+        gate_up.template operator()<true>();
+    else
+        gate_up.template operator()<false>();
 
-    int down_blocks = (hidden + WARPS - 1) / WARPS;
-    k_moe_indexed_down_combine<<<down_blocks, WARPS * 32, 0, stream>>>(
-        scratch_inter, topk_idx, down_w, down_type, topk_weight, out, hidden, inter, top_k, resident, first_expert);
+    const int down_blocks = (hidden + WARPS - 1) / WARPS;
+    auto down = [&]<bool CodecWeights>() {
+        k_moe_indexed_down_combine<CodecWeights><<<down_blocks, WARPS * 32, 0, stream>>>(
+            scratch_inter, topk_idx, down_w, down_type, topk_weight, out, hidden, inter, top_k, resident, first_expert);
+    };
+    if (is_weight_codec_dtype(down_type)) down.template operator()<true>();
+    else down.template operator()<false>();
+}
+
+void blockwise_hadamard_f32(const float* x, const int8_t* signs, float* out, int rows, int cols,
+                            int block, cudaStream_t stream, bool inverse,
+                            int head_dim, int key_heads) {
+    validate_hadamard_shape(rows, cols, block);
+    const auto groups = static_cast<int64_t>(rows) * (cols / block);
+    if (groups > 0x7fffffff) throw std::invalid_argument("Too many CUDA Hadamard groups");
+    if (key_heads && (inverse || x == out || head_dim <= 0 || key_heads < 0 ||
+                      cols % (static_cast<int64_t>(head_dim) * key_heads) != 0))
+        throw std::invalid_argument("Invalid Hadamard value head permutation");
+    k_hadamard<false><<<static_cast<unsigned>(groups), std::min(256, block / 2), 0, stream>>>(
+        x, nullptr, signs, out, cols, block, 0.0f, inverse, head_dim, key_heads);
+}
+
+void fused_rmsnorm_hadamard_f32(const float* x, const float* weight, const int8_t* signs, float* out,
+                               int rows, int cols, int block, float eps, cudaStream_t stream) {
+    validate_hadamard_shape(rows, cols, block);
+    k_hadamard<true><<<rows, std::min(256, block / 2), 0, stream>>>(
+        x, weight, signs, out, cols, block, eps, false, 0, 0);
+}
+
+void codec_gemv_f32(const float* x, const void* weight, DType dtype, float* out,
+                     int rows, int out_cols, int in_cols, cudaStream_t stream) {
+    (void)row_nbytes(dtype, in_cols);
+    constexpr int warps = 4;
+    const auto blocks = (static_cast<int64_t>(rows) * out_cols + warps - 1) / warps;
+    visit_weight_codec(dtype, [&]<class Codec>() {
+        k_codec_gemv<Codec><<<static_cast<unsigned>(blocks), warps * 32, 0, stream>>>(
+            x, static_cast<const uint8_t*>(weight), out, rows, out_cols, in_cols);
+    });
+}
+
+void codec_dequant_tile_f16(const void* weight, DType dtype, uint16_t* out,
+                             int first_row, int rows, int cols, cudaStream_t stream) {
+    (void)row_nbytes(dtype, cols);
+    const auto blocks = (static_cast<int64_t>(rows) * cols + 255) / 256;
+    visit_weight_codec(dtype, [&]<class Codec>() {
+        k_codec_unpack<Codec, false><<<static_cast<unsigned>(blocks), 256, 0, stream>>>(
+            static_cast<const uint8_t*>(weight), nullptr, out, rows, cols, first_row);
+    });
 }
 
 void embed_lookup_f32(const void* emb_table, DType table_dtype,
                       const int32_t* token_ids_dev, float* out,
                       int M, int hidden, cudaStream_t stream) {
+    if (is_weight_codec_dtype(table_dtype)) {
+        (void)row_nbytes(table_dtype, hidden);
+        const auto blocks = (static_cast<int64_t>(M) * hidden + 255) / 256;
+        visit_weight_codec(table_dtype, [&]<class Codec>() {
+            k_codec_unpack<Codec, true><<<static_cast<unsigned>(blocks), 256, 0, stream>>>(
+                static_cast<const uint8_t*>(emb_table), token_ids_dev, out, M, hidden, 0);
+        });
+        return;
+    }
     if (table_dtype == DType::Q4_A) {
         k_embed_lookup_repacked_f32<<<dim3(hidden / 256, M), 256, 0, stream>>>(
             static_cast<const BlockQ4_A*>(emb_table), token_ids_dev, out, hidden / 256);

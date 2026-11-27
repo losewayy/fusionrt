@@ -153,8 +153,52 @@ static bool try_cublas_prefill(CudaContext& ctx, const float* x, const float* no
     return true;
 }
 
+static void codec_linear(CudaContext& ctx, const float* x, const float* norm, const Tensor& w,
+                         float* y, int M, int N, int K, float eps, bool allow_prefill) {
+    auto& arena = ctx.scratch_arena();
+    const size_t mark = arena.mark();
+    const size_t row_bytes = static_cast<size_t>(K) * sizeof(uint16_t);
+    const size_t x_bytes = row_bytes * M;
+    const size_t available = arena.capacity() - arena.used();
+    if (allow_prefill && M > 1 && M >= ctx.mmq_crossover_m() && ctx.cublas() &&
+        available >= x_bytes + row_bytes + 512) {
+        const int tile = static_cast<int>(std::min({size_t{128}, static_cast<size_t>(N),
+                                                   (available - x_bytes - 512) / row_bytes}));
+        auto* x16 = static_cast<uint16_t*>(arena.alloc(x_bytes));
+        auto* w16 = static_cast<uint16_t*>(arena.alloc(row_bytes * tile));
+        cuda_ops::rmsnorm_or_copy_to_f16(x, norm, x16, M, K, eps, ctx.stream());
+        for (int first = 0; first < N; first += tile) {
+            const int count = std::min(tile, N - first);
+            cuda_ops::codec_dequant_tile_f16(w.ptr(), w.dtype, w16, first, count, K, ctx.stream());
+            cuda_ops::cublas_linear_f16_f32(ctx.cublas(), x16, w16, y + first, M, count, K, N);
+        }
+    } else {
+        if (norm) {
+            auto* normalized = static_cast<float*>(arena.alloc(static_cast<size_t>(M) * K * sizeof(float)));
+            cuda_ops::rmsnorm_f32(x, norm, normalized, M, K, eps, ctx.stream());
+            x = normalized;
+        }
+        cuda_ops::codec_gemv_f32(x, w.ptr(), w.dtype, y, M, N, K, ctx.stream());
+    }
+    arena.reset(mark);
+}
+
 void dispatch_linear(CudaContext& ctx, const float* x, const Tensor& w, float* y, int M, int N, int K,
                      bool use_fused, bool verify = false) {
+    if (is_weight_codec_dtype(w.dtype)) {
+        auto& arena = ctx.scratch_arena();
+        const auto mark = arena.mark();
+        if (w.hadamard_block) {
+            auto rotated = cuda_scratch(ctx, {M, K});
+            cuda_ops::blockwise_hadamard_f32(x, w.hadamard_signs, rotated.ptr<float>(),
+                                             M, K, w.hadamard_block, ctx.stream(), false,
+                                             w.hadamard_head_dim, w.hadamard_key_heads);
+            x = rotated.ptr<float>();
+        }
+        codec_linear(ctx, x, nullptr, w, y, M, N, K, 0.0f, use_fused && !verify);
+        arena.reset(mark);
+        return;
+    }
     if (try_q8_1_linear(ctx, x, nullptr, nullptr, nullptr, w, y, M, N, K, 0.0f, use_fused || verify) ||
         (use_fused && !verify && try_cublas_prefill(ctx, x, nullptr, w, y, M, N, K, 0.0f))) {
         return;
@@ -202,6 +246,21 @@ void dispatch_linear(CudaContext& ctx, const float* x, const Tensor& w, float* y
 
 void dispatch_rmsnorm_linear(CudaContext& ctx, const float* x, const Tensor& norm_w, const Tensor& w,
                              float* y, int M, int N, int K, float eps, bool use_fused, bool verify) {
+    if (is_weight_codec_dtype(w.dtype)) {
+        auto& arena = ctx.scratch_arena();
+        const auto mark = arena.mark();
+        const auto* norm = norm_w.ptr<float>();
+        if (w.hadamard_block) {
+            auto rotated = cuda_scratch(ctx, {M, K});
+            cuda_ops::fused_rmsnorm_hadamard_f32(x, norm, w.hadamard_signs, rotated.ptr<float>(),
+                                                  M, K, w.hadamard_block, eps, ctx.stream());
+            x = rotated.ptr<float>();
+            norm = nullptr;
+        }
+        codec_linear(ctx, x, norm, w, y, M, N, K, eps, use_fused && !verify);
+        arena.reset(mark);
+        return;
+    }
     if (try_q8_1_linear(ctx, x, nullptr, norm_w.ptr<float>(), nullptr, w, y, M, N, K, eps, use_fused || verify) ||
         (use_fused && !verify && try_cublas_prefill(ctx, x, norm_w.ptr<float>(), w, y, M, N, K, eps))) {
         return;
@@ -411,6 +470,16 @@ Tensor upload_cuda_weight(CudaContext& ctx, CudaArena& arena, const HostTensor& 
     auto dst = arena.alloc_tensor({src.desc.shape.begin(), src.desc.shape.begin() + src.desc.ndim},
                                   src.desc.dtype, src.desc.name);
     ctx.upload_into(src, dst);
+    dst.hadamard_block = src.desc.hadamard_block;
+    dst.hadamard_head_dim = src.desc.hadamard_head_dim;
+    dst.hadamard_key_heads = src.desc.hadamard_key_heads;
+    if (src.hadamard_signs) {
+        const auto& signs = *src.hadamard_signs;
+        auto* device = static_cast<int8_t*>(arena.alloc(signs.size()));
+        FUSIONRT_CUDA_CHECK(cudaMemcpyAsync(device, signs.data(), signs.size(),
+                                            cudaMemcpyHostToDevice, ctx.stream()));
+        dst.hadamard_signs = device;
+    }
     return dst;
 }
 
@@ -458,7 +527,8 @@ void upload_projections(CudaContext& ctx, CudaArena& arena, const std::array<con
                         const std::array<Tensor*, Count>& weights, std::array<Tensor, Count>& packs) {
     for (size_t begin = 0; begin < Count;) {
         size_t end = begin + 1;
-        while (end < Count && sources[end]->desc.dtype == sources[begin]->desc.dtype) ++end;
+        while (end < Count && sources[end]->desc.dtype == sources[begin]->desc.dtype &&
+               same_weight_basis(*sources[end], *sources[begin])) ++end;
         if (end == begin + 1) {
             *weights[begin] = upload_cuda_matrix(ctx, arena, *sources[begin]);
         } else {
@@ -793,9 +863,13 @@ static size_t cuda_model_arena_bytes(const LoadedModelRaw& raw, const CostHardwa
         if (t.bytes().empty()) return;
         const auto dtype = cuda_matrix_dtype(hw, t, is_vocab_head);
         reserve(t.desc.numel() / dtype_block_size(dtype) * dtype_type_size(dtype));
+        if (t.hadamard_signs) reserve(t.hadamard_signs->size());
     };
     if (raw.lm_head_w.bytes().empty()) weight(raw.tok_embeddings, true);
-    else reserve(raw.tok_embeddings.bytes().size());
+    else {
+        reserve(raw.tok_embeddings.bytes().size());
+        if (raw.tok_embeddings.hadamard_signs) reserve(raw.tok_embeddings.hadamard_signs->size());
+    }
     reserve(raw.gemma_inputs.token_embeddings.bytes().size());
     for (const auto* t : {&raw.final_norm_w, &raw.rope_factors, &raw.gemma_inputs.projection, &raw.gemma_inputs.norm}) weight(*t);
     weight(raw.lm_head_w, true);
@@ -2101,6 +2175,10 @@ static void embed_tokens(CudaContext& ctx, const Tensor& table, const Tensor& id
                          int rows, int width, float scale) {
     cuda_ops::embed_lookup_f32(table.ptr(), table.dtype, ids.ptr<int32_t>(), hidden.ptr<float>(),
                                rows, width, ctx.stream());
+    if (table.hadamard_block) {
+        cuda_ops::blockwise_hadamard_f32(hidden.ptr<float>(), table.hadamard_signs, hidden.ptr<float>(),
+                                         rows, width, table.hadamard_block, ctx.stream(), true);
+    }
     if (scale != 1.0f) cuda_ops::scale_f32(hidden.ptr<float>(), rows * width, scale, ctx.stream());
 }
 

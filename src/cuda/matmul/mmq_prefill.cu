@@ -815,7 +815,7 @@ void rmsnorm_or_copy_to_f16(const float* x, const float* norm_w, uint16_t* out_f
 }
 
 void cublas_linear_f16_f32(cublasHandle_t handle, const uint16_t* x_f16, const uint16_t* w_f16,
-                           float* y, int M, int N, int K) {
+                           float* y, int M, int N, int K, int output_stride) {
     const float alpha = 1.0f;
     const float beta = 0.0f;
     cublasStatus_t st = cublasGemmEx(
@@ -826,7 +826,7 @@ void cublas_linear_f16_f32(cublasHandle_t handle, const uint16_t* x_f16, const u
         w_f16, CUDA_R_16F, K,
         x_f16, CUDA_R_16F, K,
         &beta,
-        y, CUDA_R_32F, N,
+        y, CUDA_R_32F, output_stride ? output_stride : N,
         CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
     if (st != CUBLAS_STATUS_SUCCESS) {
         throw std::runtime_error("cublasGemmEx failed with status " + std::to_string(static_cast<int>(st)));

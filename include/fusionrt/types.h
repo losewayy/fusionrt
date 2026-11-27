@@ -9,6 +9,22 @@
 
 namespace fusionrt {
 
+// Runtime dtype, GGML tensor ID, elements per block, bytes per block.
+#define FUSIONRT_WEIGHT_CODEC_FORMATS(X) \
+    X(Q3_K,    11, 256, 110) \
+    X(IQ2_XXS,  16, 256,  66) \
+    X(IQ2_XS,  17, 256,  74) \
+    X(IQ3_XXS,  18, 256,  98) \
+    X(IQ4_NL,  20,  32,  18) \
+    X(IQ3_S,   21, 256, 110) \
+    X(IQ4_XS,  23, 256, 136) \
+    X(TQ1_0,   34, 256,  54) \
+    X(TQ2_0,   35, 256,  66) \
+    X(MXFP4,   39,  32,  17) \
+    X(Q2_0,    42,  64,  18) \
+    X(PQ2_0,  142, 128,  34) \
+    X(PTQ1_0, 143, 128,  28)
+
 enum class DType : uint8_t {
     F32 = 0,
     F16 = 1,
@@ -27,6 +43,9 @@ enum class DType : uint8_t {
     Q4_KA = 14, // CUDA: 256 weights in 144 aligned bytes
     Q6_A = 15,  // CUDA: 256 weights in 224 aligned bytes
     Q2_K = 16,  // 256 weights in 84 bytes
+#define FUSIONRT_CODEC_ENUM(name, id, block, bytes) name,
+    FUSIONRT_WEIGHT_CODEC_FORMATS(FUSIONRT_CODEC_ENUM)
+#undef FUSIONRT_CODEC_ENUM
 };
 
 enum class Backend : uint8_t {
@@ -146,6 +165,15 @@ struct alignas(16) BlockQ6_A {
 };
 static_assert(sizeof(BlockQ6_A) == 224);
 
+inline constexpr bool is_weight_codec_dtype(DType dt) {
+    switch (dt) {
+#define FUSIONRT_CODEC_CASE(name, id, block, bytes) case DType::name: return true;
+        FUSIONRT_WEIGHT_CODEC_FORMATS(FUSIONRT_CODEC_CASE)
+#undef FUSIONRT_CODEC_CASE
+        default: return false;
+    }
+}
+
 inline constexpr size_t dtype_block_size(DType dt) {
     switch (dt) {
         case DType::Q8_0: return 32;
@@ -160,6 +188,9 @@ inline constexpr size_t dtype_block_size(DType dt) {
         case DType::Q6_A: return 256;
         case DType::Q4_A: return 256;
         case DType::Q8_A: return 256;
+#define FUSIONRT_CODEC_CASE(name, id, block, bytes) case DType::name: return block;
+        FUSIONRT_WEIGHT_CODEC_FORMATS(FUSIONRT_CODEC_CASE)
+#undef FUSIONRT_CODEC_CASE
         default: return 1;
     }
 }
@@ -168,7 +199,7 @@ inline constexpr bool dtype_is_quantized(DType dt) {
     return dt == DType::Q8_0 || dt == DType::Q4_0 || dt == DType::Q4_1 ||
            dt == DType::Q2_K || dt == DType::Q4_K || dt == DType::Q5_K || dt == DType::Q6_K ||
            dt == DType::Q4_A || dt == DType::Q8_A || dt == DType::Q8_1 ||
-           dt == DType::Q4_KA || dt == DType::Q6_A;
+           dt == DType::Q4_KA || dt == DType::Q6_A || is_weight_codec_dtype(dt);
 }
 
 inline constexpr size_t dtype_type_size(DType dt) {
@@ -190,6 +221,9 @@ inline constexpr size_t dtype_type_size(DType dt) {
         case DType::Q4_A: return sizeof(BlockQ4_A);
         case DType::Q8_A: return sizeof(BlockQ8_A);
         case DType::Q8_1: return sizeof(BlockQ8_1);
+#define FUSIONRT_CODEC_CASE(name, id, block, bytes) case DType::name: return bytes;
+        FUSIONRT_WEIGHT_CODEC_FORMATS(FUSIONRT_CODEC_CASE)
+#undef FUSIONRT_CODEC_CASE
     }
     return 0;
 }
@@ -222,6 +256,9 @@ inline const char* dtype_name(DType dt) {
         case DType::Q4_A: return "Q4_A";
         case DType::Q8_A: return "Q8_A";
         case DType::Q8_1: return "Q8_1";
+#define FUSIONRT_CODEC_CASE(name, id, block, bytes) case DType::name: return #name;
+        FUSIONRT_WEIGHT_CODEC_FORMATS(FUSIONRT_CODEC_CASE)
+#undef FUSIONRT_CODEC_CASE
     }
     return "UNKNOWN";
 }

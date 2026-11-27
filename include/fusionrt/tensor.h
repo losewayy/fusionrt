@@ -22,6 +22,9 @@ struct Tensor {
     uint64_t vk_offset = 0;      // byte offset into VkBuffer
     size_t byte_offset = 0;      // byte offset on CPU/CUDA base pointer
     std::string name;
+    int hadamard_block = 0;
+    const int8_t* hadamard_signs = nullptr;  // Device vector on uploaded rotated weights.
+    int hadamard_head_dim = 0, hadamard_key_heads = 0;
 
     Tensor() = default;
 
@@ -139,6 +142,7 @@ struct Tensor {
 struct HostTensor {
     Tensor desc;
     std::vector<uint8_t> storage;
+    std::shared_ptr<const std::vector<int8_t>> hadamard_signs;
 
     HostTensor() = default;
     HostTensor(std::initializer_list<int64_t> dims, DType dt) {
@@ -167,11 +171,15 @@ struct HostTensor {
         auto slice = desc.slice_dim0(start, count);
         const auto part = bytes().subspan(slice.byte_offset, slice.nbytes());
         slice.byte_offset = 0;
-        if (mapped_) return mapped(std::move(slice), {mapped_, part.data()});
         HostTensor out;
-        out.desc = std::move(slice);
-        out.storage.assign(part.begin(), part.end());
-        out.desc.data = out.storage.data();
+        if (mapped_) {
+            out = mapped(std::move(slice), {mapped_, part.data()});
+        } else {
+            out.desc = std::move(slice);
+            out.storage.assign(part.begin(), part.end());
+            out.desc.data = out.storage.data();
+        }
+        out.hadamard_signs = hadamard_signs;
         return out;
     }
     template <typename T>

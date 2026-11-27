@@ -1,4 +1,5 @@
 #include "cpu_moe.h"
+#include "fusionrt/weight_codec.h"
 
 #include <algorithm>
 #include <array>
@@ -281,7 +282,37 @@ bool use_avx512_vnni() {
 }
 #endif
 
+template<class Codec>
+float codec_dot(const uint8_t* row, const float* x, int cols) {
+    float sum = 0;
+    for (int i = 0; i < cols; i += Codec::kBlockSize, row += Codec::kBlockBytes)
+        sum += Codec::dot_block(row, x + i);
+    return sum;
+}
+
+template<class Codec>
+void codec_dot_rows(const uint8_t* row, const float* const* x, int cols, int count, float* out) {
+    std::fill_n(out, count, 0.0f);
+    for (int i = 0; i < cols; i += Codec::kBlockSize, row += Codec::kBlockBytes) {
+        float values[Codec::kBlockSize];
+        Codec::dequant_block(row, values);
+        for (int m = 0; m < count; ++m) {
+            float sum = 0.0f;
+            for (int j = 0; j < Codec::kBlockSize; ++j) sum += values[j] * x[m][i + j];
+            out[m] += sum;
+        }
+    }
+}
+
+using CodecRows = decltype(&codec_dot_rows<WeightCodec<DType::Q3_K>>);
+CodecRows codec_rows(DType type, int rows, CpuMoeMode mode) {
+    if (rows <= 1 || mode == CpuMoeMode::Scalar || !is_weight_codec_dtype(type)) return nullptr;
+    return visit_weight_codec(type, []<class Codec>() -> CodecRows { return codec_dot_rows<Codec>; });
+}
+
 CpuMoeDot row_dot(DType type, CpuMoeMode mode) {
+    if (is_weight_codec_dtype(type))
+        return visit_weight_codec(type, []<class Codec>() -> CpuMoeDot { return codec_dot<Codec>; });
 #ifdef FUSIONRT_CPU_MOE_AVX2
     if (mode != CpuMoeMode::Scalar && use_avx2()) {
         if (const auto dot = cpu_moe_avx2_dot(type)) return dot;
@@ -561,7 +592,12 @@ int cpu_moe_accumulate_layer(CpuWorkers* workers, CpuMoeWorkspace& scratch,
     }
     if (down_q8) scratch.activation_q8.resize(static_cast<size_t>(cold) * inter_blocks);
     if (down_small) scratch.activation_q8_small.resize(static_cast<size_t>(cold) * inter_small_blocks);
-    if (gate_rows_q8 || up_rows_q8 || down_rows_q8) {
+    const auto gate_codec = codec_rows(gate.desc.dtype, rows, mode);
+    const auto up_codec = packed ? gate_codec : codec_rows(up.desc.dtype, rows, mode);
+    const auto down_codec = codec_rows(down.desc.dtype, rows, mode);
+    const bool batched_gate = gate_rows_q8 || up_rows_q8 || gate_codec || up_codec;
+    const bool batched_down = down_rows_q8 || down_codec;
+    if (batched_gate || batched_down) {
         auto& tiles = scratch.tiles;
         tiles.clear();
         for (int i = 0; i < cold;) {
@@ -580,14 +616,17 @@ int cpu_moe_accumulate_layer(CpuWorkers* workers, CpuMoeWorkspace& scratch,
             const auto* ids = scratch.grouped.data() + start;
             const auto& job = jobs[ids[0]];
             std::array<size_t, 4> tokens{};
+            std::array<const float*, 4> xs{};
             std::array<const CpuQ8K*, 4> qx{};
             for (int m = 0; m < count; ++m) {
                 tokens[m] = static_cast<size_t>(jobs[ids[m]].row / top_k);
-                qx[m] = scratch.input_q8.data() + tokens[m] * hidden_blocks;
+                xs[m] = input + tokens[m] * hidden;
+                if (gate_q8 || up_q8) qx[m] = scratch.input_q8.data() + tokens[m] * hidden_blocks;
             }
             float g[4], u[4];
-            auto dot = [&](auto batch, auto quantized, auto small, auto scalar, const uint8_t* w, float* out) {
-                if (batch && count > 1) batch(w, qx.data(), hidden, count, out);
+            auto dot = [&](auto batch, auto codec, auto quantized, auto small, auto scalar, const uint8_t* w, float* out) {
+                if (codec && count > 1) codec(w, xs.data(), hidden, count, out);
+                else if (batch && count > 1) batch(w, qx.data(), hidden, count, out);
                 else for (int m = 0; m < count; ++m) {
                     const auto token = tokens[m];
                     out[m] = quantized ? quantized(w, qx[m], hidden) :
@@ -595,8 +634,8 @@ int cpu_moe_accumulate_layer(CpuWorkers* workers, CpuMoeWorkspace& scratch,
                                 scalar(w, input + token * hidden, hidden);
                 }
             };
-            dot(gate_rows_q8, gate_q8, gate_small, gate_dot, job.gate + row * gate_stride, g);
-            dot(up_rows_q8, up_q8, up_small, up_dot, job.up + row * up_stride, u);
+            dot(gate_rows_q8, gate_codec, gate_q8, gate_small, gate_dot, job.gate + row * gate_stride, g);
+            dot(up_rows_q8, up_codec, up_q8, up_small, up_dot, job.up + row * up_stride, u);
             for (int m = 0; m < count; ++m)
                 act[static_cast<size_t>(ids[m]) * inter + row] = (g[m] / (1.0f + std::exp(-g[m]))) * u[m];
         }
@@ -637,7 +676,7 @@ int cpu_moe_accumulate_layer(CpuWorkers* workers, CpuMoeWorkspace& scratch,
         }
     };
     const int64_t down_rows = static_cast<int64_t>(rows) * hidden;
-    if (gate_rows_q8 || up_rows_q8) {
+    if (batched_gate) {
         const auto units = static_cast<int64_t>(scratch.tiles.size() - 1) * inter;
         if (workers) workers->run(units, gate_up_tile);
         else gate_up_tile(0, units);
@@ -655,7 +694,7 @@ int cpu_moe_accumulate_layer(CpuWorkers* workers, CpuMoeWorkspace& scratch,
         for (size_t job = 0; job < jobs.size(); ++job)
             cpu_moe_quantize_q8_small(act.data() + job * inter, scratch.activation_q8_small.data() + job * inter_small_blocks, inter);
     }
-    if (down_rows_q8) {
+    if (batched_down) {
         const int lanes = std::min(hidden, workers ? workers->count() : 1);
         scratch.down_dots.resize(static_cast<size_t>(lanes) * cold);
         auto down_tile = [&](int64_t begin, int64_t end) {
@@ -667,12 +706,20 @@ int cpu_moe_accumulate_layer(CpuWorkers* workers, CpuMoeWorkspace& scratch,
                         const int start = scratch.tiles[tile - 1], count = scratch.tiles[tile] - start;
                         const auto* ids = scratch.grouped.data() + start;
                         const auto* w = jobs[ids[0]].down + row * down_stride;
-                        const CpuQ8K* qx[4];
-                        for (int m = 0; m < count; ++m)
-                            qx[m] = scratch.activation_q8.data() + static_cast<size_t>(ids[m]) * inter_blocks;
                         float dst[4];
-                        if (count == 1) dst[0] = down_q8(w, qx[0], inter);
-                        else down_rows_q8(w, qx, inter, count, dst);
+                        if (down_codec) {
+                            const float* xs[4];
+                            for (int m = 0; m < count; ++m)
+                                xs[m] = act.data() + static_cast<size_t>(ids[m]) * inter;
+                            if (count == 1) dst[0] = down_dot(w, xs[0], inter);
+                            else down_codec(w, xs, inter, count, dst);
+                        } else {
+                            const CpuQ8K* qx[4];
+                            for (int m = 0; m < count; ++m)
+                                qx[m] = scratch.activation_q8.data() + static_cast<size_t>(ids[m]) * inter_blocks;
+                            if (count == 1) dst[0] = down_q8(w, qx[0], inter);
+                            else down_rows_q8(w, qx, inter, count, dst);
+                        }
                         for (int m = 0; m < count; ++m) dots[ids[m]] = dst[m];
                     }
                     for (int token = 0; token < rows; ++token) {

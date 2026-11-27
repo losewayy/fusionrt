@@ -103,6 +103,9 @@ enum class GgmlType : uint32_t {
     Q6_K = 14,
     I32 = 26,
     BF16 = 30,
+#define FUSIONRT_CODEC_CASE(name, id, block, bytes) name = id,
+    FUSIONRT_WEIGHT_CODEC_FORMATS(FUSIONRT_CODEC_CASE)
+#undef FUSIONRT_CODEC_CASE
 };
 
 DType ggml_to_dtype(uint32_t t) {
@@ -118,6 +121,9 @@ DType ggml_to_dtype(uint32_t t) {
         case 14: return DType::Q6_K;
         case 26: return DType::I32;
         case 30: return DType::BF16;
+#define FUSIONRT_CODEC_CASE(name, id, block, bytes) case id: return DType::name;
+        FUSIONRT_WEIGHT_CODEC_FORMATS(FUSIONRT_CODEC_CASE)
+#undef FUSIONRT_CODEC_CASE
         default: throw std::runtime_error("Unsupported GGML tensor type: " + std::to_string(t));
     }
 }
@@ -135,6 +141,9 @@ uint32_t dtype_to_ggml(DType dt) {
         case DType::Q6_K: return 14;
         case DType::I32: return 26;
         case DType::BF16: return 30;
+#define FUSIONRT_CODEC_CASE(name, id, block, bytes) case DType::name: return id;
+        FUSIONRT_WEIGHT_CODEC_FORMATS(FUSIONRT_CODEC_CASE)
+#undef FUSIONRT_CODEC_CASE
         default: throw std::runtime_error("Unsupported DType for GGUF export");
     }
 }
@@ -372,11 +381,24 @@ bool GgufFile::load(const std::string& path, std::string* err, bool read_tokeniz
         for (const auto& info : tensors_) {
             if (info.offset > data_bytes || info.nbytes > data_bytes - info.offset)
                 throw std::runtime_error("GGUF tensor extends beyond the file: " + info.name);
-            // GGUF quant blocks contain 16-bit scales even when the host structs are packed.
+            // Most GGUF quant blocks contain 16-bit scales even when the host structs are packed.
             const size_t required_align = info.dtype == DType::F32 || info.dtype == DType::I32
-                ? alignof(uint32_t) : alignof(uint16_t);
+                ? alignof(uint32_t) : (info.dtype == DType::MXFP4 ? 1 : alignof(uint16_t));
             if ((data_offset_ + info.offset) % required_align != 0)
                 throw std::runtime_error("Misaligned GGUF tensor offset: " + info.name);
+        }
+        if (std::any_of(tensors_.begin(), tensors_.end(),
+                        [](const auto& t) { return t.dtype == DType::Q2_0; })) {
+            std::vector<const GgufTensorInfo*> ordered;
+            ordered.reserve(tensors_.size());
+            for (const auto& t : tensors_) ordered.push_back(&t);
+            std::sort(ordered.begin(), ordered.end(), [](auto* a, auto* b) { return a->offset < b->offset; });
+            for (size_t i = 1; i < ordered.size(); ++i) {
+                const auto& prev = *ordered[i - 1];
+                if (prev.dtype == DType::Q2_0 && prev.nbytes > ordered[i]->offset - prev.offset)
+                    throw std::runtime_error("Overlapping Q2_0 tensor " + prev.name +
+                        " (GGML ID 42 requires group-64 layout, use PQ2_0 for legacy group-128 weights)");
+            }
         }
         mapping_ = std::move(mapping);
         return true;
