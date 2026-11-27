@@ -301,7 +301,8 @@ void complete_agent(SocketHandle fd, CudaContext& ctx, FusionModel& model, const
     response.start(static_cast<int>(prompt.size()));
     if (!response.connected()) return;
     agent::ToolParser parser(request, rendered, [&](std::string_view text) { response.text(text); },
-                             [&](agent::ToolCall call) { response.call(std::move(call)); });
+                             [&](agent::ToolCall call) { response.call(std::move(call)); },
+                             [&](std::string_view thought) { response.thought(thought); });
     try {
         const auto completion = generate(ctx, model, tokenizer, prompt, request.generation, limit, graph, true,
             [&](const std::string& text) {

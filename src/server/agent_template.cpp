@@ -179,8 +179,8 @@ AgentPrompt render_prompt(const AgentRequest& req, const BpeTokenizer& tokenizer
     return prompt;
 }
 
-ToolParser::ToolParser(const AgentRequest& request, const AgentPrompt& prompt, TextSink text, CallSink call)
-    : request_(request), text_(std::move(text)), call_(std::move(call)),
+ToolParser::ToolParser(const AgentRequest& request, const AgentPrompt& prompt, TextSink text, CallSink call, TextSink thought)
+    : request_(request), text_(std::move(text)), call_(std::move(call)), thought_(std::move(thought)),
       mode_(prompt.open_thought ? Mode::thought : Mode::text), llama_calls_(prompt.llama_calls) {
     push(prompt.call_prefix);
 }
@@ -231,8 +231,10 @@ void ToolParser::drain(bool final) {
         const std::string_view view(pending_);
         if (mode_ == Mode::thought) {
             const auto end = view.find(think_close);
+            const auto length = end != view.npos ? end : view.size() - (final ? 0 : partial_suffix(view, think_close));
+            if (thought_ && length != 0) thought_(view.substr(0, length));
             if (end == view.npos) {
-                pending_.erase(0, final ? view.size() : view.size() - partial_suffix(view, think_close));
+                pending_.erase(0, length);
                 return;
             }
             pending_.erase(0, end + think_close.size());

@@ -13,7 +13,7 @@ This is a personal research codebase for exploring custom quantized GPU kernels,
 - **Speculative decoding** supports prompt lookup (`--spec-ngram`) or a vocabulary-compatible GGUF draft model (`--draft-model`, `--draft-tokens`). On one Qwen3-8B Q4_K_M greedy prompt, both matched all 64 target tokens. Decode throughput was 89.26 tok/s with standard decoding, 142.91 tok/s with a Qwen3-0.6B draft, and 176.30 tok/s with prompt lookup.
 - **JSON output** uses a decoding grammar. The CLI offers `--json-grammar`. OpenAI Chat Completions and Responses support `json_object` and `json_schema` with a single root type. Schema field constraints, enabled tools, and custom stop sequences are rejected for JSON output.
 - **Multimodal input** uses CUDA `--mmproj` and `--image` or base64 image blocks in HTTP requests. Supported raster formats are non-interlaced 8-bit PNG, uncompressed 24/32-bit BMP, PPM, and PGM. The vision path has synthetic end-to-end coverage. Native Qwen-VL text M-RoPE and Qwen3-VL DeepStack remain unsupported.
-- **Local HTTP** supports `/v1/completions`, OpenAI `/v1/chat/completions` and `/v1/responses`, and Anthropic `/v1/messages`. The request body limit is 16 MiB, including base64 data.
+- **Local HTTP** supports `/v1/completions`, OpenAI `/v1/chat/completions` and `/v1/responses`, and Anthropic `/v1/messages`. The request body limit is 16 MiB, including base64 data. Model thinking appears in `reasoning_content`, `reasoning` items, or `thinking` blocks, respectively, on the three chat endpoints.
 
 ## Backend scope & hardware matrix
 

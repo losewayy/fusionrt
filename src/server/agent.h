@@ -81,7 +81,7 @@ public:
     using TextSink = std::function<void(std::string_view)>;
     using CallSink = std::function<void(ToolCall)>;
 
-    ToolParser(const AgentRequest& request, const AgentPrompt& prompt, TextSink text, CallSink call);
+    ToolParser(const AgentRequest& request, const AgentPrompt& prompt, TextSink text, CallSink call, TextSink thought = {});
     void push(std::string_view chunk);
     void finish();
 
@@ -94,6 +94,7 @@ private:
     const AgentRequest& request_;
     TextSink text_;
     CallSink call_;
+    TextSink thought_;
     std::string pending_;
     Mode mode_ = Mode::text;
     size_t scanned_ = 0;
@@ -104,8 +105,14 @@ private:
 
 enum class Finish { stop, length };
 
+struct Thought {
+    std::string text;
+};
+
+using OutputBlock = std::variant<std::string, ToolCall, Thought>;
+
 struct AgentResult {
-    std::vector<Block> output;
+    std::vector<OutputBlock> output;
     int input_tokens = 0, output_tokens = 0;
     Finish finish = Finish::stop;
 
@@ -120,6 +127,7 @@ public:
                   bool stream_usage, EventSink event = {});
     void start(int input_tokens);
     void text(std::string_view text);
+    void thought(std::string_view text);
     void call(ToolCall call);
     void finish(Finish reason, int output_tokens);
     void error(std::string_view message);
@@ -128,9 +136,11 @@ public:
     const AgentResult& result() const { return result_; }
 
 private:
+    enum class OpenBlock { none, text, thought };
     void send(std::string_view event, JsonObject payload);
     void send(std::string_view event, std::string_view data);
-    void close_text();
+    void append_text(std::string_view text, OpenBlock kind);
+    void close_block();
     JsonObject chat_chunk(JsonObject delta, JsonValue finish_reason) const;
     JsonObject responses_body(const char* status) const;
     JsonObject messages_body(bool starting) const;
@@ -142,7 +152,8 @@ private:
     EventSink event_;
     AgentResult result_;
     int sequence_ = 0, next_call_ = 0;
-    bool connected_ = true, text_open_ = false, stream_usage_ = false;
+    OpenBlock open_block_ = OpenBlock::none;
+    bool connected_ = true, stream_usage_ = false;
 };
 
 }  // namespace fusionrt::agent

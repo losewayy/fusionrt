@@ -198,6 +198,150 @@ void test_agent_protocols() {
     std::cout << "[agent] Request replay, tool extraction, and SSE completion passed\n";
 }
 
+void test_agent_reasoning() {
+    using namespace agent;
+    auto check = [](bool ok, const char* label) {
+        if (!ok) throw std::runtime_error(std::string("Agent reasoning: ") + label);
+    };
+    AgentRequest request;
+    request.tools.push_back({"calc", "", {}});
+    constexpr std::string_view thought = R"(plan <tool_call>{"name":"calc","arguments":{"hidden":true}}</tool_call>)";
+    constexpr std::string_view call = R"(<tool_call>{"name":"calc","arguments":{"visible":true}}</tool_call>)";
+    enum class Input { explicit_tags, open_thought, plain, empty_thought };
+    for (const auto protocol : {Protocol::chat, Protocol::messages, Protocol::responses}) {
+        for (const bool stream : {false, true}) {
+            for (const auto input : {Input::explicit_tags, Input::open_thought, Input::plain, Input::empty_thought}) {
+                const bool thinking = input == Input::explicit_tags || input == Input::open_thought;
+                std::vector<std::pair<std::string, JsonValue>> frames;
+                EventSink events;
+                if (stream) events = [&](std::string_view event, std::string_view data) {
+                    if (data != "[DONE]") frames.emplace_back(event, JsonValue::parse(std::string(data)));
+                    return true;
+                };
+                AgentResponse response(protocol, "sample", "model", 0, false, std::move(events));
+                response.start(10);
+                const size_t initial_frames = frames.size();
+                AgentPrompt prompt;
+                prompt.open_thought = input == Input::open_thought;
+                std::string parsed_thought;
+                ToolParser parser(request, prompt, [&](std::string_view text) { response.text(text); },
+                    [&](ToolCall tool) { response.call(std::move(tool)); },
+                    [&](std::string_view text) { parsed_thought += text; response.thought(text); });
+                if (input == Input::explicit_tags) {
+                    parser.push("<th");
+                    parser.push("ink>");
+                }
+                if (thinking) {
+                    parser.push(thought.substr(0, 5));
+                    check(parsed_thought == thought.substr(0, 5) && (!stream || frames.size() > initial_frames),
+                          "safe bytes streamed before the closing tag");
+                    parser.push(thought.substr(5));
+                    parser.push("</thi");
+                    check(parsed_thought == thought && !response.result().has_calls(),
+                          "partial delimiter held and inner tool ignored");
+                    parser.push("nk>");
+                } else if (input == Input::empty_thought) parser.push("<think></think>");
+                parser.push("answer");
+                parser.push(call);
+                parser.finish();
+                response.finish(Finish::stop, 5);
+                check(parsed_thought == (thinking ? thought : ""), "isolated thought text");
+                const auto& blocks = response.result().output;
+                const size_t first_text = thinking ? 1 : 0;
+                check(blocks.size() == first_text + 2 && std::get<std::string>(blocks[first_text]) == "answer" &&
+                      std::get<ToolCall>(blocks.back()).arguments.contains("visible"), "clean text and one real tool");
+
+                const auto body = response.body();
+                const auto& obj = body.as_object();
+                std::string item_id;
+                if (protocol == Protocol::chat) {
+                    const auto& message = obj.at("choices").as_array()[0].as_object().at("message").as_object();
+                    check(message.at("content").as_string() == "answer" && message.at("tool_calls").as_array().size() == 1 &&
+                          message.contains("reasoning_content") == thinking &&
+                          (!thinking || message.at("reasoning_content").as_string() == thought), "Chat message");
+                } else {
+                    const auto& items = obj.at(protocol == Protocol::messages ? "content" : "output").as_array();
+                    const bool anthropic = protocol == Protocol::messages;
+                    check(items.size() == first_text + 2 && items[first_text].as_object().at("type").as_string() ==
+                          (anthropic ? "text" : "message") && items.back().as_object().at("type").as_string() ==
+                          (anthropic ? "tool_use" : "function_call"), "answer and tool order");
+                    if (thinking) {
+                        const auto& reason = items[0].as_object();
+                        if (anthropic) {
+                            check(reason.at("type").as_string() == "thinking" &&
+                                  reason.at("thinking").as_string() == thought, "Messages thinking block");
+                        } else {
+                            const auto& part = reason.at("content").as_array()[0].as_object();
+                            item_id = reason.at("id").as_string();
+                            check(reason.at("type").as_string() == "reasoning" && part.at("type").as_string() ==
+                                  "reasoning_text" && part.at("text").as_string() == thought, "Responses reasoning item");
+                        }
+                    }
+                }
+                if (!stream) continue;
+                std::string streamed_thought, streamed_text;
+                std::vector<std::string> starts, stops;
+                int reasoning_done = 0, tool_deltas = 0;
+                for (const auto& [event, data] : frames) {
+                    const auto& frame = data.as_object();
+                    if (protocol == Protocol::chat) {
+                        const auto& delta = frame.at("choices").as_array()[0].as_object().at("delta").as_object();
+                        if (delta.contains("reasoning_content")) {
+                            check(!delta.contains("content") && streamed_text.empty(), "Chat thought-only delta");
+                            streamed_thought += delta.at("reasoning_content").as_string();
+                        }
+                        if (delta.contains("content")) streamed_text += delta.at("content").as_string();
+                        tool_deltas += delta.contains("tool_calls");
+                    } else if (protocol == Protocol::messages) {
+                        if (event == "content_block_start") {
+                            const auto& block = frame.at("content_block").as_object();
+                            starts.push_back(block.at("type").as_string());
+                            if (starts.back() == "thinking")
+                                check(block.at("thinking").as_string().empty(), "Messages thinking starts empty");
+                        } else if (event == "content_block_delta") {
+                            const auto& delta = frame.at("delta").as_object();
+                            if (delta.at("type").as_string() == "thinking_delta") {
+                                check(frame.at("index").as_int() == 0 && stops.empty(), "Messages thinking delta index");
+                                streamed_thought += delta.at("thinking").as_string();
+                            }
+                            if (delta.contains("text")) streamed_text += delta.at("text").as_string();
+                            tool_deltas += delta.at("type").as_string() == "input_json_delta";
+                        } else if (event == "content_block_stop") {
+                            stops.push_back(starts.at(static_cast<size_t>(frame.at("index").as_int())));
+                        }
+                    } else {
+                        if (event == "response.output_item.added" || event == "response.output_item.done") {
+                            auto& order = event == "response.output_item.added" ? starts : stops;
+                            order.push_back(frame.at("item").as_object().at("type").as_string());
+                        } else if (event == "response.reasoning_text.delta" || event == "response.reasoning_text.done") {
+                            check(frame.at("item_id").as_string() == item_id && frame.at("output_index").as_int() == 0 &&
+                                  frame.at("content_index").as_int() == 0 && streamed_text.empty(), "Responses reasoning event indices");
+                            if (event.ends_with(".delta")) streamed_thought += frame.at("delta").as_string();
+                            else {
+                                ++reasoning_done;
+                                check(frame.at("text").as_string() == thought, "Responses final reasoning text");
+                            }
+                        } else if (event == "response.output_text.delta") streamed_text += frame.at("delta").as_string();
+                        else if (event == "response.function_call_arguments.delta") ++tool_deltas;
+                    }
+                }
+                check(streamed_thought == (thinking ? thought : "") && streamed_text == "answer" && tool_deltas == 1,
+                      "stream keeps reasoning separate from answer and tools");
+                if (protocol != Protocol::chat) {
+                    const bool anthropic = protocol == Protocol::messages;
+                    std::vector<std::string> expected;
+                    if (thinking) expected.push_back(anthropic ? "thinking" : "reasoning");
+                    expected.push_back(anthropic ? "text" : "message");
+                    expected.push_back(anthropic ? "tool_use" : "function_call");
+                    check(starts == expected && stops == expected && reasoning_done == (!anthropic && thinking ? 1 : 0),
+                          "reasoning closes before subsequent output blocks");
+                }
+            }
+        }
+    }
+    std::cout << "[agent] Thinking tags, reasoning streaming and non-streaming for all three protocols passed\n";
+}
+
 void expect_close(const std::vector<float>& got, const std::vector<double>& ref,
                   double max_abs_tol, double rel_l2_tol, const std::string& label) {
     auto audit = bench::audit_arrays_f32(got.data(), ref.data(), {static_cast<int64_t>(got.size())},
@@ -3546,6 +3690,7 @@ int main() {
     try {
         test_quant_and_io();
         test_agent_protocols();
+        test_agent_reasoning();
         test_device_profile_and_cost_model();
 #ifdef FUSIONRT_ENABLE_CUDA
         CudaContext cuda_ctx(0, 256, 512);

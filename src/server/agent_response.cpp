@@ -13,28 +13,38 @@ JsonObject chat_call(const ToolCall& call) {
     return {{"id", call.id}, {"type", "function"}, {"function", function(call)}};
 }
 
-JsonObject response_item(const Block& block, const std::string& id, bool done) {
+JsonObject response_part(std::string_view text, bool reasoning) {
+    JsonObject part{{"type", reasoning ? "reasoning_text" : "output_text"}, {"text", std::string(text)}};
+    if (!reasoning) part["annotations"] = JsonArray{};
+    return part;
+}
+
+JsonObject response_item(const OutputBlock& block, const std::string& id, bool done) {
     JsonObject item{{"id", id}, {"status", done ? "completed" : "in_progress"}};
     if (const auto* call = std::get_if<ToolCall>(&block)) {
         item["type"] = "function_call";
         item["call_id"] = call->id;
         item["name"] = call->name;
         item["arguments"] = done ? JsonValue(call->arguments).dump(0) : "";
+    } else if (const auto* thought = std::get_if<Thought>(&block)) {
+        item["type"] = "reasoning";
+        item["summary"] = JsonArray{};
+        item["content"] = done ? JsonArray{response_part(thought->text, true)} : JsonArray{};
     } else {
         item["type"] = "message";
         item["role"] = "assistant";
-        item["content"] = done ? JsonArray{JsonObject{{"type", "output_text"},
-                                        {"text", std::get<std::string>(block)}, {"annotations", JsonArray{}}}}
-                               : JsonArray{};
+        item["content"] = done ? JsonArray{response_part(std::get<std::string>(block), false)} : JsonArray{};
     }
     return item;
 }
 
-JsonObject messages_block(const Block& block, bool done) {
+JsonObject messages_block(const OutputBlock& block, bool done) {
     if (const auto* call = std::get_if<ToolCall>(&block)) {
         return {{"type", "tool_use"}, {"id", call->id}, {"name", call->name},
                 {"input", done ? call->arguments : JsonObject{}}};
     }
+    if (const auto* thought = std::get_if<Thought>(&block))
+        return {{"type", "thinking"}, {"thinking", done ? thought->text : ""}};
     return {{"type", "text"}, {"text", done ? std::get<std::string>(block) : ""}};
 }
 
@@ -56,7 +66,7 @@ const char* messages_reason(const AgentResult& result) {
 }  // namespace
 
 bool AgentResult::has_calls() const {
-    return std::any_of(output.begin(), output.end(), [](const Block& b) { return std::holds_alternative<ToolCall>(b); });
+    return std::any_of(output.begin(), output.end(), [](const OutputBlock& b) { return std::holds_alternative<ToolCall>(b); });
 }
 
 AgentResponse::AgentResponse(Protocol protocol, std::string id, std::string model, int64_t created,
@@ -77,7 +87,9 @@ void AgentResponse::send(std::string_view event, std::string_view data) {
 }
 
 std::string AgentResponse::item_id(size_t index) const {
-    const char* prefix = std::holds_alternative<ToolCall>(result_.output[index]) ? "fc_" : "msg_";
+    const auto& block = result_.output[index];
+    const char* prefix = std::holds_alternative<ToolCall>(block) ? "fc_" :
+                         std::holds_alternative<Thought>(block) ? "rs_" : "msg_";
     return prefix + id_ + "_" + std::to_string(index);
 }
 
@@ -129,45 +141,65 @@ void AgentResponse::start(int input_tokens) {
 }
 
 void AgentResponse::text(std::string_view text) {
+    append_text(text, OpenBlock::text);
+}
+
+void AgentResponse::thought(std::string_view text) {
+    append_text(text, OpenBlock::thought);
+}
+
+void AgentResponse::append_text(std::string_view text, OpenBlock kind) {
     if (text.empty()) return;
-    const auto index = static_cast<int64_t>(text_open_ ? result_.output.size() - 1 : result_.output.size());
-    if (!text_open_) {
-        result_.output.emplace_back(std::string{});
-        text_open_ = true;
+    const bool reasoning = kind == OpenBlock::thought;
+    const bool open = open_block_ == kind;
+    const auto index = static_cast<int64_t>(open ? result_.output.size() - 1 : result_.output.size());
+    if (!open) {
+        close_block();
+        if (reasoning) result_.output.emplace_back(Thought{});
+        else result_.output.emplace_back(std::string{});
+        open_block_ = kind;
         if (event_ && protocol_ == Protocol::responses) {
             const auto item = item_id(index);
             send("response.output_item.added", {{"output_index", index},
                 {"item", response_item(result_.output.back(), item, false)}});
             send("response.content_part.added", {{"output_index", index}, {"item_id", item}, {"content_index", 0},
-                {"part", JsonObject{{"type", "output_text"}, {"text", ""}, {"annotations", JsonArray{}}}}});
+                {"part", response_part("", reasoning)}});
         } else if (event_ && protocol_ == Protocol::messages) {
             send("content_block_start", {{"index", index}, {"content_block", messages_block(result_.output.back(), false)}});
         }
     }
-    std::get<std::string>(result_.output.back()) += text;
+    auto& block = result_.output.back();
+    (reasoning ? std::get<Thought>(block).text : std::get<std::string>(block)) += text;
     if (!event_) return;
-    if (protocol_ == Protocol::chat) send("", chat_chunk({{"content", std::string(text)}}, nullptr));
-    else if (protocol_ == Protocol::responses) {
-        send("response.output_text.delta", {{"output_index", index}, {"item_id", item_id(index)},
-            {"content_index", 0}, {"delta", std::string(text)}, {"logprobs", JsonArray{}}});
+    if (protocol_ == Protocol::chat) {
+        send("", chat_chunk({{reasoning ? "reasoning_content" : "content", std::string(text)}}, nullptr));
+    } else if (protocol_ == Protocol::responses) {
+        JsonObject delta{{"output_index", index}, {"item_id", item_id(index)}, {"content_index", 0},
+                         {"delta", std::string(text)}};
+        if (!reasoning) delta["logprobs"] = JsonArray{};
+        send(reasoning ? "response.reasoning_text.delta" : "response.output_text.delta", std::move(delta));
     } else {
-        send("content_block_delta", {{"index", index}, {"delta", JsonObject{{"type", "text_delta"},
-                                                                         {"text", std::string(text)}}}});
+        send("content_block_delta", {{"index", index},
+            {"delta", JsonObject{{"type", reasoning ? "thinking_delta" : "text_delta"},
+                                 {reasoning ? "thinking" : "text", std::string(text)}}}});
     }
 }
 
-void AgentResponse::close_text() {
-    if (!text_open_) return;
-    text_open_ = false;
+void AgentResponse::close_block() {
+    if (open_block_ == OpenBlock::none) return;
+    const bool reasoning = open_block_ == OpenBlock::thought;
+    open_block_ = OpenBlock::none;
     if (!event_) return;
     const auto index = static_cast<int64_t>(result_.output.size() - 1);
     if (protocol_ == Protocol::responses) {
         const auto item = item_id(index);
-        const auto& text = std::get<std::string>(result_.output.back());
-        send("response.output_text.done", {{"output_index", index}, {"item_id", item}, {"content_index", 0},
-            {"text", text}, {"logprobs", JsonArray{}}});
+        const auto& block = result_.output.back();
+        const auto& text = reasoning ? std::get<Thought>(block).text : std::get<std::string>(block);
+        JsonObject done{{"output_index", index}, {"item_id", item}, {"content_index", 0}, {"text", text}};
+        if (!reasoning) done["logprobs"] = JsonArray{};
+        send(reasoning ? "response.reasoning_text.done" : "response.output_text.done", std::move(done));
         send("response.content_part.done", {{"output_index", index}, {"item_id", item}, {"content_index", 0},
-            {"part", JsonObject{{"type", "output_text"}, {"text", text}, {"annotations", JsonArray{}}}}});
+            {"part", response_part(text, reasoning)}});
         send("response.output_item.done", {{"output_index", index},
             {"item", response_item(result_.output.back(), item, true)}});
     } else if (protocol_ == Protocol::messages) {
@@ -176,7 +208,7 @@ void AgentResponse::close_text() {
 }
 
 void AgentResponse::call(ToolCall call) {
-    close_text();
+    close_block();
     const int call_index = next_call_++;
     call.id = (protocol_ == Protocol::messages ? "toolu_" : "call_") + id_ + "_" + std::to_string(call_index);
     const auto index = static_cast<int64_t>(result_.output.size());
@@ -206,7 +238,7 @@ void AgentResponse::call(ToolCall call) {
 void AgentResponse::finish(Finish reason, int output_tokens) {
     result_.finish = reason;
     result_.output_tokens = output_tokens;
-    close_text();
+    close_block();
     if (!event_) return;
     if (protocol_ == Protocol::chat) {
         send("", chat_chunk({}, chat_reason(result_)));
@@ -246,13 +278,15 @@ JsonValue AgentResponse::body() const {
     if (protocol_ == Protocol::responses) {
         return responses_body(result_.finish == Finish::length && !result_.has_calls() ? "incomplete" : "completed");
     }
-    std::string text;
+    std::string text, reasoning;
     JsonArray calls;
     for (const auto& block : result_.output) {
         if (const auto* call = std::get_if<ToolCall>(&block)) calls.emplace_back(chat_call(*call));
+        else if (const auto* thought = std::get_if<Thought>(&block)) reasoning += thought->text;
         else text += std::get<std::string>(block);
     }
     JsonObject message{{"role", "assistant"}, {"content", text.empty() && !calls.empty() ? JsonValue() : JsonValue(text)}};
+    if (!reasoning.empty()) message["reasoning_content"] = std::move(reasoning);
     if (!calls.empty()) message["tool_calls"] = std::move(calls);
     return JsonObject{{"id", id_}, {"object", "chat.completion"}, {"created", created_}, {"model", model_},
         {"choices", JsonArray{JsonObject{{"index", 0}, {"message", std::move(message)},
