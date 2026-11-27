@@ -10,6 +10,8 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
 option(FUSIONRT_BUILD_TESTS "Build C++ test suite" ON)
+option(FUSIONRT_BUILD_CLI "Build command-line executable" ON)
+option(FUSIONRT_BUILD_OPS_ONLY "Build only the standalone operator library" OFF)
 option(FUSIONRT_ENABLE_CUDA "Enable CUDA backend" ON)
 option(FUSIONRT_ENABLE_VULKAN "Enable Vulkan backend" ON)
 
@@ -24,15 +26,6 @@ if(FUSIONRT_ENABLE_CUDA)
     else()
         message(STATUS "CUDA compiler not found; building without CUDA backend")
         set(FUSIONRT_ENABLE_CUDA OFF)
-    endif()
-endif()
-
-if(FUSIONRT_ENABLE_VULKAN)
-    find_package(Vulkan QUIET)
-    find_program(GLSLC_EXECUTABLE NAMES glslc HINTS "$ENV{VULKAN_SDK}/Bin" "$ENV{VULKAN_SDK}/bin")
-    if(NOT Vulkan_FOUND OR NOT GLSLC_EXECUTABLE)
-        message(STATUS "Vulkan SDK or glslc not found; building without Vulkan backend")
-        set(FUSIONRT_ENABLE_VULKAN OFF)
     endif()
 endif()
 
@@ -57,16 +50,65 @@ else()
     )
 endif()
 
+add_library(fusionrt_ops STATIC
+    src/core/tensor.cpp
+    src/core/repack.cpp
+    src/core/cpu_moe.cpp
+    src/core/json.cpp
+    src/core/device_profile.cpp
+)
+set_target_properties(fusionrt_ops PROPERTIES POSITION_INDEPENDENT_CODE ON)
+target_include_directories(fusionrt_ops PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/include")
+target_compile_features(fusionrt_ops PUBLIC cxx_std_20)
+find_package(Threads REQUIRED)
+target_link_libraries(fusionrt_ops PRIVATE Threads::Threads)
+
+if((MSVC AND CMAKE_CXX_COMPILER_ARCHITECTURE_ID STREQUAL "x64") OR
+   (NOT MSVC AND CMAKE_SYSTEM_PROCESSOR MATCHES "^(AMD64|amd64|x86_64)$"))
+    target_sources(fusionrt_ops PRIVATE src/core/cpu_moe_avx2.cpp src/core/cpu_moe_avx512.cpp)
+    set_source_files_properties(src/core/cpu_moe.cpp PROPERTIES COMPILE_DEFINITIONS "FUSIONRT_CPU_MOE_AVX2;FUSIONRT_CPU_MOE_AVX512")
+    if(MSVC)
+        set_source_files_properties(src/core/cpu_moe_avx2.cpp PROPERTIES COMPILE_OPTIONS /arch:AVX2)
+        set_source_files_properties(src/core/cpu_moe_avx512.cpp PROPERTIES COMPILE_OPTIONS /arch:AVX512)
+    else()
+        set_source_files_properties(src/core/cpu_moe_avx2.cpp PROPERTIES COMPILE_OPTIONS "-mavx2;-mfma")
+        set_source_files_properties(src/core/cpu_moe_avx512.cpp PROPERTIES COMPILE_OPTIONS "-mavx512f;-mavx512bw;-mavx512vl;-mavx512vnni")
+    endif()
+endif()
+
+if(FUSIONRT_ENABLE_CUDA)
+    target_sources(fusionrt_ops PRIVATE
+        src/cuda/cuda_backend.cpp
+        src/cuda/cuda_common.cuh
+        src/cuda/matmul/weight_tiles.cuh
+        src/cuda/matmul/gemv_decode.cu
+        src/cuda/matmul/mmq_prefill.cu
+        src/cuda/matmul/dit_linear_ops.cu
+        src/cuda/sequence/flash_attention.cu
+        src/cuda/sequence/mla.cu
+        src/cuda/sequence/linear_recurrence.cu
+        src/cuda/epilogue/elementwise_ops.cu
+        src/cuda/epilogue/hadamard_ops.cu
+        src/cuda/epilogue/codec_moe_ops.cu
+    )
+    target_compile_definitions(fusionrt_ops PUBLIC FUSIONRT_ENABLE_CUDA=1)
+    target_link_libraries(fusionrt_ops PUBLIC CUDA::cudart CUDA::cuda_driver CUDA::cublas)
+    if(TARGET CUDA::nvml)
+        target_link_libraries(fusionrt_ops PUBLIC CUDA::nvml)
+        target_compile_definitions(fusionrt_ops PUBLIC FUSIONRT_HAS_NVML=1)
+    endif()
+endif()
+
+if(FUSIONRT_BUILD_OPS_ONLY)
+    return()
+endif()
+
 set(FUSIONRT_SOURCES
     src/server/agent_request.cpp
     src/server/agent_template.cpp
     src/server/agent_response.cpp
     src/server/http_request.cpp
-    src/core/tensor.cpp
-    src/core/cpu_moe.cpp
-    src/core/json.cpp
     src/core/sampler.cpp
-    src/core/device_profile.cpp
     src/core/model_trace.cpp
     src/core/graph_ir.cpp
     src/io/gguf.cpp
@@ -81,19 +123,6 @@ set(FUSIONRT_SOURCES
     src/bench/bench_runner.cpp
 )
 
-if((MSVC AND CMAKE_CXX_COMPILER_ARCHITECTURE_ID STREQUAL "x64") OR
-   (NOT MSVC AND CMAKE_SYSTEM_PROCESSOR MATCHES "^(AMD64|amd64|x86_64)$"))
-    list(APPEND FUSIONRT_SOURCES src/core/cpu_moe_avx2.cpp src/core/cpu_moe_avx512.cpp)
-    set_source_files_properties(src/core/cpu_moe.cpp PROPERTIES COMPILE_DEFINITIONS "FUSIONRT_CPU_MOE_AVX2;FUSIONRT_CPU_MOE_AVX512")
-    if(MSVC)
-        set_source_files_properties(src/core/cpu_moe_avx2.cpp PROPERTIES COMPILE_OPTIONS /arch:AVX2)
-        set_source_files_properties(src/core/cpu_moe_avx512.cpp PROPERTIES COMPILE_OPTIONS /arch:AVX512)
-    else()
-        set_source_files_properties(src/core/cpu_moe_avx2.cpp PROPERTIES COMPILE_OPTIONS "-mavx2;-mfma")
-        set_source_files_properties(src/core/cpu_moe_avx512.cpp PROPERTIES COMPILE_OPTIONS "-mavx512f;-mavx512bw;-mavx512vl;-mavx512vnni")
-    endif()
-endif()
-
 if(FUSIONRT_ENABLE_CUDA)
     list(APPEND FUSIONRT_SOURCES
         src/models/cuda_dispatch.cpp
@@ -102,19 +131,17 @@ if(FUSIONRT_ENABLE_CUDA)
         src/models/cuda_ir.cpp
         src/models/cuda_executor.cpp
         src/models/cuda_generate.cpp
-        src/cuda/cuda_backend.cpp
-        src/cuda/cuda_common.cuh
-        src/cuda/matmul/weight_tiles.cuh
-        src/cuda/matmul/gemv_decode.cu
-        src/cuda/matmul/mmq_prefill.cu
-        src/cuda/sequence/flash_attention.cu
-        src/cuda/sequence/mla.cu
-        src/cuda/sequence/linear_recurrence.cu
-        src/cuda/epilogue/elementwise_ops.cu
-        src/cuda/epilogue/hadamard_ops.cu
-        src/cuda/epilogue/codec_moe_ops.cu
         src/server/http_server.cpp
     )
+endif()
+
+if(FUSIONRT_ENABLE_VULKAN)
+    find_package(Vulkan QUIET)
+    find_program(GLSLC_EXECUTABLE NAMES glslc HINTS "$ENV{VULKAN_SDK}/Bin" "$ENV{VULKAN_SDK}/bin")
+    if(NOT Vulkan_FOUND OR NOT GLSLC_EXECUTABLE)
+        message(STATUS "Vulkan SDK or glslc not found; building without Vulkan backend")
+        set(FUSIONRT_ENABLE_VULKAN OFF)
+    endif()
 endif()
 
 if(FUSIONRT_ENABLE_VULKAN)
@@ -146,29 +173,14 @@ if(FUSIONRT_ENABLE_VULKAN)
 endif()
 
 add_library(fusionrt_core STATIC ${FUSIONRT_SOURCES})
-
-target_include_directories(fusionrt_core PUBLIC
-    "${CMAKE_CURRENT_SOURCE_DIR}/include"
-)
+target_link_libraries(fusionrt_core PUBLIC fusionrt_ops)
 
 target_compile_definitions(fusionrt_core PUBLIC
     FUSIONRT_VERSION="0.2.0"
 )
 
-if(FUSIONRT_ENABLE_CUDA)
-    target_compile_definitions(fusionrt_core PUBLIC FUSIONRT_ENABLE_CUDA=1)
-    target_link_libraries(fusionrt_core PUBLIC
-        CUDA::cudart
-        CUDA::cuda_driver
-        CUDA::cublas
-    )
-    if(WIN32)
-        target_link_libraries(fusionrt_core PRIVATE ws2_32 dxgi)
-    endif()
-    if(TARGET CUDA::nvml)
-        target_link_libraries(fusionrt_core PUBLIC CUDA::nvml)
-        target_compile_definitions(fusionrt_core PUBLIC FUSIONRT_HAS_NVML=1)
-    endif()
+if(FUSIONRT_ENABLE_CUDA AND WIN32)
+    target_link_libraries(fusionrt_core PRIVATE ws2_32 dxgi)
 endif()
 
 if(FUSIONRT_ENABLE_VULKAN)
@@ -177,13 +189,14 @@ if(FUSIONRT_ENABLE_VULKAN)
     target_link_libraries(fusionrt_core PUBLIC Vulkan::Vulkan)
 endif()
 
-add_executable(fusionrt src/cli/main.cpp)
-target_link_libraries(fusionrt PRIVATE fusionrt_core)
-
-if(FUSIONRT_ENABLE_VULKAN)
-    add_custom_command(TARGET fusionrt POST_BUILD
-        COMMAND ${CMAKE_COMMAND} -E copy_directory "${SHADER_BIN_DIR}" "$<TARGET_FILE_DIR:fusionrt>/shaders"
-    )
+if(FUSIONRT_BUILD_CLI)
+    add_executable(fusionrt src/cli/main.cpp)
+    target_link_libraries(fusionrt PRIVATE fusionrt_core)
+    if(FUSIONRT_ENABLE_VULKAN)
+        add_custom_command(TARGET fusionrt POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -E copy_directory "${SHADER_BIN_DIR}" "$<TARGET_FILE_DIR:fusionrt>/shaders"
+        )
+    endif()
 endif()
 
 if(FUSIONRT_BUILD_TESTS)
@@ -196,6 +209,7 @@ if(FUSIONRT_BUILD_TESTS)
         tests/test_model_state.cpp
         tests/test_spec_and_protocols.cpp
         tests/test_wave1.cpp
+        tests/test_dit_ops.cpp
     )
     target_include_directories(fusionrt_tests PRIVATE src/server)
     target_link_libraries(fusionrt_tests PRIVATE fusionrt_core)

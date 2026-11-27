@@ -1,5 +1,6 @@
 #include "test_support.h"
 #include "../src/models/cuda_dispatch.h"
+#include "fusionrt/repack.h"
 
 namespace fusionrt::test {
 
@@ -534,8 +535,50 @@ void test_q2_k_format() {
         throw std::runtime_error("Q2_K mapped GGUF roundtrip differs");
 }
 
+static void test_host_repacking() {
+    constexpr int rows = 32, cols = 512;
+    std::mt19937_64 rng(102);
+    auto check = [&]<typename Src, typename Dst>(DType src_dtype, DType dst_dtype,
+                                                 void (*legacy)(const Src*, Dst*, int64_t)) {
+        HostTensor src({rows, cols}, src_dtype);
+        for (auto& byte : src.storage) byte = static_cast<uint8_t>(rng());
+        HostTensor expected({rows, cols}, dst_dtype);
+        legacy(src.data<Src>(), expected.data<Dst>(), rows * cols);
+        HostTensor actual({rows, cols}, dst_dtype);
+        std::fill(actual.storage.begin(), actual.storage.end(), uint8_t{0xff});
+        if (!repack::can_repack_for_mmq(src_dtype, rows, cols) ||
+            repack::repacked_dtype_for(src_dtype, rows, cols, true) != dst_dtype ||
+            repack::repacked_nbytes(dst_dtype, rows, cols) != actual.storage.size() ||
+            !repack::repack_matrix_blocks(src.storage.data(), src_dtype, actual.storage.data(), dst_dtype, rows, cols) ||
+            actual.storage != expected.storage) {
+            throw std::runtime_error("Host repacking differs from the block codec");
+        }
+    };
+    check(DType::Q4_0, DType::Q4_A, repack_q4_0_to_q4_a);
+    check(DType::Q8_0, DType::Q8_A, repack_q8_0_to_q8_a);
+    check(DType::Q4_K, DType::Q4_KA, repack_q4_k_to_q4_ka);
+    check(DType::Q6_K, DType::Q6_A, repack_q6_k_to_q6_a);
+
+    if (repack::repacked_dtype_for(DType::Q6_K, rows, cols) != DType::Q6_K ||
+        repack::can_repack_for_mmq(DType::Q4_0, rows - 1, cols) ||
+        repack::can_repack_for_mmq(DType::Q8_0, rows, cols - 32) ||
+        repack::can_repack_for_mmq(DType::F16, rows, cols) ||
+        repack::repacked_nbytes(DType::Q4_A, 0, cols) != 0) {
+        throw std::runtime_error("Host repacking accepted an unsuitable MMQ format or shape");
+    }
+
+    HostTensor src({1, cols}, DType::Q4_K);
+    HostTensor dst({1, cols}, DType::Q4_KA);
+    if (repack::repack_matrix_blocks(src.storage.data(), DType::Q6_K, dst.storage.data(), DType::Q4_KA, 1, cols) ||
+        repack::repack_matrix_blocks(src.storage.data(), DType::Q4_K, dst.storage.data(), DType::Q4_KA, 1, cols - 32) ||
+        !repack::repack_matrix_blocks(src.storage.data(), DType::Q4_K, dst.storage.data(), DType::Q4_KA, 1, cols)) {
+        throw std::runtime_error("Host repacking mishandled a caller-owned buffer");
+    }
+}
+
 void test_quant_and_io() {
     std::cout << "[1/7] Testing Q8_0 / Q4_0 quantization, GGUF v3, Safetensors, BPE...\n";
+    test_host_repacking();
     std::mt19937_64 rng(101);
     HostTensor src = rand_f32({4, 128}, rng, 0.5f);
     std::vector<BlockQ8_0> q8(4 * 4);

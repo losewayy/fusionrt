@@ -3,6 +3,10 @@
 #include <iostream>
 #include <stdexcept>
 
+#ifdef FUSIONRT_ENABLE_CUDA
+void run_dit_ops_tests();
+#endif
+
 using namespace fusionrt;
 using namespace fusionrt::test;
 
@@ -43,6 +47,7 @@ int main() {
         test_cuda_graph_and_moe_offload(cuda_ctx);
         test_cuda_wave1_decode(cuda_ctx);
         test_repacked_quants(cuda_ctx);
+        run_dit_ops_tests();
         test_cuda_wave2_prefill(cuda_ctx);
         test_cuda_sliding_window(cuda_ctx);
         test_cuda_gemma_epilogues(cuda_ctx);

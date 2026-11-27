@@ -1,19 +1,23 @@
 #include "cuda_weights.h"
 #include "model_loader.h"
 #include "../core/cpu_moe.h"
+#include "fusionrt/repack.h"
 
 #ifdef FUSIONRT_ENABLE_CUDA
 #include <algorithm>
+#include <atomic>
 #include <bit>
 #include <chrono>
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
 #include <iostream>
+#include <limits>
 #include <numeric>
 #include <stdexcept>
 #include <tuple>
 #include <unordered_set>
+#include <utility>
 #ifdef _WIN32
 #include <dxgi1_4.h>
 #endif
@@ -24,38 +28,37 @@ using namespace model_io;
 namespace {
 
 DType cuda_matrix_dtype(const CostHardware& hw, const HostTensor& t, bool is_vocab_head) {
-    const auto dtype = t.desc.dtype;
-    if (t.desc.ndim != 2 || t.desc.shape[1] % 256 != 0) return dtype;
-    if (dtype == DType::Q4_K) return DType::Q4_KA;
-    if (dtype == DType::Q6_K && should_repack_q6_a(hw, t.desc.shape[0], t.desc.shape[1], is_vocab_head)) {
-        return DType::Q6_A;
+    const auto& desc = t.desc;
+    if (desc.ndim != 2 || !std::in_range<int>(desc.shape[0]) || !std::in_range<int>(desc.shape[1])) {
+        return desc.dtype;
     }
-    if (t.desc.shape[0] < 32) return dtype;
-    if (dtype == DType::Q4_0) return DType::Q4_A;
-    if (dtype == DType::Q8_0) return DType::Q8_A;
-    return dtype;
-}
-
-template<class Src, class Dst>
-void repack_matrix_blocks(CpuWorkers& workers, const HostTensor& src, HostTensor& dst,
-                          void (*repack)(const Src*, Dst*, int64_t)) {
-    const int64_t block_count = src.desc.numel() / 256;
-    workers.run(block_count, [&](int64_t first, int64_t last) {
-        repack(src.data<Src>() + first * (256 / dtype_block_size(src.desc.dtype)),
-               dst.data<Dst>() + first, (last - first) * 256);
-    });
+    const int rows = static_cast<int>(desc.shape[0]), cols = static_cast<int>(desc.shape[1]);
+    const bool allow_q6_a = desc.dtype == DType::Q6_K && should_repack_q6_a(hw, rows, cols, is_vocab_head);
+    return repack::repacked_dtype_for(desc.dtype, rows, cols, allow_q6_a);
 }
 
 HostTensor repack_matrix_for_cuda(CpuWorkers& workers, const HostTensor& src, DType dtype) {
     auto dst = HostTensor::create({src.desc.shape[0], src.desc.shape[1]}, dtype);
     dst.desc.name = src.desc.name;
-    switch (dtype) {
-        case DType::Q4_KA: repack_matrix_blocks(workers, src, dst, repack_q4_k_to_q4_ka); break;
-        case DType::Q6_A: repack_matrix_blocks(workers, src, dst, repack_q6_k_to_q6_a); break;
-        case DType::Q4_A: repack_matrix_blocks(workers, src, dst, repack_q4_0_to_q4_a); break;
-        case DType::Q8_A: repack_matrix_blocks(workers, src, dst, repack_q8_0_to_q8_a); break;
-        default: throw std::logic_error("Expected a repacked CUDA matrix format");
-    }
+    const int block_cols = static_cast<int>(dtype_block_size(dtype));
+    const size_t src_block_bytes = row_nbytes(src.desc.dtype, block_cols);
+    const size_t dst_block_bytes = dtype_type_size(dtype);
+    const auto* input = src.bytes().data();
+    auto* output = dst.storage.data();
+    std::atomic<bool> failed{false};
+    workers.run(src.desc.numel() / block_cols, [&](int64_t first, int64_t last) {
+        // Each worker sees a contiguous range of blocks, even across row boundaries.
+        while (first < last) {
+            const auto blocks = static_cast<int>(std::min<int64_t>(last - first, std::numeric_limits<int>::max()));
+            if (!repack::repack_matrix_blocks(input + first * src_block_bytes, src.desc.dtype,
+                                             output + first * dst_block_bytes, dtype, blocks, block_cols)) {
+                failed.store(true, std::memory_order_relaxed);
+                return;
+            }
+            first += blocks;
+        }
+    });
+    if (failed.load(std::memory_order_relaxed)) throw std::logic_error("Expected a repacked CUDA matrix format");
     return dst;
 }
 
