@@ -1,4 +1,5 @@
 #include "test_support.h"
+#include "../src/core/spec_cost.h"
 
 namespace fusionrt::test {
 
@@ -116,6 +117,31 @@ void test_device_profile_and_cost_model() {
     hw.pcie_h2d_gbps = 64;
     check(select_cold_expert_path(hw, 8 * 1024 * 1024) == ColdExpertPath::PcieStream &&
           select_cold_expert_path(hw, 4096) == ColdExpertPath::CpuInPlace, "Fast PCIe and transfer startup cost");
+
+    const auto resident = prefix_copy_ms(1 << 20, 1, 592, 4);
+    const auto spilled = resident + prefix_copy_ms(1 << 20, 1, 14, 12);
+    check(prefix_restore_worthwhile(resident, 0.05) && !prefix_restore_worthwhile(spilled, 0.05) &&
+          !prefix_restore_worthwhile(0.05, 0.05), "A prefix restore must save time after spill and snapshot copies");
+
+    MtpDepthController depth;
+    // Bonsai 2.5 PTQ1_0: measured widths 2, 4, 6 and 8, with intermediate widths interpolated.
+    const double verify_ms[] = {1000 / 43.26, 27.97, 31, 33.72, 60, 87.04, 79, 71.30};
+    // Conditional probabilities reconstructed from the observed acceptance fractions.
+    const double acceptance[] = {0.78, 0.75, 0.73, 0.60, 0.58, 0.30, 0.28};
+    for (int i = 0; i < 8; ++i) depth.observe_verify(i + 1, verify_ms[i]);
+    for (int i = 0; i < 7; ++i) depth.observe_acceptance(i + 1, acceptance[i]);
+    depth.observe_draft(0.8);
+    depth.observe_rewind(1, 0.25);
+    check(depth.best_depth(7) == 3, "MTP must avoid the measured verification cliff");
+    for (int i = 0; i < 16; ++i) depth.observe_acceptance(1, false);
+    check(depth.best_depth(7) == 0, "MTP must back off when early proposals are rejected");
+
+    MtpDepthController probe;
+    check(probe.choose_depth(7) == 0 && probe.choose_depth(7) == 1, "MTP measures its baseline and first draft");
+    probe.observe_verify(1, verify_ms[0]);
+    probe.observe_verify(2, verify_ms[1]);
+    for (int i = 2; i < 8; ++i) check(probe.choose_depth(7) == 0, "MTP uses measured widths between probes");
+    check(probe.choose_depth(7) == 2, "MTP probes an unmeasured width");
 }
 
 void test_agent_protocols() {

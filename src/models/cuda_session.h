@@ -46,18 +46,21 @@ public:
         active().cached_tokens.assign(tokens.begin(), tokens.end());
         active().cached_fused = fused;
     }
-    void truncate(int tokens) { cuda_kv_pool_.truncate(active().pages, tokens); }
+    void truncate(int tokens);
+    int mtp_kv_valid_len() const { return active().mtp_kv_valid_len; }
+    void set_mtp_kv_valid_len(int tokens) { active().mtp_kv_valid_len = tokens; }
     void zero_cuda_gdn(CudaContext&);
     void reset_kv_and_state(CudaContext&);
     void ensure_cuda_kv(CudaContext&, int first_write, int tokens, std::span<CudaSparseMoELayer>);
     void validate_cuda_kv_capacity(int tokens) const;
     void promote_cuda_expert_slabs(CudaContext&, int budgeted_tokens, std::span<CudaSparseMoELayer>);
-    void save_cuda_checkpoint(CudaContext&, int tokens, const Tensor* logits);
-    ModelMemory cache_memory(size_t logits_bytes) const;
+    void save_cuda_checkpoint(CudaContext&, int tokens, const Tensor* logits, const Tensor& mtp_hidden = {});
+    void observe_prefix_prefill(int tokens, double ms);
+    ModelMemory cache_memory() const;
     int cuda_max_active_tokens() const;
     struct Prefix { int length; bool checkpoint_pages; };
     Prefix prepare_prefix(CudaContext&, const std::vector<int32_t>&, bool fused,
-                          bool allow_cached_logits, const Tensor& logits);
+                          bool allow_cached_logits, const Tensor& logits, const Tensor* mtp_hidden = nullptr);
 
 private:
     friend struct CudaReviewTestAccess;
@@ -65,7 +68,8 @@ private:
     std::function<void()> invalidate_graph_;
     struct GdnSnapshot {
         std::unique_ptr<uint8_t, decltype(&cudaFree)> data{nullptr, cudaFree};
-        bool has_logits = false;
+        size_t logits_bytes = 0;
+        size_t mtp_hidden_bytes = 0;
     };
     struct GdnCheckpoint {
         int tokens;
@@ -81,6 +85,7 @@ private:
         std::vector<GdnCheckpoint> checkpoints;
         // Checkpoints belong to exact prefixes of this token history.
         std::vector<int32_t> cached_tokens;
+        int mtp_kv_valid_len = 0;
         bool cached_fused = true;
         uint64_t last_used = 0;
     };
@@ -95,6 +100,7 @@ private:
     DType cuda_kv_dtype_ = DType::F32;
     size_t active_slot_ = 0;
     uint64_t slot_clock_ = 0;
+    double prefix_prefill_ms_per_token_ = 0;
     size_t requested_kv_budget_ = 0;
     int kv_commitment_tokens_ = 0;
     bool may_evict_paused_cuda_slots_ = false;

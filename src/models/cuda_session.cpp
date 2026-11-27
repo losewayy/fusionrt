@@ -1,5 +1,6 @@
 #include "cuda_session.h"
 #include "cuda_weights.h"
+#include "../core/spec_cost.h"
 
 #ifdef FUSIONRT_ENABLE_CUDA
 #include <algorithm>
@@ -74,12 +75,21 @@ void CudaSessionManager::release_cuda_sessions() {
     expert_slab_bytes_ = 0;
     active_slot_ = 0;
     slot_clock_ = 0;
+    prefix_prefill_ms_per_token_ = 0;
 }
 
 void CudaSessionManager::clear_cuda_history() {
     auto& slot = active();
     slot.cached_tokens.clear();
     slot.checkpoints.clear();
+    slot.mtp_kv_valid_len = 0;
+}
+
+void CudaSessionManager::truncate(int tokens) {
+    auto& slot = active();
+    cuda_kv_pool_.truncate(slot.pages, tokens);
+    slot.mtp_kv_valid_len = std::min(slot.mtp_kv_valid_len, tokens);
+    std::erase_if(slot.checkpoints, [=](const auto& entry) { return entry.tokens > tokens; });
 }
 
 void CudaSessionManager::zero_cuda_gdn(CudaContext& ctx) {
@@ -91,7 +101,7 @@ void CudaSessionManager::zero_cuda_gdn(CudaContext& ctx) {
 
 void CudaSessionManager::reset_kv_and_state(CudaContext& ctx) {
     clear_cuda_history();
-    cuda_kv_pool_.truncate(active().pages, 0);
+    truncate(0);
     zero_cuda_gdn(ctx);
     ctx.synchronize();
 }
@@ -260,32 +270,45 @@ void CudaSessionManager::ensure_cuda_kv(CudaContext& ctx, int first_write, int t
             cuda_kv_pool_.truncate(victim.pages, 0);
             victim.cached_tokens.clear();
             victim.checkpoints.clear();
+            victim.mtp_kv_valid_len = 0;
         }
     }
 }
 
-void CudaSessionManager::save_cuda_checkpoint(CudaContext& ctx, int tokens, const Tensor* logits) {
+void CudaSessionManager::save_cuda_checkpoint(CudaContext& ctx, int tokens, const Tensor* logits,
+                                              const Tensor& mtp_hidden) {
     auto& slot = active();
-    if (slot.gdn.empty()) return;
+    if (slot.gdn.empty() && !mtp_hidden.data) return;
     constexpr size_t max_checkpoints = 6;
     auto& checkpoints = slot.checkpoints;
     std::erase_if(checkpoints, [=](const auto& entry) { return entry.tokens == tokens; });
-    if (checkpoints.size() == max_checkpoints) checkpoints.erase(checkpoints.begin());
+    if (checkpoints.size() == max_checkpoints) {
+        // A non-MTP continuation can still share the earlier verified NextN boundary.
+        const auto oldest = std::find_if(checkpoints.begin(), checkpoints.end(), [&](const auto& entry) {
+            return entry.tokens != slot.mtp_kv_valid_len;
+        });
+        checkpoints.erase(oldest);
+    }
     auto snapshot = std::make_shared<GdnSnapshot>();
-    const size_t logits_bytes = logits ? logits->nbytes() : 0;
+    snapshot->logits_bytes = logits ? logits->nbytes() : 0;
+    snapshot->mtp_hidden_bytes = mtp_hidden.data ? mtp_hidden.nbytes() : 0;
     uint8_t* data = nullptr;
-    FUSIONRT_CUDA_CHECK(cudaMalloc(&data, slot.ssm_bytes + logits_bytes));
+    FUSIONRT_CUDA_CHECK(cudaMalloc(&data, slot.ssm_bytes + snapshot->logits_bytes + snapshot->mtp_hidden_bytes));
     snapshot->data.reset(data);
-    snapshot->has_logits = logits != nullptr;
-    FUSIONRT_CUDA_CHECK(cudaMemcpyAsync(data, slot.gdn_data, slot.ssm_bytes, cudaMemcpyDeviceToDevice, ctx.stream()));
+    if (slot.ssm_bytes) FUSIONRT_CUDA_CHECK(cudaMemcpyAsync(data, slot.gdn_data, slot.ssm_bytes,
+                                                          cudaMemcpyDeviceToDevice, ctx.stream()));
     if (logits) {
-        FUSIONRT_CUDA_CHECK(cudaMemcpyAsync(data + slot.ssm_bytes, logits->ptr(), logits_bytes,
+        FUSIONRT_CUDA_CHECK(cudaMemcpyAsync(data + slot.ssm_bytes, logits->ptr(), snapshot->logits_bytes,
                                             cudaMemcpyDeviceToDevice, ctx.stream()));
+    }
+    if (mtp_hidden.data) {
+        FUSIONRT_CUDA_CHECK(cudaMemcpyAsync(data + slot.ssm_bytes + snapshot->logits_bytes, mtp_hidden.ptr(),
+                                            snapshot->mtp_hidden_bytes, cudaMemcpyDeviceToDevice, ctx.stream()));
     }
     checkpoints.push_back({tokens, std::move(snapshot)});
 }
 
-ModelMemory CudaSessionManager::cache_memory(size_t logits_bytes) const {
+ModelMemory CudaSessionManager::cache_memory() const {
     ModelMemory result;
     result.kv_pages = cuda_kv_pool_.pages();
     result.kv_bytes = cuda_kv_pool_.bytes();
@@ -300,17 +323,25 @@ ModelMemory CudaSessionManager::cache_memory(size_t logits_bytes) const {
         for (const auto& checkpoint : slot->checkpoints) {
             if (!counted.insert(checkpoint.snapshot.get()).second) continue;
             result.ssm_bytes += slot->ssm_bytes;
-            result.persistent_bytes += slot->ssm_bytes;
-            if (checkpoint.snapshot->has_logits) result.persistent_bytes += logits_bytes;
+            result.persistent_bytes += slot->ssm_bytes + checkpoint.snapshot->logits_bytes +
+                                       checkpoint.snapshot->mtp_hidden_bytes;
         }
     }
     return result;
 }
 
+void CudaSessionManager::observe_prefix_prefill(int tokens, double ms) {
+    const double per_token = ms / tokens;
+    prefix_prefill_ms_per_token_ = prefix_prefill_ms_per_token_ > 0
+        ? std::lerp(prefix_prefill_ms_per_token_, per_token, 0.125) : per_token;
+}
 
 CudaSessionManager::Prefix CudaSessionManager::prepare_prefix(CudaContext& ctx,
-    const std::vector<int32_t>& prompt, bool use_fused, bool allow_cached_logits, const Tensor& logits) {
+    const std::vector<int32_t>& prompt, bool use_fused, bool allow_cached_logits, const Tensor& logits,
+    const Tensor* mtp_hidden) {
     const int length = static_cast<int>(prompt.size());
+    const auto& hw = ctx.cost_hardware();
+    const auto page_bytes = mtp_hidden ? cuda_kv_page_bytes() : 0;
     struct Match {
         size_t index = 0;
         int common = 0;
@@ -326,19 +357,48 @@ CudaSessionManager::Prefix CudaSessionManager::prepare_prefix(CudaContext& ctx,
                                                           slot->cached_tokens.end()).first - prompt.begin());
         const bool append = common == static_cast<int>(slot->cached_tokens.size());
         Match candidate{i, common, 0, append, slot->last_used, {}};
-        if (slot->gdn.empty()) {
+        if (mtp_hidden) {
+            const int valid = std::min(common, slot->mtp_kv_valid_len);
+            for (const auto& checkpoint : slot->checkpoints) {
+                const auto& snapshot = *checkpoint.snapshot;
+                if (checkpoint.tokens > valid || checkpoint.tokens <= candidate.prefix || !snapshot.mtp_hidden_bytes)
+                    continue;
+                const bool exact = checkpoint.tokens == length;
+                if (exact && (!snapshot.logits_bytes || !allow_cached_logits)) continue;
+                const int pages = 1 + (checkpoint.tokens - 1) / kKvPageTokens;
+                // The pool exposes total spill occupancy. Bound the candidate's host pages by that total.
+                const auto spills = std::min(cuda_kv_pool_.host_pages(), pages);
+                const bool live_append = append && checkpoint.tokens == common;
+                const size_t state_bytes = live_append ? 0 : slot->ssm_bytes;
+                const size_t cow_bytes = !append && !exact && cuda_slots_.size() > 1 &&
+                    checkpoint.tokens % kKvPageTokens != 0 ? page_bytes : 0;
+                const size_t logits_bytes = exact ? snapshot.logits_bytes : 0;
+                const double restore_ms = prefix_copy_ms(static_cast<size_t>(spills) * page_bytes, spills,
+                    hw.pcie_h2d_gbps, hw.pcie_latency_us) + prefix_copy_ms(
+                    state_bytes + logits_bytes + snapshot.mtp_hidden_bytes + cow_bytes,
+                    (state_bytes != 0) + (logits_bytes != 0) + 1 + (cow_bytes != 0),
+                    hw.hbm_bw_gbps, ctx.device_profile().launch_floor_us);
+                if (!prefix_restore_worthwhile(restore_ms, checkpoint.tokens * prefix_prefill_ms_per_token_))
+                    continue;
+                candidate.prefix = checkpoint.tokens;
+                candidate.snapshot = checkpoint.snapshot;
+            }
+        } else if (slot->gdn.empty()) {
             candidate.prefix = std::min(common, length - 1);
         } else if (append && common < length) {
             candidate.prefix = common;
         } else {
             for (const auto& checkpoint : slot->checkpoints) {
                 if (checkpoint.tokens > common || checkpoint.tokens <= candidate.prefix) continue;
-                if (checkpoint.tokens == length && (!checkpoint.snapshot->has_logits || !allow_cached_logits)) continue;
+                if (checkpoint.tokens == length && (!checkpoint.snapshot->logits_bytes || !allow_cached_logits)) continue;
                 candidate.prefix = checkpoint.tokens;
                 candidate.snapshot = checkpoint.snapshot;
             }
         }
-        if (candidate.prefix > 0 || (candidate.append && candidate.common == length)) {
+        if (mtp_hidden && candidate.prefix > 0) {
+            if (std::tie(candidate.prefix, candidate.append, candidate.last_used) >
+                std::tie(best.prefix, best.append, best.last_used)) best = std::move(candidate);
+        } else if (!mtp_hidden && (candidate.prefix > 0 || (candidate.append && candidate.common == length))) {
             if (std::tie(candidate.append, candidate.prefix, candidate.common, candidate.last_used) >
                 std::tie(best.append, best.prefix, best.common, best.last_used)) {
                 best = std::move(candidate);
@@ -376,16 +436,24 @@ CudaSessionManager::Prefix CudaSessionManager::prepare_prefix(CudaContext& ctx,
             if (entry.tokens <= prefix) slot.checkpoints.push_back(entry);
         }
         cuda_kv_pool_.fork(slot.pages, source.pages, prefix);
+        slot.mtp_kv_valid_len = std::min(source.mtp_kv_valid_len, prefix);
     } else {
-        std::erase_if(slot.checkpoints, [=](const auto& entry) { return entry.tokens > prefix; });
-        cuda_kv_pool_.truncate(slot.pages, prefix);
+        truncate(prefix);
     }
     if (best.snapshot) {
         const auto* data = best.snapshot->data.get();
-        FUSIONRT_CUDA_CHECK(cudaMemcpyAsync(slot.gdn_data, data, slot.ssm_bytes, cudaMemcpyDeviceToDevice, ctx.stream()));
+        if (slot.ssm_bytes && !(best.append && prefix == best.common)) {
+            FUSIONRT_CUDA_CHECK(cudaMemcpyAsync(slot.gdn_data, data, slot.ssm_bytes,
+                                                cudaMemcpyDeviceToDevice, ctx.stream()));
+        }
         if (prefix == length) {
             FUSIONRT_CUDA_CHECK(cudaMemcpyAsync(logits.ptr(), data + slot.ssm_bytes,
                                                 logits.nbytes(), cudaMemcpyDeviceToDevice, ctx.stream()));
+        }
+        if (mtp_hidden) {
+            const auto row = mtp_hidden->slice_dim0(prefix - 1, 1);
+            FUSIONRT_CUDA_CHECK(cudaMemcpyAsync(row.ptr(), data + slot.ssm_bytes + best.snapshot->logits_bytes,
+                                                row.nbytes(), cudaMemcpyDeviceToDevice, ctx.stream()));
         }
     } else if (prefix == 0) {
         zero_cuda_gdn(ctx);
@@ -416,7 +484,9 @@ void CudaSessionManager::clear_histories() {
         if (!slot) continue;
         slot->cached_tokens.clear();
         slot->checkpoints.clear();
+        slot->mtp_kv_valid_len = 0;
     }
+    prefix_prefill_ms_per_token_ = 0;
 }
 
 void CudaSessionManager::download_recurrent(CudaContext& ctx, HostRecurrentState& snapshot) const {

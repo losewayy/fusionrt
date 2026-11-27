@@ -24,6 +24,9 @@ public:
     bool has_graph_prefix(bool fused) const;
     const Tensor& logits() const { return work_.logits; }
     void set_mtp_hidden_capture(bool capture) { capture_mtp_hidden_ = capture; }
+    std::vector<float> prefill_cached(CudaContext&, const std::vector<int32_t>&, bool fused, int* prefilled_tokens,
+                                      LayerTrace*, OpTrace*, const std::atomic_bool* cancel);
+    void save_prefix_checkpoint(CudaContext&, int tokens, const Tensor* logits);
     int prefill_batch_limit(CudaContext&, bool verify = false) const;
     static void validate_input_embeddings(std::span<const InputEmbedding>, size_t tokens, int width);
     void ensure_kv(CudaContext&, int first_write, int tokens);

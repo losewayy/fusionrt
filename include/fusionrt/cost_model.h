@@ -5,11 +5,14 @@
 #include <algorithm>
 #include <array>
 #include <bit>
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <limits>
 #include <numeric>
+#include <queue>
 #include <span>
+#include <stdexcept>
 #include <vector>
 
 namespace fusionrt {
@@ -43,22 +46,44 @@ struct CostHardware {
 struct MoeLayerCost {
     int experts = 0, top_k = 0, hidden = 0;
     std::array<size_t, 3> expert_tensor_bytes{};
+    bool mapped_slots = false;
 
     size_t gpu_bytes(int resident) const {
         size_t bytes = 0;
         for (const auto unit : expert_tensor_bytes) bytes += (unit * resident + 255) & ~size_t{255};
+        if (mapped_slots && resident > 0) bytes += (experts * sizeof(int32_t) + 255) & ~size_t{255};
         return bytes;
     }
 };
 
 struct MoePlacement {
     std::vector<int> gpu_experts;
-    std::array<double, 3> candidate_us{};
+    std::array<double, 4> candidate_us{};
     int choice = 0;
+    std::vector<std::vector<int32_t>> ranked_experts;
 };
 
-inline MoePlacement select_moe_placement(std::span<const MoeLayerCost> layers, size_t available,
-                                        const CostHardware& hw, double cpu_dispatch_us) {
+struct MoeLayerHeat {
+    std::vector<int32_t> ranked_experts;
+    std::vector<double> cumulative_hits;
+
+    explicit MoeLayerHeat(std::span<const double> frequencies) {
+        ranked_experts.resize(frequencies.size());
+        std::iota(ranked_experts.begin(), ranked_experts.end(), 0);
+        std::stable_sort(ranked_experts.begin(), ranked_experts.end(),
+            [&](int lhs, int rhs) { return frequencies[lhs] > frequencies[rhs]; });
+        cumulative_hits.resize(frequencies.size() + 1);
+        const double total = std::accumulate(frequencies.begin(), frequencies.end(), 0.0);
+        for (size_t i = 0; i < frequencies.size(); ++i)
+            cumulative_hits[i + 1] = cumulative_hits[i] + (total > 0 ?
+                frequencies[ranked_experts[i]] / total : 1.0 / frequencies.size());
+        if (!frequencies.empty()) cumulative_hits.back() = 1.0;
+    }
+};
+
+namespace cost_detail {
+
+inline auto moe_legacy_counts(std::span<const MoeLayerCost> layers, size_t available) {
     std::array<std::vector<int>, 3> counts;
     for (auto& candidate : counts) candidate.resize(layers.size());
     int common = 0, maximum = 0;
@@ -101,9 +126,28 @@ inline MoePlacement select_moe_placement(std::span<const MoeLayerCost> layers, s
         }
     }
 
+    return counts;
+}
+
+inline double moe_layer_us(const MoeLayerCost& l, int gpu, double bytes, double hit, double all_hot,
+                           const CostHardware& hw, double dispatch_us) {
+    if (!l.experts) return 0.0;
+    const double hot = l.top_k * hit;
     const double cpu_bw = std::max(1.0, hw.cpu_q4_gemv_gbps) * 1000;
     const double gpu_bw = std::max(1.0, hw.hbm_bw_gbps) * 1000;
     const double pci_bw = std::max(1.0, hw.pcie_h2d_gbps) * 1000;
+    const double serial = gpu < l.experts ? hw.pcie_latency_us +
+        (l.hidden * sizeof(float) + l.top_k * (sizeof(float) + sizeof(int32_t))) / pci_bw : 0.0;
+    const double cpu = (l.top_k - hot) * bytes / cpu_bw + (1.0 - all_hot) * dispatch_us;
+    return serial + std::max(cpu, hot * bytes / gpu_bw) +
+        (1.0 - all_hot) * (hw.pcie_latency_us + l.hidden * sizeof(float) / pci_bw);
+}
+
+}  // namespace cost_detail
+
+inline MoePlacement select_moe_placement(std::span<const MoeLayerCost> layers, size_t available,
+                                        const CostHardware& hw, double cpu_dispatch_us) {
+    auto counts = cost_detail::moe_legacy_counts(layers, available);
     MoePlacement result;
     for (size_t candidate = 0; candidate < counts.size(); ++candidate) {
         auto& us = result.candidate_us[candidate];
@@ -112,21 +156,94 @@ inline MoePlacement select_moe_placement(std::span<const MoeLayerCost> layers, s
             if (l.experts == 0) continue;
             const int gpu = counts[candidate][i];
             const double bytes = static_cast<double>(l.gpu_bytes(l.experts)) / l.experts;
-            const double hot = l.top_k * static_cast<double>(gpu) / l.experts;
             double all_hot = 1.0;
             for (int k = 0; k < l.top_k; ++k)
                 all_hot *= static_cast<double>(std::max(0, gpu - k)) / (l.experts - k);
-            const double serial = gpu < l.experts ? hw.pcie_latency_us +
-                (l.hidden * sizeof(float) + l.top_k * (sizeof(float) + sizeof(int32_t))) / pci_bw : 0.0;
-            const double cpu = (l.top_k - hot) * bytes / cpu_bw + (1.0 - all_hot) * cpu_dispatch_us;
-            const double gpu_us = hot * bytes / gpu_bw;
-            us += serial + std::max(cpu, gpu_us) +
-                (1.0 - all_hot) * (hw.pcie_latency_us + l.hidden * sizeof(float) / pci_bw);
+            us += cost_detail::moe_layer_us(l, gpu, bytes, static_cast<double>(gpu) / l.experts, all_hot,
+                                          hw, cpu_dispatch_us);
         }
         if (us < result.candidate_us[result.choice]) result.choice = static_cast<int>(candidate);
     }
     result.gpu_experts = std::move(counts[result.choice]);
     return result;
+}
+
+inline MoePlacement select_moe_placement(std::span<const MoeLayerCost> layers, size_t available,
+    const CostHardware& hw, double dispatch_us, std::span<const MoeLayerHeat> heat, bool balanced = false) {
+    if (heat.empty()) return select_moe_placement(layers, available, hw, dispatch_us);
+    if (heat.size() != layers.size()) throw std::invalid_argument("MoE heat profile layer count mismatch");
+    for (size_t i = 0; i < layers.size(); ++i)
+        if (heat[i].ranked_experts.size() != static_cast<size_t>(layers[i].experts))
+            throw std::invalid_argument("MoE heat profile expert count mismatch");
+    auto legacy = cost_detail::moe_legacy_counts(layers, available);
+    auto layer_us = [&](size_t i, int n) {
+        const double hit = heat[i].cumulative_hits[n];
+        // The histogram gives the marginal hit probability, not the joint top-k distribution.
+        const double all_hot = n >= layers[i].top_k ? std::pow(hit, layers[i].top_k) : 0.0;
+        const auto& l = layers[i];
+        const double bytes = std::accumulate(l.expert_tensor_bytes.begin(), l.expert_tensor_bytes.end(), 0.0);
+        return cost_detail::moe_layer_us(l, n, bytes, hit, all_hot, hw, dispatch_us);
+    };
+    auto score = [&](const std::vector<int>& counts) {
+        double total = 0.0;
+        for (size_t i = 0; i < layers.size(); ++i) total += layer_us(i, counts[i]);
+        return total;
+    };
+    MoePlacement result;
+    for (size_t j = 0; j < legacy.size(); ++j) {
+        result.candidate_us[j] = score(legacy[j]);
+        if (!balanced && result.candidate_us[j] < result.candidate_us[result.choice])
+            result.choice = static_cast<int>(j);
+    }
+
+    // Score each next slot by expected cold-expert time saved per allocated byte.
+    // Without a trace, reserve the same baseline count in every layer that can afford it.
+    auto counts = balanced ? legacy[0] : std::vector<int>(layers.size());
+    using Gain = std::pair<double, size_t>;
+    std::priority_queue<Gain> next;
+    auto push = [&](size_t i) {
+        const int n = counts[i];
+        const auto& l = layers[i];
+        if (n == l.experts) return;
+        const size_t bytes = l.gpu_bytes(n + 1) - l.gpu_bytes(n);
+        const double hit_gain = heat[i].cumulative_hits[n + 1] - heat[i].cumulative_hits[n];
+        const double compute_saved = l.top_k * hit_gain *
+            std::accumulate(l.expert_tensor_bytes.begin(), l.expert_tensor_bytes.end(), 0.0);
+        next.emplace(compute_saved / std::max<size_t>(1, bytes), i);
+    };
+    size_t remaining = available;
+    for (size_t i = 0; i < layers.size(); ++i) {
+        remaining -= layers[i].gpu_bytes(counts[i]);
+        push(i);
+    }
+    while (!next.empty()) {
+        const size_t i = next.top().second;
+        next.pop();
+        auto& n = counts[i];
+        const size_t bytes = layers[i].gpu_bytes(n + 1) - layers[i].gpu_bytes(n);
+        if (bytes > remaining) continue;
+        remaining -= bytes;
+        ++n;
+        push(i);
+    }
+    result.candidate_us[3] = score(counts);
+    if (result.candidate_us[3] <= result.candidate_us[result.choice]) {
+        result.choice = 3;
+        result.gpu_experts = std::move(counts);
+    } else {
+        result.gpu_experts = std::move(legacy[result.choice]);
+    }
+    for (const auto& layer : heat) result.ranked_experts.push_back(layer.ranked_experts);
+    return result;
+}
+
+inline bool moe_cache_move_pays(const CostHardware& hw, size_t expert_bytes, size_t mapping_bytes,
+                               int copies, double expected_future_hits) {
+    if (!expert_bytes || !(hw.pcie_h2d_gbps > 0) || !(hw.cpu_q4_gemv_gbps > 0)) return false;
+    const double move_us = (static_cast<double>(expert_bytes) + mapping_bytes) / (hw.pcie_h2d_gbps * 1000) +
+        copies * hw.pcie_latency_us;
+    const double miss_us = static_cast<double>(expert_bytes) / (hw.cpu_q4_gemv_gbps * 1000);
+    return move_us < expected_future_hits * miss_us;
 }
 
 struct MoeKvPlacement {
@@ -135,9 +252,10 @@ struct MoeKvPlacement {
 };
 
 inline MoeKvPlacement select_moe_kv_precision(std::span<const MoeLayerCost> layers, size_t available,
-    size_t arena_limit, size_t f16_bytes, size_t q8_bytes, const CostHardware& hw, double dispatch_us) {
+    size_t arena_limit, size_t f16_bytes, size_t q8_bytes, const CostHardware& hw, double dispatch_us,
+    std::span<const MoeLayerHeat> heat, bool balanced) {
     auto placement = [&](size_t kv) {
-        return select_moe_placement(layers, std::min(available - kv, arena_limit), hw, dispatch_us);
+        return select_moe_placement(layers, std::min(available - kv, arena_limit), hw, dispatch_us, heat, balanced);
     };
     if (f16_bytes > available) {
         if (q8_bytes <= available) return {DType::Q8_0, placement(q8_bytes)};
@@ -155,6 +273,11 @@ inline MoeKvPlacement select_moe_kv_precision(std::span<const MoeLayerCost> laye
             return {DType::Q8_0, std::move(quant)};
     }
     return {DType::F16, std::move(half)};
+}
+
+inline MoeKvPlacement select_moe_kv_precision(std::span<const MoeLayerCost> layers, size_t available,
+    size_t arena_limit, size_t f16_bytes, size_t q8_bytes, const CostHardware& hw, double dispatch_us) {
+    return select_moe_kv_precision(layers, available, arena_limit, f16_bytes, q8_bytes, hw, dispatch_us, {}, false);
 }
 
 enum class MmqTileConfig : uint8_t {

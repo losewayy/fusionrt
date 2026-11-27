@@ -1,6 +1,7 @@
 #include "cuda_weights.h"
 #include "model_loader.h"
 #include "../core/cpu_moe.h"
+#include "../core/moe_residency.h"
 #include "fusionrt/repack.h"
 
 #ifdef FUSIONRT_ENABLE_CUDA
@@ -142,6 +143,67 @@ void upload_projections(CudaContext& ctx, CudaArena& arena, const std::array<con
     }
 }
 
+bool mapped_moe_slots(const MoEConfig& config) {
+    return config.dynamic_cache || !config.route_profile.empty();
+}
+
+std::vector<MoeLayerHeat> load_moe_heat(std::span<const MoeLayerCost> costs, const MoEConfig& config) {
+    const auto& path = config.route_profile;
+    return moe_layer_heat(costs, std::filesystem::path(std::u8string(path.begin(), path.end())), config.dynamic_cache);
+}
+
+void upload_expert_weights(CudaContext& ctx, CudaArena& arena, CudaSparseMoELayer& layer,
+    HostTensor& gate, HostTensor& up, HostTensor& down, std::span<const int32_t> ranking) {
+    const int resident = layer.cfg.gpu_resident_experts, experts = layer.cfg.num_experts;
+    const auto slots = ranking.empty() ? ranking : ranking.first(resident);
+    if (!slots.empty()) {
+        layer.expert_to_slot = moe_expert_to_slot(experts, slots);
+        layer.d_expert_to_slot = arena.alloc_tensor({experts}, DType::I32);
+        FUSIONRT_CUDA_CHECK(cudaMemcpyAsync(layer.d_expert_to_slot.ptr(), layer.expert_to_slot.data(),
+            layer.d_expert_to_slot.nbytes(), cudaMemcpyHostToDevice, ctx.stream()));
+        if (layer.cfg.dynamic_cache && resident < experts)
+            layer.dynamic_cache = std::make_shared<MoeDynamicCache>(experts, slots);
+    }
+    const bool calibrate = layer.dynamic_cache && ctx.cost_hardware().pcie_h2d_gbps <= 0.0;
+    using Clock = std::chrono::steady_clock;
+    if (calibrate) ctx.synchronize();
+    const auto start = calibrate ? Clock::now() : Clock::time_point{};
+    size_t uploaded = 0;
+    auto split = [&](HostTensor& weights, Tensor& gpu, HostTensor& cpu) {
+        const auto bytes = weights.bytes();
+        if (bytes.empty()) return;
+        if (!resident) {
+            cpu = std::move(weights);
+            return;
+        }
+        const auto& shape = weights.desc.shape;
+        gpu = arena.alloc_tensor({resident, shape[1], shape[2]}, weights.desc.dtype);
+        if (slots.empty()) {
+            FUSIONRT_CUDA_CHECK(cudaMemcpyAsync(gpu.ptr(), bytes.data(), gpu.nbytes(),
+                                                cudaMemcpyHostToDevice, ctx.stream()));
+        } else {
+            const size_t unit = bytes.size() / experts;
+            for (int slot = 0; slot < resident; ++slot)
+                FUSIONRT_CUDA_CHECK(cudaMemcpyAsync(gpu.ptr<uint8_t>() + unit * slot, bytes.data() + unit * slots[slot],
+                                                    unit, cudaMemcpyHostToDevice, ctx.stream()));
+        }
+        ctx.synchronize();
+        uploaded += gpu.nbytes();
+        if (resident < experts) {
+            if (slots.empty()) cpu = weights.slice_dim0(resident, experts - resident);
+            else cpu = std::move(weights);
+        }
+        weights = {};
+    };
+    split(gate, layer.gpu_gate_up_w, layer.cpu_gate_up_w);
+    split(up, layer.gpu_up_w, layer.cpu_up_w);
+    split(down, layer.gpu_down_w, layer.cpu_down_w);
+    if (calibrate) {
+        const double elapsed_ns = std::chrono::duration<double, std::nano>(Clock::now() - start).count();
+        if (elapsed_ns > 0.0) layer.measured_h2d_gbps = uploaded / elapsed_ns;
+    }
+}
+
 }  // namespace
 
 void CudaModelWeights::init_synthetic(CudaContext& ctx, uint64_t seed, const CudaLoadHooks& hooks) {
@@ -163,7 +225,10 @@ void CudaModelWeights::init_synthetic(CudaContext& ctx, uint64_t seed, const Cud
     dense_layers_.clear();
     gdn_layers_.clear();
     moe_layers_.clear();
-
+    std::vector<MoeLayerCost> synthetic_costs(cfg_.num_layers);
+    if (cfg_.arch == "moe")
+        for (auto& cost : synthetic_costs) cost.experts = cfg_.moe.num_experts;
+    const auto heat = load_moe_heat(synthetic_costs, cfg_.moe);
     for (int l = 0; l < cfg_.num_layers; ++l) {
         int kind = 0;
         if (cfg_.arch == "hybrid") kind = ((l % 4) == 3) ? 0 : 1;
@@ -247,11 +312,16 @@ void CudaModelWeights::init_synthetic(CudaContext& ctx, uint64_t seed, const Cud
 
             L.norm_w = ctx.upload(make_ones_f32({H}), true);
             L.router_w = ctx.upload(make_rand_f32({E, H}, rng, 0.1f), true);
-            if (gE > 0) {
+            if (!heat.empty()) {
+                auto gate = make_rand_f32({E, 2 * I, H}, rng, 0.04f);
+                HostTensor up;
+                auto down = make_rand_f32({E, H, I}, rng, 0.04f);
+                upload_expert_weights(ctx, ctx.weight_arena(), L, gate, up, down, heat[l].ranked_experts);
+            } else if (gE > 0) {
                 L.gpu_gate_up_w = ctx.upload(make_rand_f32({gE, 2 * I, H}, rng, 0.04f), true);
                 L.gpu_down_w = ctx.upload(make_rand_f32({gE, H, I}, rng, 0.04f), true);
             }
-            if (cE > 0) {
+            if (heat.empty() && cE > 0) {
                 L.cpu_gate_up_w = make_rand_f32({cE, 2 * I, H}, rng, 0.04f);
                 L.cpu_down_w = make_rand_f32({cE, H, I}, rng, 0.04f);
             }
@@ -277,7 +347,8 @@ static bool upload_raw_model_to_cuda(CudaContext& ctx, CudaArena& arena, LoadedM
                                      std::vector<int>& layer_kinds, std::vector<size_t>& layer_indices,
                                      std::vector<CudaDenseGQALayer>& dense_layers,
                                      std::vector<CudaGatedDeltaNetLayer>& gdn_layers,
-                                     std::vector<CudaSparseMoELayer>& moe_layers) {
+                                     std::vector<CudaSparseMoELayer>& moe_layers,
+                                     const std::vector<std::vector<int32_t>>& ranked_experts) {
     cfg_out = raw.cfg;
     const Tensor rope_factors = raw.rope_factors.bytes().empty() ? Tensor{} : upload_cuda_weight(ctx, arena, raw.rope_factors);
     int H = cfg_out.dense.hidden_size;
@@ -323,25 +394,8 @@ static bool upload_raw_model_to_cuda(CudaContext& ctx, CudaArena& arena, LoadedM
         L.cpu_gate_scale = std::move(lr.expert_gate_scale);
         L.cpu_up_scale = std::move(lr.expert_up_scale);
         if (!lr.router_bias.bytes().empty()) L.router_bias = upload_cuda_weight(ctx, arena, lr.router_bias);
-        auto split = [&](HostTensor& weights, Tensor& gpu, HostTensor& cpu) {
-            if (weights.bytes().empty()) return;
-            const auto& shape = weights.desc.shape;
-            const auto type = weights.desc.dtype;
-            if (resident == 0) {
-                cpu = std::move(weights);
-                return;
-            }
-            gpu = arena.alloc_tensor({resident, shape[1], shape[2]}, type);
-            const size_t hot_bytes = gpu.nbytes();
-            FUSIONRT_CUDA_CHECK(cudaMemcpyAsync(gpu.ptr(), weights.bytes().data(), hot_bytes,
-                                                cudaMemcpyHostToDevice, ctx.stream()));
-            ctx.synchronize();
-            if (resident < shape[0]) cpu = weights.slice_dim0(resident, shape[0] - resident);
-            weights = {};
-        };
-        split(lr.experts_gate_up, L.gpu_gate_up_w, L.cpu_gate_up_w);
-        split(lr.experts_up, L.gpu_up_w, L.cpu_up_w);
-        split(lr.experts_down, L.gpu_down_w, L.cpu_down_w);
+        upload_expert_weights(ctx, arena, L, lr.experts_gate_up, lr.experts_up, lr.experts_down,
+            ranked_experts.empty() ? std::span<const int32_t>{} : std::span<const int32_t>(ranked_experts[layer_index]));
         if (lr.has_shared) {
             L.cfg.shared_intermediate_size = static_cast<int>(lr.shared_down.desc.shape[1]);
             L.shared_gate_up_w = upload_cuda_weight(ctx, arena, lr.shared_gate_up);
@@ -524,6 +578,8 @@ static size_t cuda_model_arena_bytes(const LoadedModelRaw& raw, const CostHardwa
             const int resident = placements.empty() ? 0 : placements[&l - raw.layers.data()];
             reserve(t->bytes().size() / experts * resident);
         }
+        if (!placements.empty() && placements[&l - raw.layers.data()] > 0 && mapped_moe_slots(raw.cfg.moe))
+            reserve(l.router_w.desc.shape[0] * sizeof(int32_t));
         if (l.kind == 1) weight(l.qkv_proj);
     }
     return bytes;
@@ -554,7 +610,7 @@ static size_t wddm_available_vram(int device, DXGI_QUERY_VIDEO_MEMORY_INFO& memo
 
 static size_t place_cuda_experts(CudaContext& ctx, LoadedModelRaw& raw, int override_count,
                                  size_t requested_kv_bytes, int active_tokens, int slots,
-                                 DType& dtype, bool owns_arena, size_t reclaim_bytes = 0) {
+                                 DType& dtype, bool owns_arena, size_t reclaim_bytes, MoePlacement& choice) {
     const auto& d = raw.cfg.dense;
     const auto requested_dtype = ctx.requested_kv_dtype();
     const bool mla = d.mla.latent_rank > 0;
@@ -589,6 +645,7 @@ static size_t place_cuda_experts(CudaContext& ctx, LoadedModelRaw& raw, int over
         c.experts = static_cast<int>(layer.router_w.desc.shape[0]);
         c.top_k = raw.cfg.moe.top_k;
         c.hidden = raw.cfg.moe.hidden_size;
+        c.mapped_slots = mapped_moe_slots(raw.cfg.moe);
         c.expert_tensor_bytes = {layer.experts_gate_up.bytes().size() / c.experts, layer.experts_up.bytes().size() / c.experts,
                                  layer.experts_down.bytes().size() / c.experts};
         ++expert_layers;
@@ -663,7 +720,8 @@ static size_t place_cuda_experts(CudaContext& ctx, LoadedModelRaw& raw, int over
         select_q8();
     }
     double dispatch_us = 0;
-    MoePlacement choice;
+    const auto heat = load_moe_heat(costs, raw.cfg.moe);
+    const bool balanced = raw.cfg.moe.dynamic_cache && raw.cfg.moe.route_profile.empty();
     if (expert_layers && override_count < 0) {
         auto& pool = ctx.cpu_workers();
         auto empty = [](int64_t, int64_t) {};
@@ -675,7 +733,7 @@ static size_t place_cuda_experts(CudaContext& ctx, LoadedModelRaw& raw, int over
         if (owns_arena && !requested_dtype && dtype == DType::F16 && q8_compatible && q8_bytes && kv_bytes &&
             overhead <= available) {
             auto fit = select_moe_kv_precision(costs, available - overhead, arena_limit,
-                kv_bytes, q8_bytes, ctx.cost_hardware(), dispatch_us);
+                kv_bytes, q8_bytes, ctx.cost_hardware(), dispatch_us, heat, balanced);
             if (fit.dtype == DType::Q8_0) select_q8();
             choice = std::move(fit.experts);
         }
@@ -688,8 +746,10 @@ static size_t place_cuda_experts(CudaContext& ctx, LoadedModelRaw& raw, int over
     const size_t expert_budget = owns_arena ? available - mandatory : arena_limit;
     if (override_count < 0) {
         if (choice.gpu_experts.empty())
-            choice = select_moe_placement(costs, expert_budget, ctx.cost_hardware(), dispatch_us);
+            choice = select_moe_placement(costs, expert_budget, ctx.cost_hardware(), dispatch_us, heat, balanced);
         raw.cfg.gpu_experts = std::move(choice.gpu_experts);
+    } else {
+        for (const auto& layer : heat) choice.ranked_experts.push_back(layer.ranked_experts);
     }
 
     size_t expert_gpu = 0, expert_cpu = 0;
@@ -721,7 +781,7 @@ static size_t place_cuda_experts(CudaContext& ctx, LoadedModelRaw& raw, int over
               << " effective_budget_bytes=" << available << " shared_bytes=" << fixed
               << " expert_budget_bytes=" << expert_budget << " expert_gpu_bytes=" << expert_gpu
               << " expert_cpu_bytes=" << expert_cpu << " margin_bytes=" << expert_budget - expert_gpu << '\n';
-    constexpr const char* names[] = {"uniform", "prefix", "prefix_boundary"};
+    constexpr const char* names[] = {"uniform", "prefix", "prefix_boundary", "route_heat"};
     std::clog << "MoE placement gpu_resident_total=" << experts_gpu << " cpu_cold_total=" << experts_total - experts_gpu
               << " full_gpu_layers=" << full_layers << " full_gpu_prefix=" << full_prefix << " boundary_layer=" << boundary
               << " threads=" << ctx.cpu_workers().count() << " layout=" << (override_count < 0 ? names[choice.choice] : "explicit");
@@ -730,6 +790,7 @@ static size_t place_cuda_experts(CudaContext& ctx, LoadedModelRaw& raw, int over
         std::clog << " uniform_us=" << choice.candidate_us[0] << " prefix_us=" << choice.candidate_us[1]
                   << " prefix_boundary_us=" << choice.candidate_us[2] << " cpu_dispatch_us=" << dispatch_us
                   << " cpu_gbps=" << hw.cpu_q4_gemv_gbps << " gpu_gbps=" << hw.hbm_bw_gbps;
+        if (!heat.empty()) std::clog << " route_heat_us=" << choice.candidate_us[3];
     }
     std::clog << " gpu_experts=";
     for (size_t i = 0; i < raw.cfg.gpu_experts.size(); ++i) std::clog << (i ? "," : "") << raw.cfg.gpu_experts[i];
@@ -755,10 +816,13 @@ bool CudaModelWeights::load_gguf(CudaContext& ctx, const std::string& path, std:
     auto& weights = own_weights ? gguf_weights_ : ctx.weight_arena();
     if (!own_weights) settings.releasable_session_bytes += gguf_weights_.capacity();
     const bool resize = own_weights || weights.capacity() == 0 || owned_gguf_arena_ == &ctx;
+    raw.cfg.moe.route_profile = cfg_.moe.route_profile;
+    raw.cfg.moe.dynamic_cache = cfg_.moe.dynamic_cache;
     DType kv_dtype;
+    MoePlacement placement;
     const auto kv_budget = place_cuda_experts(ctx, raw, moe_gpu_experts_override_, settings.requested_kv_bytes,
         settings.commitment_tokens, settings.slots, kv_dtype, resize,
-        settings.releasable_session_bytes + (resize ? weights.capacity() : 0));
+        settings.releasable_session_bytes + (resize ? weights.capacity() : 0), placement);
     const size_t bytes = resize ? cuda_model_arena_bytes(raw, ctx.cost_hardware(), raw.cfg.gpu_experts) : 0;
     ctx.synchronize();
     hooks.release_sessions();
@@ -772,7 +836,8 @@ bool CudaModelWeights::load_gguf(CudaContext& ctx, const std::string& path, std:
     }
     if (!upload_raw_model_to_cuda(ctx, weights, raw, cfg_, tok_embeddings_, final_norm_w_, lm_head_w_, gemma_inputs_,
                                     hooks,
-                                    layer_kinds_, layer_indices_, dense_layers_, gdn_layers_, moe_layers_)) {
+                                    layer_kinds_, layer_indices_, dense_layers_, gdn_layers_, moe_layers_,
+                                    placement.ranked_experts)) {
         return false;
     }
     if (load_mtp_) {
@@ -790,7 +855,8 @@ bool CudaModelWeights::load_gguf(CudaContext& ctx, const std::string& path, std:
         ctx.synchronize();
     }
     rebuild_ir();
-    hooks.start_sessions(kv_dtype, resize && moe_gpu_experts_override_ < 0 && kv_budget ? moe_layers_.size() : 0);
+    const bool borrow = resize && moe_gpu_experts_override_ < 0 && kv_budget && !mapped_moe_slots(cfg_.moe);
+    hooks.start_sessions(kv_dtype, borrow ? moe_layers_.size() : 0);
     return true;
 }
 
@@ -804,10 +870,13 @@ bool CudaModelWeights::load_safetensors(CudaContext& ctx, const std::string& pat
     if (!parse_safetensors_model_raw(path, max_seq_override, raw, err)) return false;
     auto& weights = ctx.weight_arena();
     const bool resize = weights.capacity() == 0 || owned_gguf_arena_ == &ctx;
+    raw.cfg.moe.route_profile = cfg_.moe.route_profile;
+    raw.cfg.moe.dynamic_cache = cfg_.moe.dynamic_cache;
     DType kv_dtype;
+    MoePlacement placement;
     const auto kv_budget = place_cuda_experts(ctx, raw, moe_gpu_experts_override_, settings.requested_kv_bytes,
         settings.commitment_tokens, settings.slots, kv_dtype, resize,
-        settings.releasable_session_bytes + (resize ? weights.capacity() : 0));
+        settings.releasable_session_bytes + (resize ? weights.capacity() : 0), placement);
     const size_t bytes = resize ? cuda_model_arena_bytes(raw, ctx.cost_hardware(), raw.cfg.gpu_experts) : 0;
     ctx.synchronize();
     hooks.release_sessions();
@@ -820,11 +889,13 @@ bool CudaModelWeights::load_safetensors(CudaContext& ctx, const std::string& pat
     }
     if (!upload_raw_model_to_cuda(ctx, weights, raw, cfg_, tok_embeddings_, final_norm_w_, lm_head_w_, gemma_inputs_,
                                     hooks,
-                                    layer_kinds_, layer_indices_, dense_layers_, gdn_layers_, moe_layers_)) {
+                                    layer_kinds_, layer_indices_, dense_layers_, gdn_layers_, moe_layers_,
+                                    placement.ranked_experts)) {
         return false;
     }
     rebuild_ir();
-    hooks.start_sessions(kv_dtype, resize && moe_gpu_experts_override_ < 0 && kv_budget ? moe_layers_.size() : 0);
+    const bool borrow = resize && moe_gpu_experts_override_ < 0 && kv_budget && !mapped_moe_slots(cfg_.moe);
+    hooks.start_sessions(kv_dtype, borrow ? moe_layers_.size() : 0);
     return true;
 }
 
@@ -857,7 +928,7 @@ void CudaModelWeights::inspect_cuda(CudaContext& ctx, ModelMemory& result) const
     }
     for (const auto& l : moe_layers_) {
         count({&l.norm_w, &l.router_w, &l.router_bias, &l.gpu_gate_up_w, &l.gpu_up_w, &l.gpu_down_w,
-               &l.shared_gate_up_w, &l.shared_down_w});
+               &l.d_expert_to_slot, &l.shared_gate_up_w, &l.shared_down_w});
     }
 }
 

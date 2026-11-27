@@ -1,6 +1,7 @@
 #include "cuda_dispatch.h"
 #include "cuda_profile.h"
 #include "../core/cpu_moe.h"
+#include "../core/moe_residency.h"
 #include "../core/moe_route_trace.h"
 #include "fusionrt/weight_codec.h"
 
@@ -379,7 +380,7 @@ void CudaSparseMoELayer::forward_prefill_cuda(CudaContext& ctx, Tensor& x_in_out
                     x_norm.ptr<float>() + hidden_offset, topk_idx.ptr<int>() + route_offset, gate.ptr(), gate.dtype,
                     up.data ? up.ptr() : nullptr, up.dtype, down.ptr(), down.dtype, topk_w.ptr<float>() + route_offset,
                     out.ptr<float>() + hidden_offset, scratch_inter.ptr<float>(), H, I, K, count, stream, first,
-                    geglu, gate_scale.ptr<float>(), up_scale.ptr<float>());
+                    geglu, gate_scale.ptr<float>(), up_scale.ptr<float>(), d_expert_to_slot.ptr<int32_t>());
             }
         };
         if (base) run_hot(gpu_gate_up_w, gpu_up_w, gpu_down_w, moe_out, 0, base);
@@ -410,6 +411,15 @@ void CudaSparseMoELayer::forward_prefill_cuda(CudaContext& ctx, Tensor& x_in_out
         cuda_ops::add_residual_f32(moe_out.ptr<float>(), sh_down.ptr<float>(), moe_out.ptr<float>(), M * H, stream);
     }
 
+    bool admit = dynamic_cache && host_indices && M == 1 && base > 0 && gpu_E < E && MoeDecodeScope::active_for(&ctx);
+    if (admit) {
+        cudaStreamCaptureStatus capture;
+        FUSIONRT_CUDA_CHECK(cudaStreamIsCapturing(stream, &capture));
+        admit = capture == cudaStreamCaptureStatusNone;
+    }
+    const auto* mapping = expert_to_slot.empty() ? nullptr : expert_to_slot.data();
+    const auto weight_bytes = admit ? (gpu_gate_up_w.nbytes() + (gpu_up_w.data ? gpu_up_w.nbytes() : 0) +
+                                        gpu_down_w.nbytes()) / base : 0;
     if (host_x) {
         using Clock = std::chrono::steady_clock;
         if (timing) ctx.moe_timing->begin_gap(*timing, stream);
@@ -417,12 +427,17 @@ void CudaSparseMoELayer::forward_prefill_cuda(CudaContext& ctx, Tensor& x_in_out
         // The event covers only the inputs. Hot and shared experts can run while the CPU works.
         FUSIONRT_CUDA_CHECK(cudaEventSynchronize(ctx.moe_input_ready()));
         if (route_pos >= 0) ctx.moe_route_trace->record(model_layer_index, route_pos, M, K, host_indices);
-        const auto compute_start = timing ? Clock::now() : Clock::time_point{};
+        const bool calibrate = admit && ctx.cost_hardware().cpu_q4_gemv_gbps <= 0.0 && measured_cpu_gbps <= 0.0;
+        const auto compute_start = timing || calibrate ? Clock::now() : Clock::time_point{};
         const int cold = cpu_moe_accumulate_layer(&ctx.cpu_workers(), ctx.cpu_moe_workspace(), cpu_gate_up_w,
-            cpu_up_w, cpu_down_w, host_indices, host_weights, gpu_E, base, M, K, host_x, host_out,
+            cpu_up_w, cpu_down_w, host_indices, host_weights, gpu_E, mapping ? 0 : base, M, K, host_x, host_out,
             ctx.cpu_moe_q8() ? CpuMoeMode::Parallel : CpuMoeMode::ParallelF32, geglu,
             cpu_gate_scale.bytes().empty() ? nullptr : cpu_gate_scale.data<float>(),
-            cpu_up_scale.bytes().empty() ? nullptr : cpu_up_scale.data<float>());
+            cpu_up_scale.bytes().empty() ? nullptr : cpu_up_scale.data<float>(), mapping);
+        if (calibrate && cold > 0) {
+            const double elapsed_ns = std::chrono::duration<double, std::nano>(Clock::now() - compute_start).count();
+            if (elapsed_ns > 0.0) measured_cpu_gbps = cold * weight_bytes / elapsed_ns;
+        }
         if (timing) {
             ctx.moe_timing->end_gap(*timing, stream);
             timing->hot += M * K - cold;
@@ -441,6 +456,30 @@ void CudaSparseMoELayer::forward_prefill_cuda(CudaContext& ctx, Tensor& x_in_out
                                             cudaMemcpyDeviceToDevice, stream));
     else
         cuda_ops::add_residual_f32(x_in_out.ptr<float>(), moe_out.ptr<float>(), x_in_out.ptr<float>(), M * H, stream);
+
+    if (admit) {
+        auto hw = ctx.cost_hardware();
+        if (hw.pcie_h2d_gbps <= 0.0) hw.pcie_h2d_gbps = measured_h2d_gbps;
+        if (hw.cpu_q4_gemv_gbps <= 0.0) hw.cpu_q4_gemv_gbps = measured_cpu_gbps;
+        const auto move = dynamic_cache->observe({host_indices, static_cast<size_t>(K)}, expert_to_slot,
+                                                  hw, weight_bytes, gpu_up_w.data ? 3 : 2);
+        if (move) {
+            auto upload = [&](const HostTensor& source, const Tensor& dest) {
+                if (!dest.data) return;
+                const auto bytes = source.bytes();
+                const size_t unit = bytes.size() / E;
+                FUSIONRT_CUDA_CHECK(cudaMemcpyAsync(dest.ptr<uint8_t>() + unit * move->slot,
+                    bytes.data() + unit * move->expert, unit, cudaMemcpyHostToDevice, stream));
+            };
+            // The current token's hot kernels precede the overwrite on this same stream.
+            upload(cpu_gate_up_w, gpu_gate_up_w);
+            upload(cpu_up_w, gpu_up_w);
+            upload(cpu_down_w, gpu_down_w);
+            dynamic_cache->commit(*move, expert_to_slot, weight_bytes);
+            FUSIONRT_CUDA_CHECK(cudaMemcpyAsync(d_expert_to_slot.ptr(), expert_to_slot.data(),
+                d_expert_to_slot.nbytes(), cudaMemcpyHostToDevice, stream));
+        }
+    }
 }
 
 

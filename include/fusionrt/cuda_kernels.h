@@ -337,7 +337,8 @@ void moe_indexed_swiglu_gemv(
     const float* x, const int* topk_idx, const void* gate_w, DType gate_type,
     const void* up_w, DType up_type, const void* down_w, DType down_type,
     const float* topk_weight, float* out, float* scratch_inter,
-    int hidden, int inter, int top_k, int resident, cudaStream_t stream, int first_expert = 0, bool geglu = false, const float* gate_scale = nullptr, const float* up_scale = nullptr);
+    int hidden, int inter, int top_k, int resident, cudaStream_t stream, int first_expert = 0, bool geglu = false,
+    const float* gate_scale = nullptr, const float* up_scale = nullptr, const int32_t* expert_to_slot = nullptr);
 
 inline void moe_indexed_swiglu_gemv_f32(
     const float* x, const int* topk_idx, const float* gate_up_w, const float* down_w,

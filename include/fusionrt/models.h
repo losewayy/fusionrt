@@ -29,6 +29,7 @@ struct GenerationOptions {
     std::span<const InputEmbedding> inputs_embeds;
     bool warn_on_graph_fallback = false;
     const std::atomic_bool* cancel = nullptr;
+    bool auto_draft_tokens = false;  // Native MTP calibrates up to draft_tokens. Zero uses the full supported range.
 };
 
 class FusionModel {

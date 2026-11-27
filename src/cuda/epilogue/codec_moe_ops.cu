@@ -327,7 +327,7 @@ __device__ float moe_warp_dot(const float* x, const void* w, DType type, int row
     }
 }
 
-template<bool CodecWeights, bool ExpertOps>
+template<bool CodecWeights, bool ExpertOps, bool MappedSlots>
 __global__ void k_moe_indexed_gate_up_swiglu(
     const float* __restrict__ x,
     const int* __restrict__ topk_idx,
@@ -335,7 +335,7 @@ __global__ void k_moe_indexed_gate_up_swiglu(
     const void* up_w, DType up_type,
     float* __restrict__ scratch_inter,
     int hidden, int inter, int top_k, int resident, int first_expert,
-    bool geglu, const float* gate_scale, const float* up_scale)
+    bool geglu, const float* gate_scale, const float* up_scale, const int32_t* expert_to_slot)
 {
     int wid = (blockIdx.x * blockDim.x + threadIdx.x) >> 5;
     int lane = threadIdx.x & 31;
@@ -344,7 +344,9 @@ __global__ void k_moe_indexed_gate_up_swiglu(
 
     int k_slot = wid / inter;
     int c = wid % inter;
-    int e = topk_idx[k_slot] - first_expert;
+    const int eid = topk_idx[k_slot];
+    if constexpr (MappedSlots) { if (eid < 0) return; }
+    const int e = (MappedSlots ? expert_to_slot[eid] : eid) - first_expert;
     if (e < 0 || e >= resident) return;
     const int gate_row = (up_w ? e : 2 * e) * inter + c;
     const float g_acc = moe_warp_dot<CodecWeights>(x, gate_w, gate_type, gate_row, hidden);
@@ -353,22 +355,22 @@ __global__ void k_moe_indexed_gate_up_swiglu(
     if (lane == 0) {
         float gate = g_acc, up = u_acc;
         if constexpr (ExpertOps) {
-            if (gate_scale) gate *= gate_scale[e + first_expert];
-            if (up_scale) up *= up_scale[e + first_expert];
+            if (gate_scale) gate *= gate_scale[eid];
+            if (up_scale) up *= up_scale[eid];
         }
         scratch_inter[k_slot * inter + c] = ExpertOps && geglu ?
             gated_activation<true>(gate, up) : gated_activation<false>(gate, up);
     }
 }
 
-template<bool CodecWeights>
+template<bool CodecWeights, bool MappedSlots>
 __global__ void k_moe_indexed_down_combine(
     const float* __restrict__ scratch_inter,
     const int* __restrict__ topk_idx,
     const void* __restrict__ down_w, DType down_type,
     const float* __restrict__ topk_weight,
     float* __restrict__ out,
-    int hidden, int inter, int top_k, int resident, int first_expert)
+    int hidden, int inter, int top_k, int resident, int first_expert, const int32_t* expert_to_slot)
 {
     int wid = (blockIdx.x * blockDim.x + threadIdx.x) >> 5;
     int lane = threadIdx.x & 31;
@@ -376,7 +378,9 @@ __global__ void k_moe_indexed_down_combine(
 
     float total = 0.0f;
     for (int k_slot = 0; k_slot < top_k; ++k_slot) {
-        int e = topk_idx[k_slot] - first_expert;
+        const int eid = topk_idx[k_slot];
+        if constexpr (MappedSlots) { if (eid < 0) continue; }
+        const int e = (MappedSlots ? expert_to_slot[eid] : eid) - first_expert;
         if (e < 0 || e >= resident) continue;
         total += moe_warp_dot<CodecWeights>(scratch_inter + k_slot * inter, down_w, down_type,
                               e * hidden + wid, inter) * topk_weight[k_slot];
@@ -679,33 +683,37 @@ void moe_indexed_swiglu_gemv(
     const void* up_w, DType up_type, const void* down_w, DType down_type,
     const float* topk_weight, float* out, float* scratch_inter,
     int hidden, int inter, int top_k, int resident, cudaStream_t stream, int first_expert,
-    bool geglu, const float* gate_scale, const float* up_scale)
+    bool geglu, const float* gate_scale, const float* up_scale, const int32_t* expert_to_slot)
 {
     constexpr int WARPS = 8;
     int total_up_rows = top_k * inter;
     int up_blocks = (total_up_rows + WARPS - 1) / WARPS;
-    auto gate_up = [&]<bool CodecWeights, bool ExpertOps>() {
-        k_moe_indexed_gate_up_swiglu<CodecWeights, ExpertOps><<<up_blocks, WARPS * 32, 0, stream>>>(
-            x, topk_idx, gate_w, gate_type, up_w, up_type, scratch_inter, hidden, inter, top_k, resident,
-            first_expert, geglu, gate_scale, up_scale);
+    auto run = [&]<bool MappedSlots>() {
+        auto gate_up = [&]<bool CodecWeights, bool ExpertOps>() {
+            k_moe_indexed_gate_up_swiglu<CodecWeights, ExpertOps, MappedSlots><<<up_blocks, WARPS * 32, 0, stream>>>(
+                x, topk_idx, gate_w, gate_type, up_w, up_type, scratch_inter, hidden, inter, top_k, resident,
+                first_expert, geglu, gate_scale, up_scale, expert_to_slot);
+        };
+        const bool codec = is_weight_codec_dtype(gate_type) || (up_w && is_weight_codec_dtype(up_type));
+        const bool transforms = geglu || gate_scale || up_scale;
+        if (codec) {
+            if (transforms) gate_up.template operator()<true, true>();
+            else gate_up.template operator()<true, false>();
+        } else {
+            if (transforms) gate_up.template operator()<false, true>();
+            else gate_up.template operator()<false, false>();
+        }
+        const int down_blocks = (hidden + WARPS - 1) / WARPS;
+        auto down = [&]<bool CodecWeights>() {
+            k_moe_indexed_down_combine<CodecWeights, MappedSlots><<<down_blocks, WARPS * 32, 0, stream>>>(
+                scratch_inter, topk_idx, down_w, down_type, topk_weight, out, hidden, inter, top_k, resident,
+                first_expert, expert_to_slot);
+        };
+        if (is_weight_codec_dtype(down_type)) down.template operator()<true>();
+        else down.template operator()<false>();
     };
-    const bool codec = is_weight_codec_dtype(gate_type) || (up_w && is_weight_codec_dtype(up_type));
-    const bool transforms = geglu || gate_scale || up_scale;
-    if (codec) {
-        if (transforms) gate_up.template operator()<true, true>();
-        else gate_up.template operator()<true, false>();
-    } else {
-        if (transforms) gate_up.template operator()<false, true>();
-        else gate_up.template operator()<false, false>();
-    }
-
-    const int down_blocks = (hidden + WARPS - 1) / WARPS;
-    auto down = [&]<bool CodecWeights>() {
-        k_moe_indexed_down_combine<CodecWeights><<<down_blocks, WARPS * 32, 0, stream>>>(
-            scratch_inter, topk_idx, down_w, down_type, topk_weight, out, hidden, inter, top_k, resident, first_expert);
-    };
-    if (is_weight_codec_dtype(down_type)) down.template operator()<true>();
-    else down.template operator()<false>();
+    if (expert_to_slot) run.template operator()<true>();
+    else run.template operator()<false>();
 }
 
 void codec_gemv_f32(const float* x, const void* weight, DType dtype, float* out,

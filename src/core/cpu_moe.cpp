@@ -520,12 +520,12 @@ void cpu_moe_quantize_q8(const float* input, CpuQ8K* output, int cols) {
     }
 }
 
-template<bool ExpertOps>
+template<bool ExpertOps, bool MappedSlots>
 static int accumulate_layer(CpuWorkers* workers, CpuMoeWorkspace& scratch,
     const HostTensor& gate, const HostTensor& up, const HostTensor& down,
     const int32_t* indices, const float* weights, int first_cold, int host_first, int rows, int top_k,
     const float* input, float* output, CpuMoeMode mode, bool geglu, const float* gate_scale,
-    const float* up_scale) {
+    const float* up_scale, const int32_t* expert_to_slot) {
     auto activate = [&](float g, float u, int route) {
         if constexpr (ExpertOps) {
             const int expert = indices[route];
@@ -550,8 +550,10 @@ static int accumulate_layer(CpuWorkers* workers, CpuMoeWorkspace& scratch,
         for (int k = 0; k < top_k; ++k) {
             const int route = row * top_k + k;
             const int id = indices[route];
-            if (id < 0 || id < first_cold || id < host_first ||
-                static_cast<int64_t>(id) - host_first >= down.desc.shape[0]) continue;
+            if (id < host_first || static_cast<int64_t>(id) - host_first >= down.desc.shape[0]) continue;
+            if constexpr (MappedSlots) {
+                if (expert_to_slot[id] >= 0) continue;
+            } else if (id < first_cold) continue;
             const size_t expert = static_cast<size_t>(id - host_first);
             const size_t first = expert * inter;
             const auto* g = gate.bytes().data() + first * (packed ? 2 : 1) * gate_stride;
@@ -756,12 +758,16 @@ static int accumulate_layer(CpuWorkers* workers, CpuMoeWorkspace& scratch,
 int cpu_moe_accumulate_layer(CpuWorkers* workers, CpuMoeWorkspace& scratch,
     const HostTensor& gate, const HostTensor& up, const HostTensor& down,
     const int32_t* indices, const float* weights, int first_cold, int host_first, int rows, int top_k,
-    const float* input, float* output, CpuMoeMode mode, bool geglu, const float* gate_scale, const float* up_scale) {
-    if (geglu || gate_scale || up_scale)
-        return accumulate_layer<true>(workers, scratch, gate, up, down, indices, weights, first_cold, host_first,
-                                      rows, top_k, input, output, mode, geglu, gate_scale, up_scale);
-    return accumulate_layer<false>(workers, scratch, gate, up, down, indices, weights, first_cold, host_first,
-                                   rows, top_k, input, output, mode, false, nullptr, nullptr);
+    const float* input, float* output, CpuMoeMode mode, bool geglu, const float* gate_scale, const float* up_scale,
+    const int32_t* expert_to_slot) {
+    auto run = [&]<bool MappedSlots>() {
+        if (geglu || gate_scale || up_scale)
+            return accumulate_layer<true, MappedSlots>(workers, scratch, gate, up, down, indices, weights, first_cold,
+                host_first, rows, top_k, input, output, mode, geglu, gate_scale, up_scale, expert_to_slot);
+        return accumulate_layer<false, MappedSlots>(workers, scratch, gate, up, down, indices, weights, first_cold,
+            host_first, rows, top_k, input, output, mode, false, nullptr, nullptr, expert_to_slot);
+    };
+    return expert_to_slot ? run.template operator()<true>() : run.template operator()<false>();
 }
 
 void cpu_moe_accumulate(const HostTensor& gate, const HostTensor& up, const HostTensor& down,

@@ -1,4 +1,5 @@
 #include "test_support.h"
+#include "test_moe_residency.h"
 
 namespace fusionrt::test {
 
@@ -267,6 +268,26 @@ void test_cuda_frontier(CudaContext& ctx) {
                 if (ids != expected) throw std::runtime_error("Frontier MoE greedy ID parity");
             }
         }
+        const MoeProfileFixture profile;
+        {
+            std::ofstream out(profile.path);
+            for (int l = 0; l < f.trunk; ++l)
+                out << "{\"layer\":" << l << ",\"phase\":\"decode\",\"experts\":[" << f.experts - 1 << "]}\n";
+        }
+        HybridModelConfig ranked;
+        ranked.moe.route_profile = profile.path;
+        for (const int resident : {2, f.experts}) {
+            FusionModel model(ranked);
+            model.set_moe_gpu_experts(resident);
+            std::string error;
+            if (!model.load_gguf(ctx, f.path, &error, 64, true)) throw std::runtime_error(error);
+            const auto& layer = model.moe_layers().front();
+            if (layer.expert_to_slot.back() != 0 || layer.d_expert_to_slot.nbytes() != f.experts * sizeof(int32_t) ||
+                (resident < f.experts && !layer.cpu_gate_up_w.storage.empty()))
+                throw std::runtime_error("Route profile must upload ranked slots from mapped weights");
+            if (model.generate_cuda(ctx, prompt, 8, true, true) != expected)
+                throw std::runtime_error("Ranked MoE GGUF placement must preserve exact greedy IDs");
+        }
 #ifdef FUSIONRT_ENABLE_VULKAN
         if (!gemma && !VkContext::enumerate_devices().empty()) {
             VkContext vk(0, 2, 8);
@@ -306,6 +327,11 @@ void test_cuda_frontier(CudaContext& ctx) {
         throw std::runtime_error("Native MTP confidence cutoff must fall back to exact single-row verification");
     std::cout << "  [PASS] Native MTP cutoff, graph verification and KV reuse preserve exact greedy IDs\n";
     mtp.spec_p_min = 0.f;
+    auto adaptive = mtp;
+    adaptive.draft_tokens = 0;
+    if (model.generate_cuda(ctx, prompt, 16, true, true, &stats, false, 0, -1, adaptive) != normal ||
+        stats.spec_proposed == 0)
+        throw std::runtime_error("Adaptive native MTP must preserve exact greedy IDs and explore a draft");
 
     ServeSpeculation serve;
     serve.mtp = true;
@@ -344,6 +370,52 @@ void test_cuda_frontier(CudaContext& ctx) {
         throw std::runtime_error("Native MTP rollback after rejected drafts");
     std::cout << "  [PASS] Qwen native MTP rejected drafts preserve the target IDs, accepted "
               << stats.spec_accepted << '/' << stats.spec_proposed << '\n';
+
+    model.set_num_slots(2);
+    // The fixture's context fits one page. Give each branch room for its private COW page.
+    model.set_kv_vram_budget_bytes(2 * model.cuda_cache_memory().kv_bytes);
+    FusionModel cold(HybridModelConfig{});
+    cold.enable_native_mtp(true);
+    if (!cold.load_gguf(ctx, f.path, &error, 64, true)) throw std::runtime_error(error);
+    auto warm = mtp;
+    warm.reuse_prefix = true;
+    auto turn = [&](const char* scenario, const std::vector<int32_t>& input, int expected_prefill) {
+        const auto expected = cold.generate_cuda(ctx, input, 8, true, true, nullptr, false, 0, -1, mtp);
+        const auto result = model.generate_cuda(ctx, input, 8, true, true, &stats, false, 0, -1, warm);
+        const std::string label = std::string("Native MTP ") + scenario;
+        if (result != expected) throw std::runtime_error(label + " changed the greedy IDs");
+        if (stats.prefilled_tokens != expected_prefill)
+            throw std::runtime_error(label + " prefilled " + std::to_string(stats.prefilled_tokens) +
+                                     " of " + std::to_string(input.size()) + " tokens, expected " +
+                                     std::to_string(expected_prefill));
+        if (stats.spec_proposed == 0 || stats.spec_accepted == stats.spec_proposed)
+            throw std::runtime_error(label + " did not exercise rejection rollback");
+        return result;
+    };
+    auto first = turn("initial fill", prompt, static_cast<int>(prompt.size()));
+    auto branch_prompt = prompt;
+    branch_prompt.push_back((first[prompt.size()] + 1) % f.vocab);
+    auto branch = turn("COW fork", branch_prompt, 1);
+    if (model.cuda_cache_memory().kv_pages != 2)
+        throw std::runtime_error("Native MTP COW fork must retain the source slot and its private KV page");
+    first.push_back(6);
+    (void)turn("source slot resume", first, 2);
+    branch.push_back(7);
+    auto resumed = turn("forked slot resume", branch, 2);
+    resumed.pop_back();
+    auto text = warm;
+    text.spec_mtp = false;
+    resumed.push_back(8);
+    (void)model.generate_cuda(ctx, resumed, 0, true, false, &stats, false, 0, -1, text);
+    if (stats.prefilled_tokens != 1) throw std::runtime_error("Target-only continuation must reuse its live prefix");
+    resumed.push_back(9);
+    (void)turn("target-only suffix clamp", resumed, 2);
+
+    model.set_num_slots(1);
+    model.reset_kv_and_state(ctx);
+    (void)model.generate_cuda(ctx, prompt, 0, true, false, nullptr, false, 0, -1, text);
+    (void)turn("target-only prefix", branch_prompt, static_cast<int>(branch_prompt.size()));
+    std::cout << "  [PASS] Native MTP prefix reuse through a COW fork, slot switching and target-only turns\n";
 }
 #endif
 
@@ -373,6 +445,9 @@ void test_moe_autofit() {
         select_moe_kv_precision(costs, 20 * unit, 7 * unit, 5 * unit, 3 * unit, hw, 50).dtype != DType::F16)
         throw std::runtime_error("Auto KV precision requires spill and strictly improved expert placement");
     std::cout << "  [PASS] Per-layer MoE auto-fit budget and candidate scores\n";
+    test_decode_heat_placement(hw);
+    test_moe_admission();
+    test_cpu_moe_slot_parity();
 }
 
 void test_gdn_loader_shapes() {
@@ -587,6 +662,7 @@ void test_cuda_gemma4_gguf() {
 #ifdef FUSIONRT_ENABLE_CUDA
 void test_cuda_graph_and_moe_offload(CudaContext& ctx) {
     std::cout << "[5/7] Testing CUDA Graph full-decode parity & Sparse MoE CPU-offload parity...\n";
+    test_cuda_moe_slot_swap(ctx);
     // 5a. Hybrid 3:1 CUDA Graph vs Eager parity
     {
         HybridModelConfig cfg;

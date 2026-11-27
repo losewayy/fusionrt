@@ -77,6 +77,8 @@ struct MoEConfig {
     bool has_shared_expert = true;
     int shared_intermediate_size = 512;
     DType weight_dtype = DType::F32;
+    std::string route_profile;
+    bool dynamic_cache = false;
 };
 
 struct HybridModelConfig {
@@ -226,6 +228,8 @@ struct CudaGdnState {
     Tensor convolution, recurrence;
 };
 
+class MoeDynamicCache;
+
 struct CudaSparseMoELayer {
     MoEConfig cfg;
     int model_layer_index = -1;
@@ -239,6 +243,11 @@ struct CudaSparseMoELayer {
     Tensor gpu_up_w;              // Separate up projection for unpacked gate/up weights.
     Tensor gpu_down_w;            // [gpu_resident_experts, hidden, inter]
     Tensor borrowed_gate_up_w, borrowed_up_w, borrowed_down_w;
+    mutable std::vector<int32_t> expert_to_slot;
+    Tensor d_expert_to_slot;
+    std::shared_ptr<MoeDynamicCache> dynamic_cache;
+    double measured_h2d_gbps = 0.0;
+    mutable double measured_cpu_gbps = 0.0;
     HostTensor cpu_gate_up_w;     // [offloaded, (2*)inter, hidden]
     HostTensor cpu_up_w;
     HostTensor cpu_down_w;        // [offloaded, hidden, inter]

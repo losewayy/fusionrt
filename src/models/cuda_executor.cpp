@@ -1,6 +1,7 @@
 #include "cuda_executor.h"
 #include "cuda_ir.h"
 #include "cuda_profile.h"
+#include "../core/moe_residency.h"
 #include "../core/moe_route_trace.h"
 
 #ifdef FUSIONRT_ENABLE_CUDA
@@ -316,7 +317,7 @@ void CudaExecutor::execute_prefill_chunks(CudaContext& ctx, const int32_t* token
         if (cancel) ctx.synchronize();
         begin += rows;
         if (position + rows == checkpoint && checkpoint < end) {
-            sessions_.save_cuda_checkpoint(ctx, checkpoint, nullptr);
+            save_prefix_checkpoint(ctx, checkpoint, nullptr);
             checkpoint += kKvPageTokens;
         }
         if (pa.enabled) {
@@ -338,6 +339,49 @@ std::vector<float> CudaExecutor::prefill_cuda_impl(CudaContext& ctx, const int32
                            save_prefix_checkpoints, inputs_embeds, cancel);
     HostTensor logits = ctx.download(work_.logits);
     return {logits.data<float>(), logits.data<float>() + weights_.config().vocab_size};
+}
+
+void CudaExecutor::save_prefix_checkpoint(CudaContext& ctx, int tokens, const Tensor* logits) {
+    const auto hidden = capture_mtp_hidden_ ? mtp_target_hidden_.slice_dim0(tokens - 1, 1) : Tensor{};
+    sessions_.save_cuda_checkpoint(ctx, tokens, logits, hidden);
+}
+
+std::vector<float> CudaExecutor::prefill_cached(CudaContext& ctx, const std::vector<int32_t>& prompt,
+                                               bool fused, int* prefilled_tokens, LayerTrace* trace,
+                                               OpTrace* op_trace, const std::atomic_bool* cancel) {
+    const int length = static_cast<int>(prompt.size());
+    try {
+        auto [prefix, checkpoint_pages] = sessions_.prepare_prefix(ctx, prompt, fused, !trace && !op_trace,
+            work_.logits, capture_mtp_hidden_ ? &mtp_target_hidden_ : nullptr);
+        if (prefix > 0 && capture_mtp_hidden_) {
+            try {
+                ensure_kv(ctx, prefix, length);
+            } catch (const KvVramExhausted&) {
+                sessions_.reset_kv_and_state(ctx);
+                prefix = 0;
+            }
+        }
+        std::vector<float> logits;
+        if (prefix == length) {
+            if (!capture_mtp_hidden_) ensure_kv(ctx, length, length);
+            auto saved_logits = ctx.download(work_.logits);
+            logits.assign(saved_logits.data<float>(), saved_logits.data<float>() + weights_.config().vocab_size);
+        } else {
+            const bool measure_prefill = capture_mtp_hidden_ && prefix == 0;
+            const auto start = measure_prefill ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+            logits = prefill_cuda_impl(ctx, prompt.data() + prefix, length - prefix, prefix, fused,
+                                       trace, op_trace, checkpoint_pages, {}, cancel);
+            if (measure_prefill) sessions_.observe_prefix_prefill(length, std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - start).count());
+            save_prefix_checkpoint(ctx, length, &work_.logits);
+        }
+        sessions_.retain_tokens(prompt, fused);
+        if (prefilled_tokens) *prefilled_tokens = length - prefix;
+        return logits;
+    } catch (...) {
+        sessions_.clear_cuda_history();
+        throw;
+    }
 }
 
 // Graphs are request-local. The device position, page-table addresses and scratch
@@ -517,6 +561,7 @@ bool CudaExecutor::decode(CudaContext& ctx, Decode& r, int pos, bool graph, bool
                           const int32_t* token, bool ensure) {
     if (ensure) ensure_kv(ctx, pos, pos + 1);
     if (token) set_token(ctx, token);
+    const MoeDecodeScope moe_decode(&ctx);
     return run_forward_token_step_cuda(ctx, weights_.config(), weights_.embeddings(), r.ir, r.ws,
         work_.hidden, work_.logits, work_.token_ids, work_.position, work_.kv_length, work_.invalid_token.ptr<int>(),
         weights_.dense_layers(), weights_.gdn_layers(), sessions_.kv(), sessions_.gdn(), weights_.moe_layers(),
@@ -708,6 +753,7 @@ void CudaExecutor::bench_decode(CudaContext& ctx, Bench& b, int pos, bool graph)
     FUSIONRT_CUDA_CHECK(cudaMemcpyAsync(b.args.ptr(), b.host_args, b.args.nbytes(), cudaMemcpyHostToDevice, ctx.stream()));
     const int H = static_cast<int>(weights_.embeddings().shape[1]);
     embed_tokens(ctx, weights_.embeddings(), b.args, work_.hidden, 1, H, weights_.config().embed_scale);
+    const MoeDecodeScope moe_decode(&ctx);
     execute_ir_graph_cuda(weights_.fused_ir(), b.ws, ctx, work_.hidden, b.args, work_.logits, 1, pos, pos,
         graph ? b.args.ptr<int32_t>() + 1 : nullptr, graph ? b.args.ptr<int32_t>() + 2 : nullptr,
         weights_.dense_layers(), weights_.gdn_layers(), sessions_.kv(), sessions_.gdn(), weights_.moe_layers(), true);

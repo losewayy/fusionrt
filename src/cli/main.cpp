@@ -10,6 +10,7 @@
 #ifdef FUSIONRT_ENABLE_CUDA
 #include "fusionrt/cuda_backend.h"
 #include "../core/moe_route_trace.h"
+#include "../core/moe_residency.h"
 #endif
 #ifdef FUSIONRT_ENABLE_VULKAN
 #include "fusionrt/vulkan_backend.h"
@@ -39,7 +40,8 @@ void print_usage(std::string_view command = {}) {
     const auto show = [&](std::string_view name) { return command.empty() || command == name; };
     const auto sampling = "  [--temp N] [--top-k N] [--top-p N] [--min-p N] [--repeat-penalty N] [--seed N]\n";
     const auto placement = "  CUDA: [--kv-dtype auto|f32|f16|q8_0] [--profile FILE] [--threads N] [--cpu-affinity spread]\n"
-                           "  CUDA: [--kv-vram-mb MiB] [--host-kv-mb MiB] [--moe-gpu-experts N]\n";
+                           "  CUDA: [--kv-vram-mb MiB] [--host-kv-mb MiB] [--moe-gpu-experts N]\n"
+                           "  CUDA: [--moe-route-profile FILE] [--moe-dynamic-cache]\n";
     const auto speculative = "  CUDA: [--spec-ngram K | --draft-model GGUF | --spec-mtp] [--draft-tokens N] [--spec-p-min N]\n";
     if (command.empty()) std::cout << "fusionrt " << FUSIONRT_VERSION
         << "\nUsage: fusionrt <info|run|chat|serve|inspect|bench-model|bench> [options]\n"
@@ -112,9 +114,27 @@ struct CudaPlacementOptions {
     static constexpr size_t mib = 1024 * 1024;
     size_t vram = 0, host = 0;
     int experts = -1, threads = 0;
-    bool specified = false, spread_affinity = false;
+    bool specified = false, spread_affinity = false, dynamic_cache = false;
+    std::string route_profile;
+
+    bool parse_flag(std::string_view option) {
+        if (option != "--moe-dynamic-cache") return false;
+        return specified = dynamic_cache = true;
+    }
+
+    HybridModelConfig configure(HybridModelConfig config = {}) const {
+        config.moe.route_profile = route_profile;
+        config.moe.dynamic_cache = dynamic_cache;
+        return config;
+    }
 
     bool parse(std::string_view option, std::string_view value) {
+        if (option == "--moe-route-profile") {
+            if (value.empty() || value.starts_with("--")) throw std::invalid_argument("Expected a file for --moe-route-profile");
+            route_profile = value;
+            specified = true;
+            return true;
+        }
         if (option == "--cpu-affinity") {
             if (value != "spread" && value != "none") throw std::invalid_argument("Expected spread or none for --cpu-affinity");
             spread_affinity = value == "spread";
@@ -320,6 +340,7 @@ int cmd_daily(const std::string& cmd, int argc, char** argv) {
     cli::SpeculativeArgs speculative;
     for (int i = 2; i < argc; ++i) {
         const std::string arg = argv[i];
+        if (placement.parse_flag(arg)) continue;
         if (arg == "--graph" || arg == "--no-graph") {
             if (cmd == "inspect") throw std::invalid_argument("inspect does not accept " + arg);
             graph = arg == "--graph";
@@ -476,7 +497,7 @@ int cmd_daily(const std::string& cmd, int argc, char** argv) {
 #else
     CudaContext ctx(0, 0, 256);
     ctx.set_kv_dtype(kv_dtype);
-    FusionModel model(HybridModelConfig{});
+    FusionModel model(placement.configure());
     model.set_num_slots(slots);
     placement.apply(ctx, model);
     model.enable_native_mtp(speculative.mtp);
@@ -548,6 +569,7 @@ int cmd_bench_model(int argc, char** argv) {
     };
     for (int i = 2; i < argc; ++i) {
         std::string a = argv[i];
+        if (placement.parse_flag(a)) continue;
         if (a == "--graph" || a == "--no-graph") graph_option = a == "--graph";
         else if (a == "--profile" && i + 1 < argc) profile = argv[++i];
         else if (a == "--profile-ops" && i + 1 < argc) profile_ops = argv[++i];
@@ -570,7 +592,7 @@ int cmd_bench_model(int argc, char** argv) {
     }
     CudaContext ctx(0, 0, 256);
     ctx.set_kv_dtype(kv_dtype);
-    FusionModel model(HybridModelConfig{});
+    FusionModel model(placement.configure());
     placement.apply(ctx, model);
     ctx.set_prefill_batch(ubatch);
     const auto load_start = std::chrono::steady_clock::now();
@@ -639,6 +661,7 @@ int cmd_run(int argc, char** argv) {
 
     for (int i = 2; i < argc; ++i) {
         std::string a = argv[i];
+        if (placement.parse_flag(a)) continue;
         if (a == "--arch" && i + 1 < argc) arch = argv[++i];
         else if (a == "--dtype" && i + 1 < argc) dtype_s = argv[++i];
         else if (a == "--backend" && i + 1 < argc) backend_s = argv[++i];
@@ -711,7 +734,7 @@ int cmd_run(int argc, char** argv) {
     cfg.gdn.weight_dtype = wdt;
     cfg.moe.weight_dtype = wdt;
 
-    FusionModel model(cfg);
+    FusionModel model(placement.configure(cfg));
     BpeTokenizer tok;
     if (model_path.empty()) tok.init_byte_fallback(cfg.vocab_size);
 
@@ -883,13 +906,17 @@ int cmd_run(int argc, char** argv) {
         if (constraint) (void)JsonValue::parse(output_text);
         std::cout << "output_text: " << output_text << "\n";
         if (trace_moe) {
-            size_t index = 0;
-            for (const auto& layer : moe_timing.layers()) {
-                if (layer.hot || layer.cold)
-                    std::cout << "moe_layer=" << index << " hot=" << layer.hot << " cold=" << layer.cold
-                              << " d2h_wait_ms=" << layer.input_wait_ms << " cpu_ms=" << layer.cpu_ms
-                              << " exposed_gpu_gap_ms=" << layer.gpu_gap_ms << '\n';
-                ++index;
+            const auto& layers = model.moe_layers();
+            for (size_t i = 0; i < layers.size(); ++i) {
+                const auto& layer = moe_timing.layers()[i];
+                const auto& cache = layers[i].dynamic_cache;
+                if (layer.hot || layer.cold || cache) {
+                    std::cout << "moe_layer=" << layers[i].model_layer_index << " hot=" << layer.hot
+                              << " cold=" << layer.cold << " d2h_wait_ms=" << layer.input_wait_ms
+                              << " cpu_ms=" << layer.cpu_ms << " exposed_gpu_gap_ms=" << layer.gpu_gap_ms;
+                    if (cache) std::cout << " cache_moves=" << cache->moves() << " cache_move_bytes=" << cache->moved_bytes();
+                    std::cout << '\n';
+                }
             }
         }
         return 0;

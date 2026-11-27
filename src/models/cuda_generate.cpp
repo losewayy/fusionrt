@@ -1,6 +1,7 @@
 #include "fusionrt/models.h"
 #include "cuda_executor.h"
 #include "../core/moe_route_trace.h"
+#include "../core/spec_cost.h"
 
 #ifdef FUSIONRT_ENABLE_CUDA
 #include <algorithm>
@@ -20,23 +21,7 @@ std::vector<float> FusionModel::prefill_cached_cuda(CudaContext& ctx, const std:
     if (prompt.size() > static_cast<size_t>(cfg_.dense.max_seq_len))
         throw prompt_context_error(prompt.size(), cfg_.dense.max_seq_len);
     validate_token_ids(prompt, 0, cfg_.vocab_size);
-    const int length = static_cast<int>(prompt.size());
-
-    const auto [prefix, checkpoint_pages] =
-        sessions_->prepare_prefix(ctx, prompt, use_fused, !trace && !op_trace, executor_->logits());
-    std::vector<float> logits;
-    if (prefix == length) {
-        executor_->ensure_kv(ctx, length, length);
-        auto saved_logits = ctx.download(executor_->logits());
-        logits.assign(saved_logits.data<float>(), saved_logits.data<float>() + cfg_.vocab_size);
-    } else {
-        logits = executor_->prefill_cuda_impl(ctx, prompt.data() + prefix, length - prefix, prefix,
-                                             use_fused, trace, op_trace, checkpoint_pages, {}, cancel);
-        sessions_->save_cuda_checkpoint(ctx, length, &executor_->logits());
-    }
-    sessions_->retain_tokens(prompt, use_fused);
-    if (prefilled_tokens) *prefilled_tokens = length - prefix;
-    return logits;
+    return executor_->prefill_cached(ctx, prompt, use_fused, prefilled_tokens, trace, op_trace, cancel);
 }
 
 static void lookup_draft(const std::vector<int32_t>& history, int limit, std::vector<int32_t>& input) {
@@ -87,11 +72,12 @@ std::vector<int32_t> FusionModel::generate_cuda(CudaContext& ctx, const std::vec
     if (json && json->vocab_size() != static_cast<size_t>(cfg_.vocab_size))
         throw std::invalid_argument("JSON constraint vocabulary does not match model");
     const bool native_mtp = options.spec_mtp;
+    const bool auto_mtp_depth = native_mtp && (options.auto_draft_tokens || options.draft_tokens == 0);
     if (native_mtp && (!std::isfinite(options.spec_p_min) || options.spec_p_min < 0.f || options.spec_p_min > 1.f))
         throw std::invalid_argument("MTP draft probability cutoff must be in [0, 1]");
     const int modes = (options.spec_ngram > 0) + (draft != nullptr) + native_mtp;
-    if (options.spec_ngram < 0 || options.draft_tokens <= 0 || modes > 1) {
-        throw std::invalid_argument("Choose one speculative decoding mode with a positive token limit");
+    if (options.spec_ngram < 0 || options.draft_tokens < 0 || (options.draft_tokens == 0 && !native_mtp) || modes > 1) {
+        throw std::invalid_argument("Choose one speculative decoding mode. A zero draft limit selects native MTP auto depth");
     }
     if (draft && (draft == this || !draft->sessions_->initialized() || draft->cfg_.vocab_size != cfg_.vocab_size || keep_state)) {
         throw std::invalid_argument("Draft generation needs a separate CUDA model with matching vocabulary and a fresh prompt");
@@ -115,13 +101,12 @@ std::vector<int32_t> FusionModel::generate_cuda(CudaContext& ctx, const std::vec
     validate_cuda_kv_capacity(start_pos + prompt_len + max_new_tokens);
     if (json && max_new_tokens == 0) throw std::invalid_argument("JSON generation needs room for output tokens");
     const int batch_limit = modes > 0 && max_new_tokens > 1
-        ? std::min(prefill_batch_limit(ctx, true), native_mtp ? 8 : cfg_.dense.max_seq_len) : 1;
+        ? std::min(prefill_batch_limit(ctx, true), native_mtp ? MtpDepthController::max_depth + 1 : cfg_.dense.max_seq_len) : 1;
     const bool speculative = batch_limit >= 2;
     if (speculative && options.op_trace) {
         throw std::invalid_argument("Operation profiling is unavailable during speculative decoding");
     }
-    // NextN consumes verified hidden states for the entire live prefix.
-    const bool reuse = options.reuse_prefix && !keep_state && embeds.empty() && !native_mtp;
+    const bool reuse = options.reuse_prefix && !keep_state && embeds.empty();
     struct RestoreHiddenCapture {
         CudaExecutor& executor;
         ~RestoreHiddenCapture() { executor.set_mtp_hidden_capture(false); }
@@ -197,6 +182,7 @@ std::vector<int32_t> FusionModel::generate_cuda(CudaContext& ctx, const std::vec
     double prefill_ms = std::chrono::duration<double, std::milli>(tp1 - tp0).count();
 
     int pos = start_pos + prompt_len;
+    int mtp_pos = native_mtp ? sessions_->mtp_kv_valid_len() : 0;
     int gen_count = 0;
     int spec_proposed = 0, spec_accepted = 0;
     GenerationStats mtp_stats;
@@ -255,6 +241,8 @@ std::vector<int32_t> FusionModel::generate_cuda(CudaContext& ctx, const std::vec
         } restore{spec_arena, spec_arena.mark()};
         auto verify = executor_->begin_verify(ctx, native_mtp, use_graph, batch_limit);
         const bool profile_verify = native_mtp && std::getenv("FUSIONRT_MTP_PROFILE");
+        const bool time_verify = profile_verify || auto_mtp_depth;
+        MtpDepthController depth_controller;
         std::array<int, 9> verify_calls{};
         std::array<double, 9> verify_ms{};
         auto* draft_sessions = draft_pos > 0 ? draft->sessions_.get() : nullptr;
@@ -277,9 +265,16 @@ std::vector<int32_t> FusionModel::generate_cuda(CudaContext& ctx, const std::vec
         std::vector<int32_t> input, row_ids, draft_history;
         std::vector<float> rows;
         std::vector<Sampler::Distribution> draft_probs;
-        int mtp_pos = 0;
         auto mtp = native_mtp ? executor_->begin_mtp(ctx, options.spec_p_min > 0.f) :
             CudaExecutor::Request<CudaExecutor::MtpDraft>{nullptr, nullptr};
+        const auto fill_verified_mtp = [&](int end) {
+            while (mtp_pos < end && !cancelled()) {
+                executor_->mtp_step(ctx, *mtp, mtp_pos, tokens[mtp_pos], mtp_pos - 1,
+                                    false, false, use_fused, *verify);
+                ++mtp_pos;
+            }
+        };
+        const int draft_cap = options.draft_tokens > 0 ? options.draft_tokens : MtpDepthController::max_depth;
         int ngram_depth = 1, ngram_misses = 0, ngram_pause = 0;
         bool pending_on_device = greedy, reset_decode_position = true;
         bool running = max_new_tokens > 0 && emit(next_tok);
@@ -288,8 +283,9 @@ std::vector<int32_t> FusionModel::generate_cuda(CudaContext& ctx, const std::vec
             const int start = pos;
             const bool ngram_probe = options.spec_ngram > 0 && ngram_pause == 0;
             if (ngram_pause > 0) --ngram_pause;
-            int limit = std::min({remaining - 1, batch_limit - 1, (draft || native_mtp) ? options.draft_tokens :
+            int limit = std::min({remaining - 1, batch_limit - 1, (draft || native_mtp) ? draft_cap :
                                   ngram_probe ? ngram_depth : 0});
+            if (auto_mtp_depth) limit = depth_controller.choose_depth(limit);
             input.assign(1, tokens.back());
             draft_probs.clear();
             if (draft_sessions && limit > 0 && start < draft->cfg_.dense.max_seq_len) {
@@ -324,12 +320,12 @@ std::vector<int32_t> FusionModel::generate_cuda(CudaContext& ctx, const std::vec
                 }
             } else if (native_mtp && limit > 0) {
                 executor_->ensure_kv(ctx, mtp_pos, start + limit);
-                while (mtp_pos < start && !cancelled()) {
-                    executor_->mtp_step(ctx, *mtp, mtp_pos, tokens[mtp_pos], mtp_pos - 1,
-                                        false, false, use_fused, *verify);
-                    ++mtp_pos;
-                }
+                const bool initial_mtp_fill = auto_mtp_depth && mtp_pos < prompt_len;
+                fill_verified_mtp(start);
+                if (initial_mtp_fill) ctx.synchronize();
                 for (int i = 0; i < limit && !cancelled(); ++i) {
+                    const auto draft_start = auto_mtp_depth ? std::chrono::steady_clock::now() :
+                                                             std::chrono::steady_clock::time_point{};
                     if (executor_->mtp_step(ctx, *mtp, start + i, input.back(), start - 1,
                                             i != 0, true, use_fused, *verify))
                         ++mtp_stats.mtp_draft_graph_steps;
@@ -342,6 +338,8 @@ std::vector<int32_t> FusionModel::generate_cuda(CudaContext& ctx, const std::vec
                         ++mtp_stats.mtp_rewound_kv_rows;
                     }
                     const auto [proposal, confidence] = executor_->read_mtp(ctx, *mtp);
+                    if (auto_mtp_depth) depth_controller.observe_draft(std::chrono::duration<double, std::milli>(
+                        std::chrono::steady_clock::now() - draft_start).count());
                     if (confidence < options.spec_p_min) {
                         ++mtp_stats.mtp_cutoffs;
                         break;
@@ -376,17 +374,22 @@ std::vector<int32_t> FusionModel::generate_cuda(CudaContext& ctx, const std::vec
 
             spec_proposed += proposed;
             if (proposed > 0) sessions_->save_recurrent(ctx, target_snapshot);
-            const auto verify_start = profile_verify ? std::chrono::steady_clock::now() :
-                                                      std::chrono::steady_clock::time_point{};
-            if (executor_->verify_cuda(ctx, input, start, use_fused, rows, row_ids, greedy, reuse && target_snapshot,
+            const auto verify_start = time_verify ? std::chrono::steady_clock::now() :
+                                                   std::chrono::steady_clock::time_point{};
+            if (executor_->verify_cuda(ctx, input, start, use_fused, rows, row_ids, greedy,
+                            reuse && !native_mtp && target_snapshot,
                             native_mtp ? verify.get() : nullptr)) {
                 used_cuda_graph = true;
                 ++mtp_stats.mtp_verify_graph_steps;
             }
-            if (profile_verify) {
-                ++verify_calls[proposed + 1];
-                verify_ms[proposed + 1] += std::chrono::duration<double, std::milli>(
+            if (time_verify) {
+                const double ms = std::chrono::duration<double, std::milli>(
                     std::chrono::steady_clock::now() - verify_start).count();
+                if (auto_mtp_depth) depth_controller.observe_verify(proposed + 1, ms);
+                if (profile_verify) {
+                    ++verify_calls[proposed + 1];
+                    verify_ms[proposed + 1] += ms;
+                }
             }
             pending_on_device = false;
             reset_decode_position = true;
@@ -411,6 +414,7 @@ std::vector<int32_t> FusionModel::generate_cuda(CudaContext& ctx, const std::vec
                 if (native_mtp && !bonus) {
                     ++mtp_stats.mtp_checked_by_depth[i];
                     mtp_stats.mtp_accepted_by_depth[i] += accepted;
+                    if (auto_mtp_depth) depth_controller.observe_acceptance(i + 1, accepted);
                 }
                 running = emit(next_tok);
                 if (!accepted || !running) break;
@@ -429,6 +433,8 @@ std::vector<int32_t> FusionModel::generate_cuda(CudaContext& ctx, const std::vec
             const int kept = start_pos + static_cast<int>(tokens.size()) - 1;
             pos = start + proposed + 1;
             if (kept < pos) {
+                const auto rewind_start = auto_mtp_depth ? std::chrono::steady_clock::now() :
+                                                          std::chrono::steady_clock::time_point{};
                 sessions_->truncate(kept);
                 if (target_snapshot) {
                     sessions_->restore_recurrent(ctx, target_snapshot);
@@ -437,6 +443,12 @@ std::vector<int32_t> FusionModel::generate_cuda(CudaContext& ctx, const std::vec
                                                           use_fused, nullptr, nullptr, reuse);
                     }
                 }
+                if (auto_mtp_depth) {
+                    if (target_snapshot) ctx.synchronize();
+                    depth_controller.observe_rewind(pos - kept, std::chrono::duration<double, std::milli>(
+                        std::chrono::steady_clock::now() - rewind_start).count());
+                }
+                mtp_pos = std::min(mtp_pos, kept);
                 pos = kept;
             }
             if (draft_sessions && draft_pos > kept) {
@@ -448,6 +460,11 @@ std::vector<int32_t> FusionModel::generate_cuda(CudaContext& ctx, const std::vec
                 } else draft_pos = kept;
             }
         }
+        // Materialize NextN rows seeded by verified trunk states before sharing this prefix.
+        if (native_mtp && reuse && mtp_pos < pos && !cancelled()) {
+            executor_->ensure_kv(ctx, mtp_pos, pos);
+            fill_verified_mtp(pos);
+        }
         ctx.synchronize();
         if (profile_verify) for (size_t m = 1; m < verify_calls.size(); ++m) {
             if (verify_calls[m]) std::clog << "MTP verify M=" << m << " calls=" << verify_calls[m]
@@ -455,10 +472,16 @@ std::vector<int32_t> FusionModel::generate_cuda(CudaContext& ctx, const std::vec
         }
     }
     if (cancelled()) sessions_->clear_cuda_history();
-    else if (reuse) {
+    else {
+        if (native_mtp) sessions_->set_mtp_kv_valid_len(std::min(mtp_pos, pos));
         // The most recently sampled token has not been forwarded into KV/SSM state.
-        if (pos > prompt_len) sessions_->save_cuda_checkpoint(ctx, pos, &executor_->logits());
-        sessions_->retain_tokens({tokens.data(), static_cast<size_t>(pos)}, use_fused);
+        if (reuse) {
+            if (pos > prompt_len) {
+                // After speculative rollback, the last verify logit can belong to a discarded row.
+                executor_->save_prefix_checkpoint(ctx, pos, native_mtp && speculative ? nullptr : &executor_->logits());
+            }
+            sessions_->retain_tokens({tokens.data(), static_cast<size_t>(pos)}, use_fused);
+        }
     }
     if (options.op_trace && options.op_trace->ops.empty()) *options.op_trace = std::move(prefill_profile);
     auto td1 = std::chrono::high_resolution_clock::now();

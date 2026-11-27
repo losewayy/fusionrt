@@ -76,7 +76,7 @@ void FusionModel::set_device_profile(CudaContext& ctx, const DeviceProfile& prof
 }
 
 ModelMemory FusionModel::cuda_cache_memory() const {
-    return sessions_->cache_memory(executor_->logits().nbytes());
+    return sessions_->cache_memory();
 }
 
 ModelMemory FusionModel::inspect_cuda(CudaContext& ctx) {
