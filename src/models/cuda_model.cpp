@@ -1475,7 +1475,7 @@ static void execute_ir_graph_cuda(
                 auto latent = cuda_scratch(ctx, {rows, heads, mla.latent_rank});
                 cuda_ops::mla_attention_f32(bufs[node.inputs[0]].ptr<float>(), bufs[node.inputs[1]].ptr<float>(),
                     layer.mla_kv_a_norm.ptr<float>(), layer.mla_k_b, layer.mla_v_b, layer.rope_factors.ptr<float>(),
-                    query.ptr<float>(), latent.ptr<float>(), output.ptr<float>(), kv_states[node.layer_index],
+                    query.ptr<float>(), latent.ptr<float>(), output.template ptr<float>(), kv_states[node.layer_index],
                     rows, heads, d.head_dim, start_pos, pos_dev, d.rms_norm_eps, mla.attention_scale,
                     mla.rope_amplitude, ctx.stream());
                 break;
