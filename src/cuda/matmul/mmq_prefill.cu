@@ -1,4 +1,5 @@
 #include "weight_tiles.cuh"
+#include "fusionrt/weight_codec.h"
 
 #include <mma.h>
 
@@ -139,6 +140,15 @@ struct MmqWeight {
     float scale, other;
 };
 
+template <class WC>
+struct MmqCodecBlock {
+    using Codec = WC;
+    uint8_t packed[WC::kBlockBytes];
+};
+
+template <class W>
+constexpr bool mmq_codec = requires { typename W::Codec; };
+
 template <typename W>
 constexpr bool mmq_packed_q4 =
     std::is_same_v<W, BlockQ4_A> || std::is_same_v<W, BlockQ4_K> || std::is_same_v<W, BlockQ4_KA>;
@@ -149,6 +159,9 @@ constexpr bool mmq_async = mmq_packed_q4<W> || std::is_same_v<W, BlockQ6_A> || s
 template <typename W>
 constexpr bool mmq_has_min =
     std::is_same_v<W, BlockQ4_K> || std::is_same_v<W, BlockQ4_KA> || std::is_same_v<W, BlockQ5_K>;
+
+template <typename W>
+constexpr bool mmq_split_scale = std::is_same_v<W, BlockQ6_K> || std::is_same_v<W, BlockQ6_A>;
 
 template <typename W>
 __device__ __forceinline__ float2 mmq_k_scales(const W& w, int sub) {
@@ -223,15 +236,15 @@ template <typename W, int BM, int BN, int BK>
 __device__ __forceinline__ void load_mmq_tile(
     const BlockQ8_1* x, const W* w,
     MmqTile<BM, BK, 8, mmq_has_min<W>>& xs,
-    MmqTile<BN, BK, mmq_packed_q4<W> ? 4 : 8,
-            !std::is_same_v<W, BlockQ4_A> && !std::is_same_v<W, BlockQ8_A>>& ws,
+    MmqTile<BN, BK, mmq_packed_q4<W> ? 4 : 8, mmq_has_min<W> || mmq_split_scale<W>>& ws,
     int m0, int n0, int M, int N, int K, int kb) {
     constexpr bool async = mmq_async<W>;
     int slot = threadIdx.x % BK;
-    int xstride = K / 32, wstride = K / 256;
+    int xstride = K / 32;
+    const int xsub = mmq_codec<W> ? min(kb + slot, xstride - 1) : kb + slot;
     int sub = (kb + slot) % 8;
     for (int m = threadIdx.x / BK; m < BM; m += blockDim.x / BK) {
-        const auto* src = reinterpret_cast<const uint4*>(x + static_cast<int64_t>(min(m0 + m, M - 1)) * xstride + kb + slot);
+        const auto* src = reinterpret_cast<const uint4*>(x + static_cast<int64_t>(min(m0 + m, M - 1)) * xstride + xsub);
         auto* dst = reinterpret_cast<uint4*>(xs.qs[m] + slot * 8);
         if constexpr (async) {
             mmq_copy_async<16>(dst, src);
@@ -240,7 +253,8 @@ __device__ __forceinline__ void load_mmq_tile(
         } else {
             dst[0] = __ldg(src);
             dst[1] = __ldg(src + 1);
-            xs.scale[slot][m] = __uint_as_float(__ldg(&src[2].x));
+            xs.scale[slot][m] = !mmq_codec<W> || kb + slot < xstride ?
+                                __uint_as_float(__ldg(&src[2].x)) : 0.0f;
         }
         if constexpr (mmq_has_min<W>) {
             if constexpr (async) mmq_copy_async<4>(&xs.other[slot][m], &src[2].w);
@@ -248,10 +262,22 @@ __device__ __forceinline__ void load_mmq_tile(
         }
     }
     for (int n = threadIdx.x / BK; n < BN; n += blockDim.x / BK) {
-        const W& src = w[static_cast<int64_t>(min(n0 + n, N - 1)) * wstride + (kb + slot) / 8];
+        constexpr int block_elems = [] {
+            if constexpr (mmq_codec<W>) return W::Codec::kBlockSize;
+            else return 256;
+        }();
+        const W& src = w[static_cast<int64_t>(min(n0 + n, N - 1)) * (K / block_elems) + xsub / (block_elems / 32)];
         constexpr int words = mmq_packed_q4<W> ? 4 : 8;
         auto* dst = reinterpret_cast<uint4*>(ws.qs[n] + slot * words);
-        if constexpr (TileQ4_144<W>) {
+        if constexpr (mmq_codec<W>) {
+            using Codec = typename W::Codec;
+            const int part = xsub % (block_elems / 32);
+            dst[0] = make_uint4(Codec::int8_word(src.packed, part, 0), Codec::int8_word(src.packed, part, 1),
+                                Codec::int8_word(src.packed, part, 2), Codec::int8_word(src.packed, part, 3));
+            dst[1] = make_uint4(Codec::int8_word(src.packed, part, 4), Codec::int8_word(src.packed, part, 5),
+                                Codec::int8_word(src.packed, part, 6), Codec::int8_word(src.packed, part, 7));
+            ws.scale[slot][n] = Codec::int8_scale(src.packed, part);
+        } else if constexpr (TileQ4_144<W>) {
             using Tile = TileQ4Trait<W>;
             mmq_copy_async<16>(dst, Tile::nibbles(src, sub));
             if constexpr (Tile::symmetric) {
@@ -325,7 +351,7 @@ __device__ __forceinline__ unsigned mmq_load_packed_q4(const unsigned* ptr) {
 
 template <typename W, int BM, int BN, int BK>
 struct MmqBuffers {
-    static constexpr bool split_scale = std::is_same_v<W, BlockQ6_K> || std::is_same_v<W, BlockQ6_A>;
+    static constexpr bool split_scale = mmq_split_scale<W>;
     static constexpr bool min_scale = mmq_has_min<W>;
     static constexpr int weight_words = mmq_packed_q4<W> ? 4 : 8;
 
@@ -744,6 +770,22 @@ void launch_mmq_q4_a_and_q8_a(const BlockQ8_1* x, const BlockQ4_A* w4, const Blo
 void mmq_q4_a_q8_1(const void* x, const void* w, float* y, int M, int N, int K, cudaStream_t stream,
                      const CostHardware& hw) {
     launch_mmq<BlockQ4_A>(x, w, y, M, N, K, stream, hw);
+}
+
+void codec_mmq_q8_1(const void* x, const void* w, DType dtype, float* y, int M, int N, int K,
+                     cudaStream_t stream) {
+    if (M <= 0 || N <= 0 || K <= 0) return;
+    visit_weight_codec(dtype, [&]<class Codec>() {
+        if constexpr (Codec::kHasInt8Sub32) {
+            if (K % Codec::kBlockSize) throw std::invalid_argument("Invalid WeightCodec MMQ column count");
+            using W = MmqCodecBlock<Codec>;
+            const auto* qx = static_cast<const BlockQ8_1*>(x);
+            const auto* qw = static_cast<const W*>(w);
+            if (M <= 16) launch_mmq_tile<W, 16, 32, 1>(qx, qw, y, M, N, K, stream);
+            else if (M <= 32) launch_mmq_tile<W, 32, 64, 2>(qx, qw, y, M, N, K, stream);
+            else launch_mmq_tile<W, 64, 64, 2, 4, 2>(qx, qw, y, M, N, K, stream);
+        } else throw std::invalid_argument("WeightCodec has no INT8 MMQ basis");
+    });
 }
 
 void mmq_q8_a_q8_1(const void* x, const void* w, float* y, int M, int N, int K, cudaStream_t stream,

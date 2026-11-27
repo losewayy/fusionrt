@@ -4,6 +4,7 @@
 #include "../core/cpu_moe.h"
 #include "../core/moe_route_trace.h"
 #include "fusionrt/cuda_kernels.h"
+#include "fusionrt/weight_codec.h"
 
 #include <algorithm>
 #include <bit>
@@ -153,10 +154,25 @@ static bool try_cublas_prefill(CudaContext& ctx, const float* x, const float* no
     return true;
 }
 
+static bool use_codec_mmq(const CudaContext& ctx, int rows, bool allow_prefill) {
+    return allow_prefill && rows >= std::max(16, ctx.mmq_crossover_m());
+}
+
 static void codec_linear(CudaContext& ctx, const float* x, const float* norm, const Tensor& w,
                          float* y, int M, int N, int K, float eps, bool allow_prefill) {
     auto& arena = ctx.scratch_arena();
     const size_t mark = arena.mark();
+    if (has_weight_codec_int8(w.dtype)) {
+        void* q8 = arena.alloc(static_cast<size_t>(M) * row_nbytes(DType::Q8_1, K));
+        cuda_ops::quantize_x_q8_1(x, nullptr, norm, nullptr, q8, M, K, eps, ctx.stream());
+        if (use_codec_mmq(ctx, M, allow_prefill)) {
+            cuda_ops::codec_mmq_q8_1(q8, w.ptr(), w.dtype, y, M, N, K, ctx.stream());
+        } else {
+            cuda_ops::codec_gemv_q8_1(q8, w.ptr(), w.dtype, y, M, N, K, ctx.stream());
+        }
+        arena.reset(mark);
+        return;
+    }
     const size_t row_bytes = static_cast<size_t>(K) * sizeof(uint16_t);
     const size_t x_bytes = row_bytes * M;
     const size_t available = arena.capacity() - arena.used();
@@ -1596,12 +1612,14 @@ static OpTiming operator_work(const IRNode& node, int rows, int pos, const CudaC
         work.flops += count * (4 * width + 2);
     };
     auto linear = [&](const Tensor& w, bool reads_activation) {
-        const bool q8 = supports_q8_1_decode(w.dtype) &&
-                        (m == 1 || (use_fused && m >= ctx.mmq_crossover_m()));
+        const bool codec = has_weight_codec_int8(w.dtype);
+        const bool q8 = codec || (supports_q8_1_decode(w.dtype) &&
+                        (m == 1 || (use_fused && m >= ctx.mmq_crossover_m())));
+        const bool mmq = codec ? use_codec_mmq(ctx, m, use_fused) : q8 && m > 1;
         work.bytes += w.nbytes() + f32 * m * (n + (reads_activation && !packed_input ? k : 0));
         work.flops += 2 * m * n * k;
         if (q8) work.bytes += (packed_input ? 1 : 2) * m * row_nbytes(DType::Q8_1, k);
-        if (q8 && m > 1) work.kind += "_MMQ_INT8";
+        if (mmq) work.kind += "_MMQ_INT8";
         else if (q8) work.kind += "_GEMV_INT8";
         else if (m == 1) work.kind += "_GEMV";
         else if (use_fused && m >= 4 && w.dtype != DType::F32 && !prefill_mmq(w.dtype) &&

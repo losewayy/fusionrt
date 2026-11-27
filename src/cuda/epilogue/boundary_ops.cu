@@ -521,6 +521,45 @@ __global__ void k_codec_gemv(const float* x, const uint8_t* w, float* out, int r
     }
 }
 
+template<class Codec>
+__global__ void k_codec_gemv_q8_1(const BlockQ8_1* __restrict__ x, const uint8_t* __restrict__ w,
+                                  float* __restrict__ out, int n, int k) {
+    constexpr int groups = Codec::kBlockSize / 32;
+    const int col = blockIdx.x * (blockDim.x / 32) + threadIdx.x / 32;
+    if (col >= n) return;
+    const int lane = threadIdx.x & 31;
+    constexpr int block_lanes = Codec::kInt8BlockLanes;
+    const int word = lane % block_lanes;
+    const int blocks = k / Codec::kBlockSize;
+    const auto* qx = x + static_cast<int64_t>(blockIdx.y) * (k / 32);
+    const auto* b = w + static_cast<int64_t>(col) * blocks * Codec::kBlockBytes;
+    float sum = 0.0f;
+    for (int block = lane / block_lanes; block < blocks; block += 32 / block_lanes) {
+        const auto* packed = b + block * Codec::kBlockBytes;
+        if constexpr (Codec::kHasWarpInt8Block) {
+            const auto basis = Codec::load_int8_block(packed, word);
+            float inner = 0.0f;
+            #pragma unroll
+            for (int sub = 0; sub < groups; ++sub) {
+                const auto& a = qx[block * groups + sub];
+                const int lo = __dp4a(static_cast<int>(basis.word(sub, word)), a.qs[word], 0);
+                const int dot = __dp4a(static_cast<int>(basis.word(sub, word + 4)), a.qs[word + 4], lo);
+                inner = fmaf(a.d, dot, inner);
+            }
+            sum = fmaf(basis.scale(), inner, sum);
+        } else {
+            #pragma unroll
+            for (int sub = 0; sub < groups; ++sub) {
+                const auto& a = qx[block * groups + sub];
+                const int dot = __dp4a(static_cast<int>(Codec::int8_word(packed, sub, word)), a.qs[word], 0);
+                sum = fmaf(Codec::int8_scale(packed, sub) * a.d, dot, sum);
+            }
+        }
+    }
+    const float result = warp_reduce_sum(sum);
+    if (lane == 0) out[static_cast<int64_t>(blockIdx.y) * n + col] = result;
+}
+
 template<class Codec, bool Embedding>
 __global__ void k_codec_unpack(const uint8_t* w, const int32_t* ids,
                                void* out, int rows, int cols, int first) {
@@ -1165,6 +1204,20 @@ void codec_dequant_tile_f16(const void* weight, DType dtype, uint16_t* out,
         const dim3 blocks((cols / Codec::kBlockSize + 7) / 8, std::min(rows, 65535));
         k_codec_unpack<Codec, false><<<blocks, 256, 0, stream>>>(
             static_cast<const uint8_t*>(weight), nullptr, out, rows, cols, first_row);
+    });
+}
+
+void codec_gemv_q8_1(const void* x, const void* weight, DType dtype, float* out,
+                      int M, int N, int K, cudaStream_t stream) {
+    if (M <= 0 || N <= 0 || K <= 0) return;
+    visit_weight_codec(dtype, [&]<class Codec>() {
+        if constexpr (Codec::kHasInt8Sub32) {
+            if (K % Codec::kBlockSize) throw std::invalid_argument("Invalid WeightCodec GEMV column count");
+            constexpr int warps = 4;
+            const dim3 grid((N + warps - 1) / warps, M);
+            k_codec_gemv_q8_1<Codec><<<grid, warps * 32, 0, stream>>>(
+                static_cast<const BlockQ8_1*>(x), static_cast<const uint8_t*>(weight), out, N, K);
+        } else throw std::invalid_argument("WeightCodec has no INT8 GEMV basis");
     });
 }
 

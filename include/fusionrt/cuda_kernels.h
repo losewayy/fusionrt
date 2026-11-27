@@ -122,6 +122,10 @@ void fused_rmsnorm_hadamard_f32(const float* x, const float* weight, const int8_
 
 void codec_gemv_f32(const float* x, const void* weight, DType dtype, float* out,
                      int rows, int out_cols, int in_cols, cudaStream_t stream);
+void codec_gemv_q8_1(const void* x, const void* weight, DType dtype, float* out,
+                      int M, int N, int K, cudaStream_t stream);
+void codec_mmq_q8_1(const void* x, const void* weight, DType dtype, float* out,
+                     int M, int N, int K, cudaStream_t stream);
 void codec_dequant_tile_f16(const void* weight, DType dtype, uint16_t* out,
                              int first_row, int rows, int cols, cudaStream_t stream);
 

@@ -265,6 +265,7 @@ void test_cuda_weight_codecs(CudaContext& ctx) {
         const auto dx = ctx.upload(x, false), w = ctx.upload(src, false);
         auto out = arena.alloc_tensor({M, N}, DType::F32);
         const auto check = [&](bool gemm) {
+            if (has_weight_codec_int8(f.type)) return;
             model_io::vision_linear_cuda(ctx, dx, w, out, gemm ? M : 1);
             const auto read = ctx.download(out);
             const auto length = static_cast<size_t>((gemm ? M : 1) * N);
@@ -326,8 +327,78 @@ void test_cuda_weight_codecs(CudaContext& ctx) {
         arena.reset(mark);
     }
     ctx.set_mmq_crossover_m(crossover);
-    std::cout << "  [PASS] 13 packed CUDA codecs max_rel_l2 GEMV=" << max_gemv
+    std::cout << "  [PASS] 13 packed CUDA codecs, 5 fallback formats max_rel_l2 GEMV=" << max_gemv
               << " tiled cuBLAS=" << max_gemm << " indexed/hybrid MoE=" << max_moe << '\n';
+}
+
+void test_cuda_codec_int8(CudaContext& ctx) {
+    auto& arena = ctx.scratch_arena();
+    const auto mark = arena.mark();
+    const int crossover = ctx.mmq_crossover_m();
+    ctx.set_mmq_crossover_m(16);
+    double max_gemv = 0.0, max_mmq = 0.0, max_integer = 0.0;
+    for (const auto& f : codec_fixtures) {
+        if (!has_weight_codec_int8(f.type)) continue;
+        constexpr int N = 71, max_rows = 256;
+        const int K = 3 * f.elements;
+        const auto src = packed_fixture(f, {N, K});
+        const auto w32 = model_io::to_f32_host(src);
+        auto values = codec_input(max_rows, K);
+        // Include a completely zero activation block and exercise general Q8 rounding.
+        std::fill_n(values.begin(), 32, 0.0f);
+        HostTensor input({max_rows, K}, DType::F32);
+        std::copy(values.begin(), values.end(), input.data<float>());
+        const auto x = ctx.upload(input, false), w = ctx.upload(src, false);
+        const auto q = arena.alloc_tensor({max_rows, K}, DType::Q8_1);
+        cuda_ops::quantize_x_q8_1(x.ptr<float>(), nullptr, nullptr, nullptr, q.ptr(),
+                                 max_rows, K, 0, ctx.stream());
+        const auto qhost = ctx.download(q);
+        const auto* qblocks = qhost.data<BlockQ8_1>();
+        std::vector<float> rounded(values.size());
+        for (size_t i = 0; i < rounded.size(); ++i) {
+            const auto& b = qblocks[i / 32];
+            rounded[i] = b.d * reinterpret_cast<const int8_t*>(b.qs)[i % 32];
+        }
+        double format_gemv = 0.0, format_mmq = 0.0;
+        for (const int rows : {1, 4, 16, 37, 128, 256}) {
+            const auto saved = arena.mark();
+            auto out = arena.alloc_tensor({rows, N}, DType::F32);
+            auto linear = [&] { model_io::vision_linear_cuda(ctx, x, w, out, rows); };
+            linear();
+            const auto eager = ctx.download(out);
+            CudaGraphExec graph;
+            graph.capture(ctx.stream(), linear);
+            graph.launch(ctx.stream());
+            const auto replay = ctx.download(out);
+            const size_t count = static_cast<size_t>(rows) * N;
+            if (!std::equal(eager.data<float>(), eager.data<float>() + count, replay.data<float>()))
+                throw std::runtime_error(std::string(dtype_name(f.type)) + " INT8 graph differs from eager");
+            std::vector<float> ref(count), int_ref(count);
+            for (int m = 0; m < rows; ++m) for (int n = 0; n < N; ++n) {
+                const auto* weights = w32.data<float>() + n * K;
+                ref[m * N + n] = static_cast<float>(codec_reference_dot(weights, values.data() + m * K, K));
+                int_ref[m * N + n] = static_cast<float>(codec_reference_dot(weights, rounded.data() + m * K, K));
+            }
+            std::span<const float> actual(eager.data<float>(), count);
+            const double error = codec_rel_l2(actual, ref);
+            if (!(error < 0.009))
+                throw std::runtime_error(std::string(dtype_name(f.type)) + " INT8 relative L2 vs FP32=" +
+                                         std::to_string(error) + " at M=" + std::to_string(rows));
+            require_codec_close(f.type, "INT8 vs dequantized Q8_1 reference", actual, int_ref);
+            max_integer = std::max(max_integer, codec_rel_l2(actual, int_ref));
+            auto& max_error = rows <= 4 ? format_gemv : format_mmq;
+            max_error = std::max(max_error, error);
+            arena.reset(saved);
+        }
+        max_gemv = std::max(max_gemv, format_gemv);
+        max_mmq = std::max(max_mmq, format_mmq);
+        std::cout << "    " << dtype_name(f.type) << " FP32 rel_l2 GEMV=" << format_gemv
+                  << " MMQ=" << format_mmq << '\n';
+        arena.reset(mark);
+    }
+    ctx.set_mmq_crossover_m(crossover);
+    std::cout << "  [PASS] 8 integer codecs GEMV rel_l2=" << max_gemv << " MMQ rel_l2=" << max_mmq
+              << " exact Q8_1 reference rel_l2=" << max_integer << " and exact graph replay\n";
 }
 
 void test_cuda_codec_model(CudaContext& ctx) {
@@ -408,8 +479,11 @@ void test_cuda_codec_model(CudaContext& ctx) {
         FusionModel reference(HybridModelConfig{});
         if (!GgufFile::write_v3(file.path, meta, weights, &error) ||
             !reference.load_gguf(ctx, file.path, &error, 96)) throw std::runtime_error(error);
-        require_codec_close(f.type, "CUDA loaded model embeddings / LM head", actual_logits,
-                            reference.forward_prefill_cuda(ctx, ids, 0));
+        const auto expected = reference.forward_prefill_cuda(ctx, ids, 0);
+        const double tolerance = has_weight_codec_int8(f.type) ? 0.015 : 1e-5;
+        if (!(codec_rel_l2(actual_logits, expected) < tolerance))
+            throw std::runtime_error(std::string(dtype_name(f.type)) + " loaded CUDA model logits relative L2=" +
+                                     std::to_string(codec_rel_l2(actual_logits, expected)));
     }
     std::cout << "  [PASS] 13 loaded CUDA models, embeddings/LM head and Prism explicit rotation\n";
 }
@@ -5258,6 +5332,7 @@ int main() {
         test_cuda_failed_graph_recapture(cuda_ctx);
         test_cuda_q2_k(cuda_ctx);
         test_cuda_weight_codecs(cuda_ctx);
+        test_cuda_codec_int8(cuda_ctx);
         test_cuda_frontier(cuda_ctx);
         test_cuda_hadamard(cuda_ctx);
         test_cuda_codec_model(cuda_ctx);

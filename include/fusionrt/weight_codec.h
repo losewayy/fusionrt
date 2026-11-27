@@ -57,7 +57,51 @@ FUSIONRT_CODEC_INLINE int ternary(uint8_t packed, int digit) {
     return ((wrapped * 3) >> 8) - 1;
 }
 
+#ifdef __CUDACC__
+__device__ __forceinline__ unsigned signed_two_bit_word(unsigned x) {
+    return ((x & 0x03030303u) + 0x7f7f7f7fu) ^ 0x80808080u;
+}
+
+__device__ __forceinline__ unsigned ternary_word(unsigned packed, int digit) {
+    constexpr unsigned pow3[] = {1, 3, 9, 27, 81};
+    const unsigned power = pow3[digit];
+    // Separate adjacent bytes so the base-3 multiply cannot carry across digits.
+    const unsigned even = (packed & 0x00ff00ffu) * power & 0x00ff00ffu;
+    const unsigned odd = (packed >> 8 & 0x00ff00ffu) * power & 0x00ff00ffu;
+    return signed_two_bit_word(((3 * even) >> 8 & 0x00030003u) | (3 * odd & 0x03000300u));
+}
+
+__device__ __forceinline__ unsigned ptq1_tail_word(unsigned pair, int i) {
+    const int digit = (i - 120) / 2;
+    return __byte_perm(ternary_word(pair, digit), ternary_word(pair, digit + 1), 0x5410);
+}
+
+struct Ptq1WarpBlock {
+    unsigned primary, secondary, tail;
+
+    __device__ __forceinline__ unsigned word(int sub, int lane) const {
+        const int i = sub * 32 + lane * 4;
+        if (i < 80) return ternary_word(primary, i / 16);
+        if (i < 120) return ternary_word(secondary, (i - 80) / 8);
+        return ptq1_tail_word(tail, i);
+    }
+
+    __device__ __forceinline__ float scale() const {
+        return __half2float(__ushort_as_half(static_cast<uint16_t>(tail >> 16)));
+    }
+};
+#endif
+
 }  // namespace codec_detail
+
+constexpr bool has_weight_codec_int8(DType format) {
+    switch (format) {
+        case DType::PTQ1_0: case DType::PQ2_0: case DType::Q2_0:
+        case DType::TQ1_0: case DType::TQ2_0: case DType::IQ4_NL:
+        case DType::IQ4_XS: case DType::MXFP4: return true;
+        default: return false;
+    }
+}
 
 // Block data is always little-endian. Access by byte so mapped and tiled rows
 // can be read directly, including the 17-byte MXFP4 blocks.
@@ -66,6 +110,7 @@ struct WeightCodec {
     static_assert(is_weight_codec_dtype(Format));
     static constexpr int kBlockSize = static_cast<int>(dtype_block_size(Format));
     static constexpr int kBlockBytes = static_cast<int>(dtype_type_size(Format));
+    static constexpr bool kHasInt8Sub32 = has_weight_codec_int8(Format);
 
     static FUSIONRT_CODEC_INLINE float value(const uint8_t* b, int i) {
         using namespace codec_detail;
@@ -129,6 +174,62 @@ struct WeightCodec {
     }
 
 #ifdef __CUDACC__
+    static constexpr bool kHasWarpInt8Block = Format == DType::PTQ1_0;
+    static constexpr int kInt8BlockLanes = kHasWarpInt8Block ? 4 : 8;
+
+    static __device__ __forceinline__ codec_detail::Ptq1WarpBlock load_int8_block(const uint8_t* b, int lane) {
+        static_assert(kHasWarpInt8Block);
+        // The same primary word provides weights for both halves of a sub-block.
+        const auto* words = reinterpret_cast<const unsigned*>(b);
+        return {__ldg(words + lane), __ldg(words + 4 + lane % 2), __ldg(words + 6)};
+    }
+
+    static __device__ __forceinline__ float int8_scale(const uint8_t* b, int sub) {
+        using namespace codec_detail;
+        static_assert(kHasInt8Sub32);
+        if constexpr (Format == DType::PTQ1_0) return half(b + 26);
+        else if constexpr (Format == DType::TQ1_0) return half(b + 52);
+        else if constexpr (Format == DType::TQ2_0) return half(b + 64);
+        else if constexpr (Format == DType::MXFP4) return e8m0_half(b[0]);
+        else if constexpr (Format == DType::IQ4_XS) {
+            const int low = (b[4 + sub / 2] >> (4 * (sub % 2))) & 15;
+            const int high = (le16(b + 2) >> (2 * sub)) & 3;
+            return half(b) * ((low | (high << 4)) - 32);
+        } else return half(b);
+    }
+
+    // Four consecutive signed weights, byte-packed for dp4a and the INT8 MMA tile.
+    static __device__ __forceinline__ unsigned int8_word(const uint8_t* b, int sub, int word) {
+        using namespace codec_detail;
+        static_assert(kHasInt8Sub32);
+        const int i = sub * 32 + word * 4;
+        if constexpr (Format == DType::PTQ1_0) {
+            if (i < 80) return ternary_word(__ldg(reinterpret_cast<const unsigned*>(b) + word % 4), i / 16);
+            if (i < 120) return ternary_word(__ldg(reinterpret_cast<const unsigned*>(b + 16) + word % 2),
+                                            (i - 80) / 8);
+            return ptq1_tail_word(le16(b + 24), i);
+        } else if constexpr (Format == DType::TQ1_0) {
+            if (i < 160) return ternary_word(le32(b + word * 4), sub);
+            if (i < 240) return ternary_word(le32(b + 32 + (word % 4) * 4), (i - 160) / 16);
+            return ternary_word(le32(b + 48), (i - 240) / 4);
+        } else if constexpr (Format == DType::TQ2_0) {
+            return signed_two_bit_word(le32(b + (sub / 4) * 32 + word * 4) >> (2 * (sub % 4)));
+        } else if constexpr (Format == DType::PQ2_0 || Format == DType::Q2_0) {
+            const unsigned q = b[2 + sub * 8 + word];
+            return signed_two_bit_word(q | (q << 6) | (q << 12) | (q << 18));
+        } else {
+            const uint8_t* qs = b + (Format == DType::IQ4_XS ? 8 + sub * 16 : Format == DType::MXFP4 ? 1 : 2);
+            unsigned result = 0;
+#pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                const int index = nibble(qs, 4 * word + j);
+                const int8_t q = Format == DType::MXFP4 ? kvalues_fp4[index] : kvalues_iq4nl[index];
+                result |= static_cast<unsigned>(static_cast<uint8_t>(q)) << (8 * j);
+            }
+            return result;
+        }
+    }
+
     static constexpr int kWarpBlockLanes = Format == DType::PTQ1_0 ? 8 : 32;
 
     // Each lane unpacks the weights that share a packed byte or sub-block scale.
