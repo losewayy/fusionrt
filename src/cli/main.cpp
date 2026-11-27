@@ -41,11 +41,11 @@ void print_usage(std::string_view command = {}) {
     const auto show = [&](std::string_view name) { return command.empty() || command == name; };
     const auto sampling = "  [--temp N] [--top-k N] [--top-p N] [--min-p N] [--repeat-penalty N] [--seed N]\n";
     const auto placement = "  CUDA: [--kv-dtype auto|f32|f16|q8_0|k8v4] [--profile FILE] [--threads N] [--cpu-affinity spread]\n"
-                           "  CUDA: [--kv-vram-mb MiB] [--host-kv-mb MiB] [--moe-gpu-experts N]\n"
-                           "  CUDA: [--moe-route-profile FILE] [--moe-dynamic-cache]\n";
+                           "  CUDA: [--kv-vram-mb MiB] [--host-kv-mb MiB]\n"
+                           "  [--moe-gpu-experts N] [--moe-route-profile FILE] [--moe-dynamic-cache]\n";
     const auto vulkan = "  Vulkan: [--kv-dtype auto|f32|f16|q8_0] [--profile FILE]\n";
-    const auto speculative = "  CUDA: [--spec-ngram K | --draft-model GGUF | --spec-mtp] [--draft-tokens N|auto] [--spec-p-min N]\n"
-                             "  CUDA: --draft-tokens auto (or 0) requires --spec-mtp.\n";
+    const auto speculative = "  [--spec-ngram K | --draft-model GGUF | --spec-mtp] [--draft-tokens N|auto] [--spec-p-min N]\n"
+                             "  --draft-tokens auto (or 0) requires --spec-mtp.\n";
     if (command.empty()) std::cout << "fusionrt " << FUSIONRT_VERSION
         << "\nUsage: fusionrt <info|run|chat|serve|inspect|bench-model|bench> [options]\n"
         << "Use fusionrt <command> --help for details. generate is an alias for run.\n";
@@ -66,7 +66,7 @@ void print_usage(std::string_view command = {}) {
         << "  CUDA placement flags require --device-memory.\n" << placement;
     if (show("bench-model")) std::cout << "fusionrt bench-model --model PATH [--pp N] [--tg N] [--decode-prefix N]\n"
         << "  [--backend cuda|vulkan] [--vk-device N] [--ubatch N] [--reps N] [--graph|--no-graph] [--profile-ops FILE]\n"
-        << placement << vulkan;
+        << placement << vulkan << "  Vulkan benchmark speculation:\n" << speculative;
     if (show("bench")) std::cout << "fusionrt bench [--suite all|fusions|blocks|vulkan] [--output FILE] [--vk-device N]\n";
     if (command == "info") std::cout << "fusionrt info\n";
 }
@@ -124,6 +124,12 @@ struct SpeculativeArgs : cli::SpeculativeArgs {
 
     bool auto_draft_tokens() const { return draft_tokens == 0; }
 
+#ifdef FUSIONRT_ENABLE_VULKAN
+    void apply(FusionModel& target, FusionModel* draft) const {
+        if (enabled()) target.set_vulkan_speculation(ngram, draft, draft_tokens, mtp, p_min);
+    }
+#endif
+
     void validate(bool has_target) const {
         if (!auto_draft_tokens()) {
             cli::SpeculativeArgs::validate(has_target);
@@ -140,7 +146,7 @@ struct CudaPlacementOptions {
     static constexpr size_t mib = 1024 * 1024;
     size_t vram = 0, host = 0;
     int experts = -1, threads = 0;
-    bool specified = false, spread_affinity = false, dynamic_cache = false;
+    bool specified = false, cuda_only = false, spread_affinity = false, dynamic_cache = false;
     std::string route_profile;
 
     bool parse_flag(std::string_view option) {
@@ -164,7 +170,7 @@ struct CudaPlacementOptions {
         if (option == "--cpu-affinity") {
             if (value != "spread" && value != "none") throw std::invalid_argument("Expected spread or none for --cpu-affinity");
             spread_affinity = value == "spread";
-            specified = true;
+            specified = cuda_only = true;
             return true;
         }
         if (option != "--kv-vram-mb" && option != "--host-kv-mb" && option != "--moe-gpu-experts" && option != "--threads")
@@ -172,7 +178,7 @@ struct CudaPlacementOptions {
         if (option == "--threads") {
             threads = parse_integer(option, value);
             if (threads < 0) throw std::invalid_argument("Expected --threads >= 0");
-            specified = true;
+            specified = cuda_only = true;
             return true;
         }
         if (option == "--moe-gpu-experts") {
@@ -182,6 +188,7 @@ struct CudaPlacementOptions {
             const size_t mb = parse_integer<size_t>(option, value);
             if (mb > std::numeric_limits<size_t>::max() / mib) throw std::invalid_argument("KV budget is too large");
             (option == "--kv-vram-mb" ? vram : host) = mb * mib;
+            cuda_only = true;
         }
         specified = true;
         return true;
@@ -379,6 +386,27 @@ struct WeightSummary {
 
 #ifdef FUSIONRT_ENABLE_VULKAN
 void load_vulkan_model(VkContext& ctx, FusionModel& model, const std::string& path, int max_seq);
+
+struct VulkanDraft {
+    std::unique_ptr<VkContext> context;
+    std::unique_ptr<FusionModel> model;
+};
+
+VulkanDraft load_vulkan_draft(VkContext& ctx, const BpeTokenizer& target, const SpeculativeArgs& args, int max_seq) {
+    VulkanDraft draft;
+    if (!args.draft_path.empty()) {
+        BpeTokenizer tokenizer;
+        load_tokenizer(tokenizer, args.draft_path);
+        if (!target.has_compatible_vocab(tokenizer))
+            throw std::invalid_argument("Draft tokenizer must have the same vocabulary and EOS as the target");
+        draft.context = std::make_unique<VkContext>(ctx.info().device_index, 0, 0);
+        draft.context->set_prefill_batch(ctx.prefill_batch());
+        draft.context->set_device_profile(ctx.device_profile());
+        draft.model = std::make_unique<FusionModel>(HybridModelConfig{});
+        load_vulkan_model(*draft.context, *draft.model, args.draft_path, max_seq);
+    }
+    return draft;
+}
 #endif
 
 int cmd_daily(const std::string& cmd, int argc, char** argv) {
@@ -565,16 +593,20 @@ int cmd_daily(const std::string& cmd, int argc, char** argv) {
 #else
             const int vk_dev = vk_device.value_or(0);
             if (vk_dev < 0) throw std::invalid_argument("Expected --vk-device >= 0");
-            if (placement.specified || slots != 1 || !route_trace_path.empty() || speculative.enabled())
-                throw std::invalid_argument("Placement, multiple slots, MoE route tracing and speculative decoding require CUDA");
+            if (placement.cuda_only || slots != 1 || !route_trace_path.empty())
+                throw std::invalid_argument("KV budgets, CPU thread settings, multiple slots and MoE route tracing require CUDA");
             if (graph.value_or(false)) std::clog << "--graph requested, using eager decoding on Vulkan\n";
             VkContext ctx(static_cast<uint32_t>(vk_dev), 0, 0);
             ctx.set_kv_dtype(kv_dtype);
             ctx.set_device_profile(DeviceProfile::load(profile));
-            FusionModel model({});
+            FusionModel model(placement.configure());
+            model.set_moe_gpu_experts(ctx, placement.experts);
+            model.enable_native_mtp(ctx, speculative.mtp);
             BpeTokenizer tokenizer;
             load_tokenizer(tokenizer, path);
+            const auto draft = load_vulkan_draft(ctx, tokenizer, speculative, max_seq);
             load_vulkan_model(ctx, model, path, max_seq);
+            speculative.apply(model, draft.model.get());
             std::unique_ptr<VulkanVisionEncoder> vision;
             if (!mmproj.empty())
                 vision = std::make_unique<VulkanVisionEncoder>(ctx, mmproj, model.config().dense.hidden_size);
@@ -656,7 +688,7 @@ void load_vulkan_model(VkContext& ctx, FusionModel& model, const std::string& pa
 }
 
 std::vector<GenerationStats> bench_model_vulkan(VkContext& ctx, FusionModel& model, int pp, int tg,
-                                                 int reps, int decode_prefix, OpTrace* trace) {
+                                                 int reps, int decode_prefix, OpTrace* trace, bool speculative) {
     using Clock = std::chrono::steady_clock;
     if (std::max(pp, decode_prefix + tg) > model.config().dense.max_seq_len)
         throw std::invalid_argument("Benchmark exceeds model context");
@@ -679,6 +711,17 @@ std::vector<GenerationStats> bench_model_vulkan(VkContext& ctx, FusionModel& mod
         prefill(prompt, rep < 0 ? nullptr : &samples[rep]);
     }
     for (int rep = -1; rep < reps && tg > 0; ++rep) {
+        if (speculative) {
+            GenerationStats decode_stats;
+            model.generate_vulkan(ctx, prefix, tg, &decode_stats);
+            if (rep >= 0) {
+                const auto& prefill_stats = samples[rep];
+                decode_stats.prefill_ms = prefill_stats.prefill_ms;
+                decode_stats.prefill_tok_per_s = prefill_stats.prefill_tok_per_s;
+                samples[rep] = decode_stats;
+            }
+            continue;
+        }
         model.reset_kv_and_state_vulkan(ctx);
         prefill(prefix, nullptr);
         const auto begin = Clock::now();
@@ -711,6 +754,7 @@ int cmd_bench_model(int argc, char** argv) {
     std::optional<bool> graph_option;
     std::string profile, profile_ops;
     CudaPlacementOptions placement;
+    SpeculativeArgs speculative;
     auto parse_int = [](std::string_view option, std::string_view arg) {
         const int value = parse_integer(option, arg);
         if (value < 0) throw std::invalid_argument("Expected a nonnegative integer for " + std::string(option));
@@ -731,6 +775,8 @@ int cmd_bench_model(int argc, char** argv) {
         else if (a == "--ubatch" && i + 1 < argc) ubatch = parse_int(a, argv[++i]);
         else if (a == "--decode-prefix" && i + 1 < argc) decode_prefix = parse_int(a, argv[++i]);
         else if (a == "--reps" && i + 1 < argc) reps = parse_int(a, argv[++i]);
+        else if (a == "--spec-mtp") speculative.mtp = true;
+        else if (i + 1 < argc && speculative.parse(a, argv[i + 1])) ++i;
         else if (i + 1 < argc && placement.parse(a, argv[i + 1])) ++i;
         else throw std::invalid_argument("Unknown or incomplete bench-model option: " + a);
     }
@@ -741,7 +787,12 @@ int cmd_bench_model(int argc, char** argv) {
     if (decode_prefix > std::numeric_limits<int>::max() - tg || (decode_prefix != 0 && tg == 0)) {
         throw std::invalid_argument("--decode-prefix requires a positive generation count and a valid context length");
     }
-    const auto max_seq = std::max(pp, decode_prefix + tg);
+    speculative.validate(true);
+    if (speculative.enabled() && (backend != "vulkan" || tg == 0 || !profile_ops.empty()))
+        throw std::invalid_argument("Speculative benchmark requires Vulkan generation without operation profiling");
+    const int prefix_len = speculative.enabled() ? std::max(1, decode_prefix) : decode_prefix;
+    if (prefix_len > std::numeric_limits<int>::max() - tg) throw std::invalid_argument("Benchmark context is too large");
+    const auto max_seq = std::max(pp, prefix_len + tg);
     std::vector<GenerationStats> samples;
     double load_ms = 0.0;
     bool graph_used = false;
@@ -774,18 +825,24 @@ int cmd_bench_model(int argc, char** argv) {
 #endif
     } else if (backend == "vulkan") {
 #ifdef FUSIONRT_ENABLE_VULKAN
-        if (placement.specified) throw std::invalid_argument("Placement options require the CUDA backend");
+        if (placement.cuda_only) throw std::invalid_argument("KV budgets and CPU thread settings require CUDA");
         VkContext ctx(static_cast<uint32_t>(vk_dev), 0, 0);
         ctx.set_kv_dtype(kv_dtype);
         ctx.set_prefill_batch(ubatch);
         ctx.set_device_profile(DeviceProfile::load(profile));
-        FusionModel model(HybridModelConfig{});
+        FusionModel model(placement.configure());
+        model.set_moe_gpu_experts(ctx, placement.experts);
+        model.enable_native_mtp(ctx, speculative.mtp);
         const auto load_start = std::chrono::steady_clock::now();
+        BpeTokenizer tokenizer;
+        if (!speculative.draft_path.empty()) load_tokenizer(tokenizer, path);
+        const auto draft = load_vulkan_draft(ctx, tokenizer, speculative, max_seq);
         load_vulkan_model(ctx, model, path, max_seq);
+        speculative.apply(model, draft.model.get());
         load_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - load_start).count();
         if (graph_option.value_or(false))
             std::clog << "--graph requested, using eager decoding because the backend is Vulkan\n";
-        samples = bench_model_vulkan(ctx, model, pp, tg, reps, decode_prefix, op_trace);
+        samples = bench_model_vulkan(ctx, model, pp, tg, reps, prefix_len, op_trace, speculative.enabled());
         ubatch = ctx.prefill_batch();
 #else
         throw std::runtime_error("Vulkan backend was not enabled in this build");
@@ -877,7 +934,7 @@ int cmd_run(int argc, char** argv) {
     }
     const int steps = steps_option.value_or(model_path.empty() ? 16 : 512);
     sampling.validate();
-    if (placement.specified && backend_s != "cuda") throw std::invalid_argument("Placement options require the CUDA backend");
+    if (placement.cuda_only && backend_s != "cuda") throw std::invalid_argument("KV budgets and CPU thread settings require CUDA");
     if (steps < 0 || max_seq <= 0) throw std::invalid_argument("Invalid --steps or --max-seq");
     if (slots < 1 || warmup < 0) throw std::invalid_argument("Expected --slots >= 1 and --warmup >= 0");
     if ((slots != 1 || warmup || trace_moe || !route_trace_path.empty() || cpu_moe_f32) && (backend_s != "cuda" || chat_mode))
@@ -890,8 +947,8 @@ int cmd_run(int argc, char** argv) {
         throw std::invalid_argument("Image input requires standard decoding");
     speculative.validate(!model_path.empty());
     if (json_grammar && chat_mode) throw std::invalid_argument("JSON grammar requires non-interactive run");
-    if (speculative.enabled() && (backend_s != "cuda" || chat_mode))
-        throw std::invalid_argument("Speculative decoding requires non-interactive CUDA run");
+    if (speculative.enabled() && chat_mode)
+        throw std::invalid_argument("Speculative decoding requires non-interactive run");
 
     DType wdt = DType::F32;
     if (dtype_s == "q8") wdt = DType::Q8_0;
@@ -1095,12 +1152,13 @@ int cmd_run(int argc, char** argv) {
         VkContext ctx(static_cast<uint32_t>(vk_dev), 0, 0);
         ctx.set_kv_dtype(kv_dtype);
         ctx.set_device_profile(DeviceProfile::load(profile));
-        if (!model_path.empty()) {
-            load_tokenizer(tok, model_path);
-            load_vulkan_model(ctx, model, model_path, max_seq);
-        } else {
-            model.init_synthetic_vulkan(ctx, 42);
-        }
+        model.set_moe_gpu_experts(ctx, placement.experts);
+        model.enable_native_mtp(ctx, speculative.mtp);
+        if (!model_path.empty()) load_tokenizer(tok, model_path);
+        const auto draft = load_vulkan_draft(ctx, tok, speculative, max_seq);
+        if (model_path.empty()) model.init_synthetic_vulkan(ctx, 42);
+        else load_vulkan_model(ctx, model, model_path, max_seq);
+        speculative.apply(model, draft.model.get());
         if (graph_option.value_or(false))
             std::clog << "--graph requested, using eager decoding because the backend is Vulkan\n";
         const bool stop_on_eos = !model_path.empty() && !ignore_eos;
@@ -1175,6 +1233,11 @@ int cmd_run(int argc, char** argv) {
                   << " prefill_tok/s=" << st.prefill_tok_per_s
                   << " decode_ms=" << st.decode_ms
                   << " decode_tok/s=" << st.decode_tok_per_s;
+        if (speculative.enabled()) {
+            const auto rate = st.spec_proposed ? static_cast<double>(st.spec_accepted) / st.spec_proposed : 0.0;
+            std::cout << " spec_proposed=" << st.spec_proposed << " spec_accepted=" << st.spec_accepted
+                      << " spec_accept_rate=" << rate;
+        }
         if (!prepared.inputs_embeds.empty()) {
             int64_t image_tokens = 0;
             for (const auto& embedding : prepared.inputs_embeds) image_tokens += embedding.host_rows.desc.shape[0];

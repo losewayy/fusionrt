@@ -40,10 +40,11 @@ void load_inputs(uint slot, uint m_base, uint n_base, uint k_base, uint stride, 
         for (uint j = 0u; j < VECTOR; ++j) {
             if (k + j < uint(pc.K)) {
                 if (m < uint(pc.M)) a[j] = x[m * uint(pc.K) + k + j];
-                if (n < uint(pc.N) && stride != 0u) {
-                    b[j] = dequantize_weight(pc.dtype, n * stride, k + j, block);
-                }
             }
+        }
+        if (n < uint(pc.N) && stride != 0u) {
+            if (k < uint(pc.K)) b.xy = dequantize_weight_pair(pc.dtype, n * stride, k, uint(pc.K), block);
+            if (k + 2u < uint(pc.K)) b.zw = dequantize_weight_pair(pc.dtype, n * stride, k + 2u, uint(pc.K), block);
         }
         tile_x[slot * TILE_M * K_STRIDE + i] = f16vec4(a);
         tile_w[slot * TILE_N * K_STRIDE + i] = f16vec4(b);

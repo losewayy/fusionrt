@@ -36,12 +36,12 @@ void main() {
         uint k = base_k + lane_n;
         uint wn = gl_WorkGroupID.x * TILE_N + lane_m;
         for (uint i = 0u; i < 2u; ++i) {
+            vec2 weights = wn + i < N && k < K && stride != 0u
+                         ? dequantize_weight_pair(pc.dtype, (wn + i) * stride, k, K, block) : vec2(0.0);
             for (uint j = 0u; j < 2u; ++j) {
                 tile_x[lane_m + i][lane_n + j] =
                     m + i < M && k + j < K ? x[(m + i) * K + k + j] : 0.0;
-                tile_w[lane_n + j][lane_m + i] =
-                    wn + i < N && k + j < K && stride != 0u
-                    ? dequantize_weight(pc.dtype, (wn + i) * stride, k + j, block) : 0.0;
+                tile_w[lane_n + j][lane_m + i] = weights[j];
             }
         }
         barrier();

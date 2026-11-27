@@ -1,5 +1,5 @@
 #include "vulkan_weights.h"
-#include "model_loader.h"
+#include "vulkan_spec_moe.h"
 
 #include <algorithm>
 #include <cmath>
@@ -47,7 +47,8 @@ DType mla_matrix_dtype(const HostTensor& source) {
     return source.desc.dtype == DType::F32 ? DType::F32 : DType::F16;
 }
 
-void reserve_vulkan_model(VkContext& ctx, const LoadedModelRaw& raw, DType kv_type) {
+std::pair<VkDeviceSize, VkDeviceSize> vulkan_model_bytes(const VkContext& ctx, const LoadedModelRaw& raw,
+                                                       DType kv_type, std::span<const int> resident) {
     const auto align = ctx.info().min_storage_offset_align;
     VkDeviceSize bytes = 0, state = 0;
     auto add = [&](VkDeviceSize n) {
@@ -73,7 +74,16 @@ void reserve_vulkan_model(VkContext& ctx, const LoadedModelRaw& raw, DType kv_ty
     matrix(raw.gemma_inputs.token_embeddings);
     matrix(raw.gemma_inputs.projection);
     f32(raw.gemma_inputs.norm);
-    for (const auto& l : raw.layers) {
+    if (!raw.mtp_projection.bytes().empty()) {
+        matrix(raw.mtp_projection);
+        matrix(raw.mtp_embedding);
+        matrix(raw.mtp_head);
+        for (const auto* t : {&raw.mtp_enorm, &raw.mtp_hnorm, &raw.mtp_head_norm}) f32(*t);
+        state_tensor(static_cast<VkDeviceSize>(raw.cfg.dense.max_seq_len) * raw.cfg.dense.hidden_size * sizeof(float));
+        state_tensor(static_cast<VkDeviceSize>(raw.cfg.dense.hidden_size) * sizeof(float));
+    }
+    for (size_t i = 0; i < raw.layers.size(); ++i) {
+        const auto& l = raw.layers[i];
         f32(l.attn_norm);
         f32(l.mlp_norm);
         for (const auto* t : {&l.o_proj, &l.gate_up, &l.gate, &l.up, &l.down, &l.ple_gate, &l.ple_projection})
@@ -84,9 +94,13 @@ void reserve_vulkan_model(VkContext& ctx, const LoadedModelRaw& raw, DType kv_ty
             for (const auto* t : {&l.router_w, &l.router_bias, &l.router_scale, &l.routed_norm,
                                  &l.expert_gate_scale, &l.expert_up_scale, &l.expert_down_scale})
                 f32(*t);
-            for (const auto* t : {&l.experts_gate_up, &l.experts_up, &l.experts_down,
-                                  &l.shared_gate_up, &l.shared_down, &l.shared_gate})
-                matrix(*t);
+            for (const auto* t : {&l.shared_gate_up, &l.shared_down, &l.shared_gate}) matrix(*t);
+            const auto experts = l.router_w.desc.shape[0];
+            if (resident[i] > 0) {
+                for (const auto* t : {&l.experts_gate_up, &l.experts_up, &l.experts_down})
+                    add(t->desc.nbytes() / experts * resident[i]);
+                if (resident[i] < experts) add(experts * sizeof(int32_t));
+            }
         }
         if (l.kind == 0) {
             const auto d = dense_config(raw.cfg, l);
@@ -125,13 +139,15 @@ void reserve_vulkan_model(VkContext& ctx, const LoadedModelRaw& raw, DType kv_ty
             const auto& g = raw.cfg.gdn;
             for (const auto* t : {&l.qkv_proj, &l.z_proj, &l.a_proj, &l.b_proj}) matrix(*t);
             for (const auto* t : {&l.conv_w, &l.conv_bias, &l.A_log, &l.dt_bias, &l.gdn_norm_w}) f32(*t);
-            state_tensor(static_cast<VkDeviceSize>(l.conv_w.desc.shape[0]) * std::max(1, g.conv_kernel_size - 1) * sizeof(float));
-            state_tensor(static_cast<VkDeviceSize>(g.num_v_heads) * g.head_k_dim * g.head_v_dim * sizeof(float));
+            for (int copy = 0; copy < 2; ++copy) {
+                state_tensor(static_cast<VkDeviceSize>(l.conv_w.desc.shape[0]) * std::max(1, g.conv_kernel_size - 1) * sizeof(float));
+                state_tensor(static_cast<VkDeviceSize>(g.num_v_heads) * g.head_k_dim * g.head_v_dim * sizeof(float));
+            }
         }
     }
     // The final state allocation need not end at the same alignment as the counted order.
     add(align);
-    ctx.reserve_model_memory(bytes - state, state);
+    return {bytes - state, state};
 }
 
 std::vector<Tensor> upload_mla_matrix(VkContext& ctx, const HostTensor& fp, DType dtype) {
@@ -224,6 +240,10 @@ HostTensor VulkanModelWeights::gather_host_embeddings(std::span<const int32_t> t
     return gather_host_rows(host_embeddings_, tokens);
 }
 
+HostTensor VulkanModelWeights::gather_mtp_embeddings(std::span<const int32_t> tokens) const {
+    return gather_host_rows(mtp_.host_embedding, tokens);
+}
+
 HostTensor VulkanModelWeights::gather_host_ple(std::span<const int32_t> tokens) const {
     return gather_host_rows(host_ple_, tokens);
 }
@@ -261,14 +281,54 @@ void VulkanModelWeights::upload(VkContext& ctx, const LoadedModelRaw& raw, const
     can_fallback = can_fallback && std::all_of(raw.layers.begin(), raw.layers.end(), [&](const auto& l) {
         return l.kind != 0 || dense_config(cfg, l).head_dim % 32 == 0;
     });
+    const auto costs = vulkan_detail::moe_costs(raw);
+    const auto& route_profile = cfg.moe.route_profile;
+    const auto heat = moe_layer_heat(costs, std::filesystem::path(std::u8string(route_profile.begin(), route_profile.end())),
+                                     cfg.moe.dynamic_cache);
+    std::vector<int> resident(costs.size());
+    if (std::any_of(costs.begin(), costs.end(), [](const auto& cost) { return cost.experts > 0; })) {
+        const auto scratch = vulkan_detail::moe_scratch_reserve(ctx, raw, costs);
+        if (!ctx.try_reserve_scratch_memory(scratch))
+            throw std::runtime_error("Vulkan MoE scratch cannot fit the device budget");
+    }
+    const auto reserve = [&](DType type) {
+        std::fill(resident.begin(), resident.end(), 0);
+        const auto [fixed, state] = vulkan_model_bytes(ctx, raw, type, resident);
+        const auto available = vulkan_detail::model_budget(ctx);
+        size_t budget = available - std::min(available, fixed + state);
+        for (;;) {
+            if (gpu_experts_ < 0) {
+                resident = select_moe_placement(costs, budget, vulkan_detail::moe_hardware(ctx),
+                    ctx.device_profile().launch_floor_us, heat, cfg.moe.dynamic_cache && route_profile.empty()).gpu_experts;
+            } else {
+                for (size_t i = 0; i < costs.size(); ++i) resident[i] = std::min(costs[i].experts, gpu_experts_);
+            }
+            const auto [weights, context] = vulkan_model_bytes(ctx, raw, type, resident);
+            try {
+                ctx.reserve_model_memory(weights, context);
+                return;
+            } catch (const std::runtime_error&) {
+                if (gpu_experts_ >= 0 || weights + context == fixed + state) throw;
+                // The driver's live budget can be below its reported device capacity.
+                budget -= std::max<size_t>(budget / 8, 1);
+            }
+        }
+    };
     try {
-        reserve_vulkan_model(ctx, raw, kv_type);
+        reserve(kv_type);
     } catch (const std::runtime_error&) {
         if (!can_fallback || ctx.kv_dtype() || kv_type != DType::F16) throw;
         kv_type = DType::Q8_0;
-        reserve_vulkan_model(ctx, raw, kv_type);
+        reserve(kv_type);
     }
 
+    auto& arena = ctx.weight_arena();
+    struct RestoreOnFailure {
+        VkArena& arena;
+        VkDeviceSize mark;
+        bool committed = false;
+        ~RestoreOnFailure() { if (!committed) arena.reset(mark); }
+    } restore{arena, arena.mark()};
     std::unordered_map<const void*, Tensor> sign_buffers;
     hadamard_signs_.clear();
     hadamard_width_ = 0;
@@ -299,6 +359,22 @@ void VulkanModelWeights::upload(VkContext& ctx, const LoadedModelRaw& raw, const
     host_embeddings_ = shader_embedding(raw.tok_embeddings.desc.dtype) ? HostTensor{} : raw.tok_embeddings;
     final_norm_ = upload_f32(raw.final_norm_w);
     lm_head_ = raw.lm_head_w.bytes().empty() ? tok_embeddings_ : upload_vk_weight(raw.lm_head_w);
+    mtp_ = {};
+    if (!raw.mtp_projection.bytes().empty()) {
+        mtp_.projection = upload_vk_weight(raw.mtp_projection);
+        mtp_.embedding = raw.mtp_embedding.bytes().empty() ? tok_embeddings_ : upload_vk_weight(raw.mtp_embedding);
+        mtp_.host_embedding = raw.mtp_embedding.bytes().empty() ? host_embeddings_ :
+            shader_embedding(raw.mtp_embedding.desc.dtype) ? HostTensor{} : raw.mtp_embedding;
+        mtp_.embedding_norm = upload_f32(raw.mtp_enorm);
+        mtp_.hidden_norm = upload_f32(raw.mtp_hnorm);
+        mtp_.head = raw.mtp_head.bytes().empty() ? lm_head_ : upload_vk_weight(raw.mtp_head);
+        mtp_.head_norm = raw.mtp_head_norm.bytes().empty() ? final_norm_ : upload_f32(raw.mtp_head_norm);
+        mtp_.projection_scale = raw.mtp_projection_scale;
+        mtp_.head_scale = raw.mtp_head_scale;
+        mtp_.trunk_hidden = ctx.weight_arena().alloc_tensor(
+            {cfg.dense.max_seq_len, cfg.dense.hidden_size}, DType::F32, "vk_mtp_trunk_hidden");
+        mtp_.draft_hidden = ctx.weight_arena().alloc_tensor({1, cfg.dense.hidden_size}, DType::F32, "vk_mtp_draft_hidden");
+    }
     const auto rope_factors = upload_f32(raw.rope_factors);
     gemma_inputs_ = {upload_vk_weight(raw.gemma_inputs.token_embeddings),
                      upload_vk_weight(raw.gemma_inputs.projection), upload_f32(raw.gemma_inputs.norm)};
@@ -314,7 +390,7 @@ void VulkanModelWeights::upload(VkContext& ctx, const LoadedModelRaw& raw, const
         VulkanMoeWeights L;
         L.cfg = cfg.moe;
         L.cfg.has_shared_expert = lr.has_shared;
-        L.cfg.num_experts = L.cfg.gpu_resident_experts = static_cast<int>(lr.router_w.desc.shape[0]);
+        L.cfg.num_experts = static_cast<int>(lr.router_w.desc.shape[0]);
         L.cfg.intermediate_size = static_cast<int>(lr.experts_down.desc.shape[2]);
         L.norm_w = upload_f32(!lr.router_scale.bytes().empty() ? lr.routed_norm :
                               lr.mlp_norm.bytes().empty() ? lr.attn_norm : lr.mlp_norm);
@@ -325,11 +401,20 @@ void VulkanModelWeights::upload(VkContext& ctx, const LoadedModelRaw& raw, const
         L.up_scale = upload_f32(lr.expert_up_scale);
         L.down_scale = upload_f32(lr.expert_down_scale);
         L.shared_gate_w = upload_vk_weight(lr.shared_gate);
-        L.gpu_gate_up_w = upload_vk_weight(lr.experts_gate_up);
+        const size_t layer = &lr - raw.layers.data();
+        std::vector<int32_t> ranking;
+        if (resident[layer] > 0 && resident[layer] < L.cfg.num_experts) {
+            if (!heat.empty()) ranking = heat[layer].ranked_experts;
+            else {
+                ranking.resize(L.cfg.num_experts);
+                std::iota(ranking.begin(), ranking.end(), 0);
+            }
+        }
+        vulkan_detail::upload_experts(ctx, L, lr, resident[layer], ranking);
         L.gate_region = L.gpu_gate_up_w;
-        if (!lr.experts_up.bytes().empty()) {
+        if (L.gpu_up_w.vk_buffer) {
             // Both native matrices live in the same arena. Bind one byte range across them.
-            const auto up = upload_vk_weight(lr.experts_up);
+            const auto& up = L.gpu_up_w;
             const auto offset = up.vk_offset - L.gpu_gate_up_w.vk_offset;
             if (offset + up.nbytes() > std::numeric_limits<uint32_t>::max())
                 throw std::runtime_error("Vulkan MoE gate/up weights exceed shader address range");
@@ -339,7 +424,6 @@ void VulkanModelWeights::upload(VkContext& ctx, const LoadedModelRaw& raw, const
             L.gate_region.vk_buffer = L.gpu_gate_up_w.vk_buffer;
             L.gate_region.vk_offset = L.gpu_gate_up_w.vk_offset;
         }
-        L.gpu_down_w = upload_vk_weight(lr.experts_down);
         if (lr.has_shared) {
             L.cfg.shared_intermediate_size = static_cast<int>(lr.shared_down.desc.shape[1]);
             L.shared_gate_up_w = upload_vk_weight(lr.shared_gate_up);
@@ -438,6 +522,10 @@ void VulkanModelWeights::upload(VkContext& ctx, const LoadedModelRaw& raw, const
     }
     ctx.synchronize();
     cfg_ = cfg;
+    cfg_.gpu_experts = resident;
+    if (!moe_layers_.empty())
+        cfg_.moe.gpu_resident_experts = *std::max_element(resident.begin(), resident.end());
+    restore.committed = true;
 }
 
 void VulkanModelWeights::init_synthetic_vulkan(VkContext& ctx, uint64_t seed, const VulkanLoadHooks& hooks) {
@@ -515,6 +603,13 @@ void VulkanModelWeights::init_synthetic_vulkan(VkContext& ctx, uint64_t seed, co
         }
         raw.layers.push_back(std::move(lr));
     }
+    if (load_mtp_) {
+        if (raw.layers.empty() || cfg_.arch == "moe") throw std::invalid_argument("Synthetic NextN requires dense or GDN layers");
+        raw.layers.push_back(raw.layers.front());
+        raw.mtp_projection = make_rand_f32({H, 2 * H}, rng, 0.04f);
+        raw.mtp_enorm = make_ones_f32({H});
+        raw.mtp_hnorm = make_ones_f32({H});
+    }
     upload(ctx, raw, hooks, DType::F32);
 }
 
@@ -522,7 +617,18 @@ bool VulkanModelWeights::load_gguf_vulkan(VkContext& ctx, const std::string& pat
                                          int max_seq_override, const VulkanLoadHooks& hooks) {
     LoadedModelRaw raw;
     if (!parse_gguf_model_raw(path, max_seq_override, raw, err)) return false;
-    raw.layers.resize(raw.cfg.num_layers);
+    if (load_mtp_ && raw.mtp_projection.bytes().empty()) {
+        if (err) *err = "--spec-mtp requires a Qwen GGUF with an integrated NextN block";
+        return false;
+    }
+    if (!load_mtp_) {
+        raw.layers.resize(raw.cfg.num_layers);
+        raw.mtp_projection = {};
+        raw.mtp_embedding = {};
+        raw.mtp_head = {};
+    }
+    raw.cfg.moe.route_profile = cfg_.moe.route_profile;
+    raw.cfg.moe.dynamic_cache = cfg_.moe.dynamic_cache;
     upload(ctx, raw, hooks, DType::F16);
     return true;
 }
@@ -530,7 +636,13 @@ bool VulkanModelWeights::load_gguf_vulkan(VkContext& ctx, const std::string& pat
 bool VulkanModelWeights::load_safetensors_vulkan(VkContext& ctx, const std::string& path, std::string* err,
                                          int max_seq_override, const VulkanLoadHooks& hooks) {
     LoadedModelRaw raw;
+    if (load_mtp_) {
+        if (err) *err = "--spec-mtp requires a GGUF model";
+        return false;
+    }
     if (!parse_safetensors_model_raw(path, max_seq_override, raw, err)) return false;
+    raw.cfg.moe.route_profile = cfg_.moe.route_profile;
+    raw.cfg.moe.dynamic_cache = cfg_.moe.dynamic_cache;
     upload(ctx, raw, hooks, DType::F16);
     return true;
 }

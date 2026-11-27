@@ -13,8 +13,9 @@ layout(push_constant) uniform Push { int M; int N; int K; int dtype; } pc;
 
 #define FUSIONRT_MAINLINE_ONLY
 #define FUSIONRT_GEMV_DEQUANTIZE dequantize_mainline
+#define FUSIONRT_BLOCK_GEMV dequantize_mainline_block
 #include "../epilogue/codec_common.glsl"
 
 void main() {
-    run_gemv();
+    run_block_gemv();
 }

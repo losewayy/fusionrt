@@ -15,6 +15,7 @@
 namespace fusionrt {
 
 struct OpTrace;
+class VkContext;
 
 struct VkCoopMatConfig {
     bool supported = false;
@@ -80,6 +81,7 @@ public:
 
 private:
     friend class VkContext;
+    VkContext* owner_ = nullptr;
     VkBufferAllocation alloc_;
     VkDeviceSize offset_ = 0;
     VkDeviceSize align_ = 256;
@@ -91,6 +93,7 @@ struct VkPipelineEntry {
     VkPipelineLayout pipe_layout = VK_NULL_HANDLE;
     VkPipeline pipeline = VK_NULL_HANDLE;
     uint32_t num_bindings = 0;
+    uint32_t read_only_bindings = 0;
 };
 
 struct VkBatchDispatch {
@@ -141,10 +144,18 @@ public:
     // Execute a single compute dispatch synchronously (returns GPU timestamp ms if enabled)
     double dispatch_single(const VkBatchDispatch& d, bool measure_timestamp = false);
 
-    // Execute an entire sequence of compute dispatches in ONE VkCommandBuffer with barriers
-    // between dispatches to eliminate per-op command-buffer submission overhead.
+    // Execute a sequence of compute dispatches and copies in one synchronous submission.
     // Returns total GPU execution time in milliseconds via VK_QUERY_TYPE_TIMESTAMP.
     double dispatch_batched(const std::vector<VkBatchDispatch>& dispatches, bool measure_timestamp = true);
+
+    void set_replay_enabled(bool enabled);
+    bool replay_enabled() const { return replay_enabled_; }
+    void invalidate_replay();
+    void reset_arenas();
+    size_t last_batch_descriptor_allocs() const { return last_batch_descriptor_allocs_; }
+    // Includes the final barrier for later submissions on the same queue.
+    size_t last_batch_barriers() const { return last_batch_barriers_; }
+    bool last_batch_replay_hit() const { return last_batch_replay_hit_; }
 
     // Unbatched baseline: submits one command buffer + queue submit per dispatch
     double dispatch_unbatched(const std::vector<VkBatchDispatch>& dispatches, bool measure_timestamp = true);
@@ -155,10 +166,14 @@ public:
     static std::string find_shader_path(const std::string& shader_name);
 
 private:
+    struct BatchCache;
+    double dispatch_cached(const std::vector<VkBatchDispatch>& dispatches, bool measure_timestamp);
+    void record_batch(const std::vector<VkBatchDispatch>& dispatches, bool timed);
     VkDeviceSize available_device_bytes(uint32_t memory_type) const;
     void create_instance_and_device(uint32_t device_index);
     VkCommandBuffer begin_one_time_commands();
     void submit_and_wait(VkCommandBuffer cmd);
+    void submit_recorded(VkCommandBuffer cmd);
     void copy_buffer(VkBuffer src, VkDeviceSize src_off, VkBuffer dst, VkDeviceSize dst_off, VkDeviceSize bytes);
 
     VkInstance instance_ = VK_NULL_HANDLE;
@@ -173,6 +188,11 @@ private:
     uint32_t timestamp_bits_ = 0;
     VkQueryPool query_pool_ = VK_NULL_HANDLE;
     VkFence fence_ = VK_NULL_HANDLE;
+    std::unique_ptr<BatchCache> batch_;
+    bool replay_enabled_ = true;
+    bool last_batch_replay_hit_ = false;
+    size_t last_batch_descriptor_allocs_ = 0;
+    size_t last_batch_barriers_ = 0;
 
     VkDeviceInfo info_;
     DeviceProfile profile_;
@@ -186,6 +206,7 @@ private:
     VkBufferAllocation l2_flush_buf_;
 
     std::unordered_map<std::string, VkPipelineEntry> pipelines_;
+    std::string pipeline_key_;
 };
 
 void check_vk(VkResult res, const char* expr, const char* file, int line);

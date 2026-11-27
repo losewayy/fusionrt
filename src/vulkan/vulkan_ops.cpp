@@ -38,8 +38,8 @@ void append_linear_dispatch(std::vector<VkBatchDispatch>& ops,
     if (M <= 8) {
         const char* shader = nullptr;
         if (w.dtype == DType::F32 && K % 4 == 0) shader = "gemv_vec4.comp";
-        else if (M == 1 && w.dtype == DType::Q8_0) shader = "gemv_q8_0.comp";
-        else if (M == 1 && w.dtype == DType::Q4_0) shader = "gemv_q4_0.comp";
+        else if (w.dtype == DType::Q8_0) shader = "gemv_q8_0.comp";
+        else if (w.dtype == DType::Q4_0) shader = "gemv_q4_0.comp";
         if (shader) {
             const PushGemm push{M, N, K};
             ops.push_back({shader, n, 1, 1, {x, w, y}, store_push(push_storage, push), sizeof(push)});
@@ -261,122 +261,7 @@ double VkContext::dispatch_single(const VkBatchDispatch& d, bool measure_timesta
 }
 
 double VkContext::dispatch_batched(const std::vector<VkBatchDispatch>& dispatches, bool measure_timestamp) {
-    if (dispatches.empty()) return 0.0;
-
-    measure_timestamp = measure_timestamp && timestamp_bits_ > 0;
-    uint32_t set_count = 0, descriptor_count = 0;
-    for (const auto& d : dispatches) {
-        if (!d.copies.empty()) continue;
-        ++set_count;
-        descriptor_count += static_cast<uint32_t>(d.buffers.size());
-    }
-    if (set_count > descriptor_set_capacity_ || descriptor_count > descriptor_capacity_) {
-        VkDescriptorPoolSize size{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, std::max(descriptor_count, 4096u)};
-        VkDescriptorPoolCreateInfo ci{};
-        ci.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
-        ci.maxSets = std::max(set_count, 1024u);
-        ci.poolSizeCount = 1;
-        ci.pPoolSizes = &size;
-        VkDescriptorPool pool;
-        FUSIONRT_VK_CHECK(vkCreateDescriptorPool(device_, &ci, nullptr, &pool));
-        if (desc_pool_) vkDestroyDescriptorPool(device_, desc_pool_, nullptr);
-        desc_pool_ = pool;
-        descriptor_capacity_ = size.descriptorCount;
-        descriptor_set_capacity_ = ci.maxSets;
-    }
-    struct PoolReset {
-        VkDevice device;
-        VkDescriptorPool pool;
-        ~PoolReset() { if (pool) vkResetDescriptorPool(device, pool, 0); }
-    } reset{device_, desc_pool_};
-
-    std::vector<VkDescriptorSet> dsets(dispatches.size());
-    for (size_t i = 0; i < dispatches.size(); ++i) {
-        const auto& d = dispatches[i];
-        if (!d.copies.empty()) continue;
-        const auto& pipe = get_pipeline(d.shader_name, static_cast<uint32_t>(d.buffers.size()), d.push_size);
-        VkDescriptorSetAllocateInfo dsai{};
-        dsai.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
-        dsai.descriptorPool = desc_pool_;
-        dsai.descriptorSetCount = 1;
-        dsai.pSetLayouts = &pipe.desc_layout;
-        VkDescriptorSet ds = VK_NULL_HANDLE;
-        FUSIONRT_VK_CHECK(vkAllocateDescriptorSets(device_, &dsai, &ds));
-
-        std::vector<VkDescriptorBufferInfo> dbis(d.buffers.size());
-        std::vector<VkWriteDescriptorSet> writes(d.buffers.size());
-        for (size_t i = 0; i < d.buffers.size(); ++i) {
-            dbis[i].buffer = reinterpret_cast<VkBuffer>(d.buffers[i].vk_buffer);
-            dbis[i].offset = d.buffers[i].vk_offset;
-            dbis[i].range = std::max<VkDeviceSize>((d.buffers[i].nbytes() + 3) & ~VkDeviceSize{3}, 16);
-
-            writes[i] = VkWriteDescriptorSet{};
-            writes[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-            writes[i].dstSet = ds;
-            writes[i].dstBinding = static_cast<uint32_t>(i);
-            writes[i].descriptorCount = 1;
-            writes[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-            writes[i].pBufferInfo = &dbis[i];
-        }
-        vkUpdateDescriptorSets(device_, static_cast<uint32_t>(writes.size()), writes.data(), 0, nullptr);
-        dsets[i] = ds;
-    }
-
-    VkCommandBuffer cmd = begin_one_time_commands();
-
-    if (measure_timestamp) {
-        vkCmdResetQueryPool(cmd, query_pool_, 0, 2);
-        vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, query_pool_, 0);
-    }
-
-    constexpr auto compute_and_transfer = VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT;
-    for (size_t i = 0; i < dispatches.size(); ++i) {
-        const auto& d = dispatches[i];
-        if (!d.copies.empty()) {
-            auto regions = d.copies;
-            for (auto& r : regions) {
-                r.srcOffset += d.buffers[0].vk_offset;
-                r.dstOffset += d.buffers[1].vk_offset;
-            }
-            vkCmdCopyBuffer(cmd, reinterpret_cast<VkBuffer>(d.buffers[0].vk_buffer),
-                            reinterpret_cast<VkBuffer>(d.buffers[1].vk_buffer),
-                            static_cast<uint32_t>(regions.size()), regions.data());
-        } else {
-            const auto& pipe = get_pipeline(d.shader_name, static_cast<uint32_t>(d.buffers.size()), d.push_size);
-            vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipe.pipeline);
-            vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipe.pipe_layout, 0, 1, &dsets[i], 0, nullptr);
-            if (d.push_size) {
-                vkCmdPushConstants(cmd, pipe.pipe_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, d.push_size, d.push_data);
-            }
-            vkCmdDispatch(cmd, d.gx, d.gy, d.gz);
-        }
-
-        // Include the last operation so a subsequent submission can read the results or KV.
-        VkMemoryBarrier bar{};
-        bar.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
-        bar.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
-        bar.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT |
-                           VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
-        vkCmdPipelineBarrier(cmd, compute_and_transfer, compute_and_transfer, 0, 1, &bar, 0, nullptr, 0, nullptr);
-    }
-
-    if (measure_timestamp) {
-        vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, query_pool_, 1);
-    }
-
-    submit_and_wait(cmd);
-
-    double gpu_ms = 0.0;
-    if (measure_timestamp) {
-        uint64_t ts[2]{0, 0};
-        FUSIONRT_VK_CHECK(vkGetQueryPoolResults(device_, query_pool_, 0, 2, sizeof(ts), ts,
-                                                sizeof(uint64_t), VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT));
-        const uint64_t elapsed = (ts[1] - ts[0]) & (UINT64_MAX >> (64 - timestamp_bits_));
-        gpu_ms = static_cast<double>(elapsed) * static_cast<double>(info_.timestamp_period_ns) * 1e-6;
-    }
-
-    vkFreeCommandBuffers(device_, cmd_pool_, 1, &cmd);
-    return gpu_ms;
+    return dispatch_cached(dispatches, measure_timestamp);
 }
 
 double VkContext::dispatch_unbatched(const std::vector<VkBatchDispatch>& dispatches, bool measure_timestamp) {

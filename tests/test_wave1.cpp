@@ -3,7 +3,8 @@
 #include "../src/models/cuda_dispatch.h"
 #endif
 #ifdef FUSIONRT_ENABLE_VULKAN
-#include "test_vulkan_v2.h"
+#include "test_vulkan_v3.h"
+#include "test_vulkan_v3_replay.h"
 #endif
 #include "test_support.h"
 #include <future>
@@ -172,6 +173,8 @@ void test_wave1_inputs() {
 #ifdef FUSIONRT_ENABLE_VULKAN
     test_vulkan_dense_kv_reset();
     test_vulkan_v2();
+    test_vulkan_v3();
+    test_vulkan_v3_replay();
 #ifndef FUSIONRT_ENABLE_CUDA
     test_vulkan_v1();
 #endif

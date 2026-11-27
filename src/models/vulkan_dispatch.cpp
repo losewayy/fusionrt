@@ -8,6 +8,7 @@
 #include <cmath>
 #include <cstring>
 #include <initializer_list>
+#include <numeric>
 
 namespace fusionrt {
 namespace {
@@ -156,7 +157,7 @@ void VulkanDispatch::append_linear(Batch& batch, const Tensor& input, const Tens
 
 void VulkanDispatch::append_dense(Batch& batch, const VulkanDenseWeights& layer, const VulkanDenseKv& kv,
                                   DenseScratch& scratch, const Tensor& input, const Tensor& output,
-                                  int hidden, int pos, int rows, std::span<const AttentionSpan> image_spans) {
+                                  int hidden, int pos, int rows, std::span<const AttentionSpan> image_spans, bool verify) {
     const auto& cfg = layer.cfg;
     const int nq = cfg.num_attention_heads, nkv = cfg.num_key_value_heads, hd = cfg.head_dim;
     const int q_dim = nq * hd, kv_dim = nkv * hd, qkv_dim = q_dim + 2 * kv_dim;
@@ -213,9 +214,23 @@ void VulkanDispatch::append_dense(Batch& batch, const VulkanDenseWeights& layer,
     }
     const float scale = layer.gemma4 ? 1.0f : 1.0f / std::sqrt(static_cast<float>(hd));
     const int window = layer.sliding_window;
-    if (rows == 1) {
-        append(batch, "sequence/flash_attention_decode.spv", nq, {scratch.query, kv.key, kv.value, scratch.attention},
-               vk_ops::PushFaDecode{nq, nkv, hd, pos + 1, kv_type, window, scale});
+    if (rows == 1 || verify) {
+        // Use decode's reduction for each verification row, while batching projections and KV writes.
+        for (int row = 0; row < rows; ++row) {
+            auto query = scratch.query.slice_dim0(row, 1);
+            auto result = scratch.attention.slice_dim0(row, 1);
+            const auto offset = query.vk_offset - scratch.query.vk_offset;
+            const auto bytes = query.nbytes();
+            const bool aligned = query.vk_offset % batch.ctx.info().min_storage_offset_align == 0;
+            if (!aligned) {
+                query = scratch.image_query;
+                result = scratch.image_attention;
+                append_copy(batch, scratch.query, query, {{offset, 0, bytes}});
+            }
+            append(batch, "sequence/flash_attention_decode.spv", nq, {query, kv.key, kv.value, result},
+                   vk_ops::PushFaDecode{nq, nkv, hd, pos + row + 1, kv_type, window, scale});
+            if (!aligned) append_copy(batch, result, scratch.attention, {{0, offset, bytes}});
+        }
     } else {
         const auto attention = [&](int begin, int end, int kv_len, int swin, bool causal) {
             if (begin == end) return;
@@ -362,6 +377,12 @@ void VulkanDispatch::append_finish_ffn(Batch& batch, const Tensor& activation, c
 
 void VulkanDispatch::append_moe(Batch& batch, const VulkanMoeWeights& layer, MoeScratch& scratch,
                                 const Tensor& input, const Tensor& output, int hidden, int rows) {
+    append_moe_route(batch, layer, scratch, input, hidden, rows);
+    append_moe_experts(batch, layer, scratch, input, output, hidden, rows);
+}
+
+void VulkanDispatch::append_moe_route(Batch& batch, const VulkanMoeWeights& layer, MoeScratch& scratch,
+                                      const Tensor& input, int hidden, int rows) {
     const auto& cfg = layer.cfg;
     const int experts = cfg.num_experts, top_k = cfg.top_k, inter = cfg.intermediate_size;
     const bool geglu = layer.router_scale.vk_buffer != 0;
@@ -377,12 +398,23 @@ void VulkanDispatch::append_moe(Batch& batch, const VulkanMoeWeights& layer, Moe
         layer.up_offset, 0, cfg.expert_weights_scale};
     append(batch, "epilogue/moe_quant_ops.spv", rows,
            {scratch.router_logits, scratch.indices, scratch.weights, layer.router_bias, {}, {}, {}, {}, layer.down_scale}, push);
-    push.mode = 1;
-    push.flags = (layer.up_offset ? 2 : 0) | (geglu ? 4 : 0) |
-                 (layer.gate_scale.vk_buffer ? 8 : 0) | (layer.up_scale.vk_buffer ? 16 : 0);
-    append(batch, "epilogue/moe_quant_ops.spv", inter,
-           {scratch.normalized, scratch.indices, {}, layer.gate_scale, {}, layer.gate_region,
-            scratch.intermediate, {}, layer.up_scale}, push, top_k, rows);
+}
+
+void VulkanDispatch::append_moe_experts(Batch& batch, const VulkanMoeWeights& layer, MoeScratch& scratch,
+                                        const Tensor& input, const Tensor& output, int hidden, int rows) {
+    const auto& cfg = layer.cfg;
+    const int inter = cfg.intermediate_size, top_k = cfg.top_k;
+    const bool geglu = layer.router_scale.vk_buffer != 0;
+    const int mapped = layer.slot_map.vk_buffer ? 1 : 0;
+    vk_ops::PushMoeQuant push{1, rows, hidden, inter, cfg.num_experts, top_k,
+        mapped | (layer.up_offset ? 2 : 0) | (geglu ? 4 : 0) |
+        (layer.gate_scale.vk_buffer ? 8 : 0) | (layer.up_scale.vk_buffer ? 16 : 0),
+        0, 0, static_cast<int>(layer.gpu_gate_up_w.dtype), static_cast<int>(layer.up_dtype),
+        static_cast<int>(layer.gpu_down_w.dtype), cfg.gpu_resident_experts, 0, 0, layer.up_offset, 0, 1.f};
+    if (push.resident)
+        append(batch, "epilogue/moe_quant_ops.spv", inter,
+               {scratch.normalized, scratch.indices, {}, layer.gate_scale, layer.slot_map, layer.gate_region,
+                scratch.intermediate, {}, layer.up_scale}, push, top_k, rows);
     if (cfg.has_shared_expert) {
         const int shared = cfg.shared_intermediate_size;
         append_linear(batch, scratch.normalized, layer.shared_gate_up_w, scratch.shared_gate_up, rows, 2 * shared, hidden);
@@ -409,19 +441,44 @@ void VulkanDispatch::append_moe(Batch& batch, const VulkanMoeWeights& layer, Moe
         }
     }
     push.mode = 2;
-    push.flags = (geglu ? 0 : 2) | (cfg.has_shared_expert ? 4 : 0);
+    push.flags = mapped | (geglu ? 0 : 2) | (cfg.has_shared_expert ? 4 : 0);
     append(batch, "epilogue/moe_quant_ops.spv", hidden,
-           {{}, scratch.indices, scratch.weights, input, {}, layer.gpu_down_w, scratch.intermediate, output,
+           {{}, scratch.indices, scratch.weights, input, layer.slot_map, layer.gpu_down_w, scratch.intermediate, output,
             scratch.shared_down}, push, rows);
 }
 
+int VulkanDispatch::head_chunk_width(const VkContext& ctx, const Tensor& head, int vocab) {
+    const auto stride = row_nbytes(head.dtype, head.shape[1]);
+    const auto align = ctx.info().min_storage_offset_align;
+    const auto quantum = align / std::gcd(align, static_cast<uint64_t>(stride));
+    // Stay within the Vulkan minimum dispatch and storage descriptor limits.
+    const auto limit = std::min<uint64_t>(65535, (128ULL << 20) / stride);
+    if (static_cast<uint64_t>(vocab) <= limit) return vocab;
+    if (quantum > limit) throw std::invalid_argument("Vulkan vocabulary head cannot be split into aligned ranges");
+    return static_cast<int>((limit / quantum) * quantum);
+}
+
 void VulkanDispatch::append_head(Batch& batch, const Tensor& norm, const Tensor& head, Tensor& normalized,
-                                 Tensor& logits, const Tensor& input, int hidden, int vocab, float eps, float softcap) {
-    append_norm_linear(batch, input, norm, head, normalized, logits, 1, vocab, hidden, eps);
+                                 Tensor& logits, const Tensor& input, int hidden, int vocab, float eps, float softcap,
+                                 int rows, Tensor chunk) {
+    if (!chunk.vk_buffer) {
+        append_norm_linear(batch, input, norm, head, normalized, logits, rows, vocab, hidden, eps);
+    } else {
+        append_norm(batch, input, norm, normalized, rows, hidden, eps);
+        const auto& x = head.hadamard_block ? batch.rotated : normalized;
+        append_hadamard(batch, head, normalized, x, rows, hidden, false);
+        const int capacity = static_cast<int>(chunk.shape[1]);
+        for (int first = 0; first < vocab; first += capacity) {
+            const int width = std::min(capacity, vocab - first);
+            const auto weights = head.slice_dim0(first, width);
+            vk_ops::append_linear_dispatch(batch.ops, x, weights, chunk, rows, width, hidden, batch.push, &batch.ctx);
+            append_columns(batch, chunk, logits, rows, width, width, vocab, 0, first);
+        }
+    }
     if (softcap > 0.f) {
-        vk_ops::PushGemma push{2, 1, vocab};
+        vk_ops::PushGemma push{2, rows, vocab};
         push.cap = softcap;
-        append_gemma(batch, logits, {}, logits, push, vector_groups(1, vocab));
+        append_gemma(batch, logits, {}, logits, push, vector_groups(rows, vocab));
     }
 }
 

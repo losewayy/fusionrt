@@ -92,6 +92,11 @@ public:
 #endif
 
 #ifdef FUSIONRT_ENABLE_VULKAN
+    void set_moe_gpu_experts(VkContext&, int count);
+    void enable_native_mtp(VkContext&, bool enabled);
+    bool has_native_mtp(const VkContext&) const;
+    void set_vulkan_speculation(int ngram, FusionModel* draft, int depth, bool mtp, float p_min);
+    std::vector<float> forward_verify_vulkan(VkContext&, std::span<const int32_t> tokens, int start_pos);
     void init_synthetic_vulkan(VkContext& ctx, uint64_t seed = 42);
     bool load_gguf_vulkan(VkContext& ctx, const std::string& path, std::string* err = nullptr, int max_seq_override = 0);
     bool load_safetensors_vulkan(VkContext& ctx, const std::string& path, std::string* err = nullptr, int max_seq_override = 0);
@@ -116,6 +121,8 @@ private:
 
 #ifdef FUSIONRT_ENABLE_VULKAN
     std::shared_ptr<VulkanModelRuntime> vulkan_;
+    int vulkan_gpu_experts_ = -1;
+    bool vulkan_load_mtp_ = false;
 #endif
 };
 

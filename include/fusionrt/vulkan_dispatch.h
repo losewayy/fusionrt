@@ -55,7 +55,7 @@ struct VulkanDispatch {
     static void append_hadamard(Batch&, const Tensor& weight, const Tensor& input, const Tensor& output,
                                 int rows, int width, bool inverse);
     static void append_dense(Batch&, const VulkanDenseWeights&, const VulkanDenseKv&, DenseScratch&,
-                             const Tensor& input, const Tensor& output, int hidden, int pos, int rows, std::span<const AttentionSpan> image_spans = {});
+                             const Tensor& input, const Tensor& output, int hidden, int pos, int rows, std::span<const AttentionSpan> image_spans = {}, bool verify = false);
     static void append_mla(Batch&, const VulkanDenseWeights&, const VulkanDenseKv&, MlaScratch&,
                            const Tensor& input, const Tensor& output, int hidden, int pos, int rows);
     static void append_gdn(Batch&, const VulkanGdnWeights&, const VulkanGdnState&, GdnScratch&,
@@ -68,8 +68,13 @@ struct VulkanDispatch {
                                   const Tensor& post_norm, int hidden, int rows, float eps, float scale);
     static void append_moe(Batch&, const VulkanMoeWeights&, MoeScratch&,
                            const Tensor& input, const Tensor& output, int hidden, int rows);
+    static void append_moe_route(Batch&, const VulkanMoeWeights&, MoeScratch&, const Tensor& input, int hidden, int rows);
+    static void append_moe_experts(Batch&, const VulkanMoeWeights&, MoeScratch&,
+                                   const Tensor& input, const Tensor& output, int hidden, int rows);
     static void append_head(Batch&, const Tensor& norm, const Tensor& head, Tensor& normalized, Tensor& logits,
-                            const Tensor& input, int hidden, int vocab, float eps, float softcap);
+                            const Tensor& input, int hidden, int vocab, float eps, float softcap,
+                            int rows = 1, Tensor chunk = {});
+    static int head_chunk_width(const VkContext&, const Tensor&, int vocab);
 };
 
 }  // namespace fusionrt

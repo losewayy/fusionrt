@@ -2,6 +2,7 @@
 
 #include "fusionrt/model_types.h"
 #include <unordered_map>
+#include "../core/moe_residency.h"
 
 namespace fusionrt {
 
@@ -43,13 +44,25 @@ struct VulkanGdnWeights {
 
 struct VulkanMoeWeights : VkSparseMoELayer {
     Tensor router_bias, router_scale, gate_scale, up_scale, down_scale, gate_region;
+    Tensor gpu_up_w, slot_map;
+    HostTensor cpu_gate, cpu_up, cpu_down, cpu_gate_scale, cpu_up_scale;
+    mutable std::vector<int32_t> expert_to_slot;
+    mutable std::optional<MoeDynamicCache> cache;
+    mutable CostHardware cache_hardware;
     uint32_t up_offset = 0;
     DType up_dtype = DType::F32;
 };
 
+struct VulkanMtpWeights {
+    Tensor projection, embedding, embedding_norm, hidden_norm, head, head_norm, trunk_hidden, draft_hidden;
+    HostTensor host_embedding;
+    float projection_scale = 1.f, head_scale = 1.f;
+};
+
 class VulkanModelWeights {
 public:
-    explicit VulkanModelWeights(const HybridModelConfig& cfg) : cfg_(cfg) {}
+    explicit VulkanModelWeights(const HybridModelConfig& cfg, int gpu_experts = -1, bool mtp = false)
+        : cfg_(cfg), gpu_experts_(gpu_experts), load_mtp_(mtp) {}
 
     void init_synthetic_vulkan(VkContext&, uint64_t seed, const VulkanLoadHooks&);
     bool load_gguf_vulkan(VkContext&, const std::string&, std::string*, int, const VulkanLoadHooks&);
@@ -70,11 +83,16 @@ public:
     const auto& dense_layers() const { return dense_layers_; }
     const auto& gdn_layers() const { return gdn_layers_; }
     const auto& moe_layers() const { return moe_layers_; }
+    const auto& mtp() const { return mtp_; }
+    HostTensor gather_mtp_embeddings(std::span<const int32_t> tokens) const;
 
     void upload(VkContext&, const model_io::LoadedModelRaw&, const VulkanLoadHooks&, DType default_kv_type);
 
 private:
     HybridModelConfig cfg_;
+    int gpu_experts_;
+    bool load_mtp_;
+    VulkanMtpWeights mtp_;
     Tensor dummy_;
     std::unordered_map<uint64_t, Tensor> hadamard_signs_;
     int hadamard_width_ = 0;

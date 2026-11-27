@@ -12,8 +12,9 @@ layout(std430, binding = 2) writeonly buffer Y { float y[]; };
 layout(push_constant) uniform Push { int M; int N; int K; int dtype; } pc;
 
 #define FUSIONRT_GEMV_DEQUANTIZE dequantize_weight_codec
+#define FUSIONRT_BLOCK_GEMV dequantize_codec_block
 #include "../epilogue/codec_common.glsl"
 
 void main() {
-    run_gemv();
+    run_block_gemv();
 }

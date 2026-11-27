@@ -1,4 +1,5 @@
 #include "vulkan_session.h"
+#include "fusionrt/vulkan_dispatch.h"
 
 #include <algorithm>
 
@@ -24,8 +25,34 @@ void VulkanSessionManager::allocate_dense(VkContext& ctx, const DenseGQAConfig& 
 
 void VulkanSessionManager::allocate_gdn(VkContext& ctx, const GatedDeltaNetConfig& cfg, int conv_dim) {
     auto& arena = ctx.weight_arena();
-    gdn_states_.push_back({arena.alloc_tensor({conv_dim, std::max(1, cfg.conv_kernel_size - 1)}, DType::F32, "vk_cs"),
-                           arena.alloc_tensor({cfg.num_v_heads, cfg.head_k_dim, cfg.head_v_dim}, DType::F32, "vk_ss")});
+    const std::vector<int64_t> conv{conv_dim, std::max(1, cfg.conv_kernel_size - 1)};
+    const std::vector<int64_t> ssm{cfg.num_v_heads, cfg.head_k_dim, cfg.head_v_dim};
+    gdn_states_.push_back({arena.alloc_tensor(conv, DType::F32, "vk_cs"),
+                           arena.alloc_tensor(ssm, DType::F32, "vk_ss"),
+                           arena.alloc_tensor(conv, DType::F32, "vk_cs_snapshot"),
+                           arena.alloc_tensor(ssm, DType::F32, "vk_ss_snapshot")});
+}
+
+void VulkanSessionManager::copy_gdn_state(VkContext& ctx, size_t first, size_t end, bool restore) const {
+    VulkanDispatch::Batch batch{ctx};
+    const auto copy = [&](const Tensor& live, const Tensor& snapshot) {
+        VulkanDispatch::append_copy(batch, restore ? snapshot : live, restore ? live : snapshot,
+                                    {{0, 0, live.nbytes()}});
+    };
+    for (size_t index = first; index < end; ++index) {
+        const auto& state = gdn_states_.at(index);
+        copy(state.conv, state.conv_snapshot);
+        copy(state.ssm, state.ssm_snapshot);
+    }
+    if (!batch.ops.empty()) ctx.dispatch_batched(batch.ops, false);
+}
+
+void VulkanSessionManager::snapshot_gdn_state(VkContext& ctx, size_t first, size_t end) const {
+    copy_gdn_state(ctx, first, end, false);
+}
+
+void VulkanSessionManager::restore_gdn_state(VkContext& ctx, size_t first, size_t end) const {
+    copy_gdn_state(ctx, first, end, true);
 }
 
 void VulkanSessionManager::reset_kv_and_state_vulkan(VkContext& ctx) const {
