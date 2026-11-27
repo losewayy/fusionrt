@@ -496,13 +496,16 @@ std::vector<int32_t> FusionModel::generate_vulkan(VkContext& ctx, const std::vec
                                                   int max_new_tokens, GenerationStats* stats,
                                                   bool keep_state, int start_pos,
                                                   int32_t stop_eos_id) {
-    if (!keep_state) {
-        reset_kv_and_state_vulkan(ctx);
-        start_pos = 0;
-    }
+    if (max_new_tokens < 0 || start_pos < 0) throw std::invalid_argument("Invalid generation length or start position");
+    if (!keep_state) start_pos = 0;
     std::vector<int32_t> tokens = prompt_ids;
     if (tokens.empty()) tokens.push_back(1);
-    int prompt_len = static_cast<int>(tokens.size());
+    const auto total_tokens = static_cast<size_t>(start_pos) + tokens.size();
+    const int context = cfg_.dense.max_seq_len;
+    if (total_tokens > static_cast<size_t>(context)) throw prompt_context_error(total_tokens, context);
+    max_new_tokens = std::min(max_new_tokens, context - static_cast<int>(total_tokens));
+    const int prompt_len = static_cast<int>(tokens.size());
+    if (!keep_state) reset_kv_and_state_vulkan(ctx);
 
     std::vector<float> logits;
     int pos = start_pos;
@@ -514,16 +517,20 @@ std::vector<int32_t> FusionModel::generate_vulkan(VkContext& ctx, const std::vec
     double prefill_ms = std::chrono::duration<double, std::milli>(tp1 - tp0).count();
 
     int gen_count = 0;
+    int decode_steps = 0;
     auto td0 = std::chrono::high_resolution_clock::now();
     for (int step = 0; step < max_new_tokens; ++step) {
         int32_t next_tok = static_cast<int32_t>(
             std::distance(logits.begin(), std::max_element(logits.begin(), logits.end())));
         tokens.push_back(next_tok);
         ++gen_count;
-        if (stop_eos_id >= 0 && next_tok == stop_eos_id) break;
-        if (step + 1 < max_new_tokens) {
+        const bool eos = next_tok == stop_eos_id;
+        // A continued turn starts after the last emitted token, including EOS.
+        if (keep_state || (!eos && step + 1 < max_new_tokens)) {
             logits = forward_token_vulkan(ctx, next_tok, pos++);
+            ++decode_steps;
         }
+        if (eos) break;
     }
     auto td1 = std::chrono::high_resolution_clock::now();
     double decode_ms = std::chrono::duration<double, std::milli>(td1 - td0).count();
@@ -534,7 +541,7 @@ std::vector<int32_t> FusionModel::generate_vulkan(VkContext& ctx, const std::vec
         stats->prefill_ms = prefill_ms;
         stats->decode_ms = decode_ms;
         stats->prefill_tok_per_s = (prefill_ms > 0.0) ? (static_cast<double>(prompt_len) * 1000.0 / prefill_ms) : 0.0;
-        stats->decode_tok_per_s = (decode_ms > 0.0 && gen_count > 1) ? (static_cast<double>(gen_count - 1) * 1000.0 / decode_ms) : 0.0;
+        stats->decode_tok_per_s = decode_ms > 0.0 ? static_cast<double>(decode_steps) * 1000.0 / decode_ms : 0.0;
     }
     return tokens;
 }

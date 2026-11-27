@@ -131,16 +131,29 @@ void test_agent_protocols() {
           "Chat maps developer, named choice and tool result");
     const auto responses = parse(R"({"instructions":"Be concise","max_output_tokens":64,"input":[
         {"role":"user","content":[{"type":"input_text","text":"Calculate"}]},
+        {"type":"reasoning","id":"rs_b","summary":[],"content":[{"type":"reasoning_text","text":"hidden thought"}]},
+        {"type":"message","role":"assistant","content":[{"type":"output_text","text":"Checking"}]},
         {"type":"function_call","name":"calc","call_id":"b","arguments":"{}"},
         {"type":"function_call_output","call_id":"b","output":"391"}]})", Protocol::responses);
     check(responses.generation.max_tokens == 64 &&
           std::get<ToolResult>(responses.messages.back().content[0]).content == "391", "Responses input replay");
     const auto anthropic = parse(R"({"system":[{"type":"text","text":"Be concise"}],"messages":[
         {"role":"user","content":"Calculate"},
-        {"role":"assistant","content":[{"type":"tool_use","name":"calc","id":"c","input":{}}]},
+        {"role":"assistant","content":[{"type":"thinking","thinking":"hidden thought"},{"type":"text","text":"Checking"},
+            {"type":"tool_use","name":"calc","id":"c","input":{}}]},
         {"role":"user","content":[{"type":"tool_result","tool_use_id":"c","is_error":true,"content":"Unavailable"}]}
     ]})", Protocol::messages);
     check(std::get<ToolResult>(anthropic.messages.back().content[0]).is_error, "Messages preserves tool failure");
+    BpeTokenizer tokenizer;
+    tokenizer.init_byte_fallback();
+    for (const auto* request : {&responses, &anthropic}) {
+        const auto rendered = render_prompt(*request, tokenizer);
+        check(request->messages.size() == 4 && request->messages[2].content.size() == 2 &&
+              std::holds_alternative<ToolCall>(request->messages[2].content[1]) &&
+              rendered.text.find("Checking") != std::string::npos && rendered.text.find("<tool_call>") != std::string::npos &&
+              rendered.text.find("<tool_response>") != std::string::npos && rendered.text.find("hidden thought") == std::string::npos,
+              "Echoed reasoning keeps assistant text, tools and tool results");
+    }
     bool rejected = false;
     try {
         parse(R"({"input":[{"type":"function_call_output","call_id":"other","output":"data"}]})", Protocol::responses);
@@ -1749,10 +1762,16 @@ void test_cuda_graph_and_moe_offload(CudaContext& ctx) {
 
         m.reset_kv_and_state(ctx);
         auto out_eager = m.generate_cuda(ctx, {1, 10, 20}, 4, true, false);
-        auto out_graph = m.generate_cuda(ctx, {1, 10, 20}, 4, true, true);
-        if (out_eager != out_graph) {
+        GenerationStats graph_stats;
+        auto out_graph = m.generate_cuda(ctx, {1, 10, 20}, 4, true, true, &graph_stats);
+        if (out_eager != out_graph || !graph_stats.used_cuda_graph) {
             throw std::runtime_error("CUDA Graph token generation diverged from eager!");
         }
+        GenerationOptions sampling_options;
+        sampling_options.sampling.temperature = 0.7f;
+        sampling_options.warn_on_graph_fallback = true;
+        (void)m.generate_cuda(ctx, {1, 10, 20}, 4, true, true, &graph_stats, false, 0, -1, sampling_options);
+        if (graph_stats.used_cuda_graph) throw std::runtime_error("Stochastic decoding must fall back to eager");
         std::cout << "  [PASS/CHECK] CUDA Graph 4-layer Hybrid 3:1 token parity exact match\n";
     }
 
@@ -1973,6 +1992,35 @@ void test_vulkan_batched_vs_unbatched() {
     HostTensor h2 = vk.download(x_out2);
     std::vector<double> ref(h1.data<float>(), h1.data<float>() + H);
     expect_close(std::vector<float>(h2.data<float>(), h2.data<float>() + H), ref, 1e-6, 1e-6, "Vulkan batched vs unbatched layer");
+}
+
+void test_vulkan_continued_turn() {
+    VkContext vk(0, 32, 32);
+    HybridModelConfig cfg;
+    cfg.vocab_size = 32;
+    cfg.num_layers = 1;
+    cfg.dense.hidden_size = cfg.dense.intermediate_size = 64;
+    cfg.dense.num_attention_heads = 2;
+    cfg.dense.num_key_value_heads = 1;
+    cfg.dense.head_dim = 32;
+    cfg.dense.max_seq_len = 32;
+    constexpr uint64_t seed = 781;
+    const std::vector<int32_t> prompt{1, 5, 9};
+    FusionModel fresh(cfg);
+    fresh.init_synthetic_vulkan(vk, seed);
+    const auto first = fresh.generate_vulkan(vk, prompt, 1);
+    const int next_pos = static_cast<int>(first.size());
+    const int32_t next_user_token = (first.back() + 1) % cfg.vocab_size;
+    for (int i = 0; i < next_pos; ++i) (void)fresh.forward_token_vulkan(vk, first[i], i);
+    const auto expected = fresh.forward_token_vulkan(vk, next_user_token, next_pos);
+    for (const auto eos : {int32_t{-1}, first.back()}) {
+        FusionModel continued(cfg);
+        continued.init_synthetic_vulkan(vk, seed);
+        const auto answer = continued.generate_vulkan(vk, prompt, eos < 0 ? 1 : 4, nullptr, true, 0, eos);
+        if (answer != first || continued.forward_token_vulkan(vk, next_user_token, next_pos) != expected)
+            throw std::runtime_error("Vulkan must cache the final token before continuing a turn");
+    }
+    std::cout << "  [PASS] Vulkan continued-turn logits after EOS and max steps\n";
 }
 #endif  // FUSIONRT_ENABLE_VULKAN
 
@@ -2477,6 +2525,31 @@ void test_review_input_validation() {
     auto parse = [](const char* text, Protocol protocol) {
         return agent::parse_request(JsonValue::parse(text).as_object(), protocol);
     };
+    const auto request = JsonValue::parse(R"({"model":"gpt-4o","n":1,"logprobs":false,"top_logprobs":null,"presence_penalty":0,"frequency_penalty":0,"logit_bias":{},"messages":[{"role":"user","content":"test"}]})").as_object();
+    (void)agent::parse_request(request, Protocol::chat);
+    for (const auto& [key, value] : JsonObject{{"n", 2}, {"logprobs", true}, {"top_logprobs", 0},
+                                              {"presence_penalty", 0.5}, {"frequency_penalty", -0.5},
+                                              {"logit_bias", JsonObject{{"42", 1}}}}) {
+        auto unsupported = request;
+        unsupported[key] = value;
+        bool rejected = false;
+        try { (void)agent::parse_request(unsupported, Protocol::chat); }
+        catch (const std::invalid_argument& e) { rejected = std::string_view(e.what()).find(key) != std::string_view::npos; }
+        if (!rejected) throw std::runtime_error("Expected a named bad-request error for " + key);
+    }
+    HybridModelConfig health_cfg;
+    health_cfg.dense.max_seq_len = 4096;
+    if (http::health_body("local", health_cfg, 1, {}).at("max_seq").as_int() != 4096)
+        throw std::runtime_error("/health must include the model context");
+    BpeTokenizer http_tokenizer;
+    http_tokenizer.init_byte_fallback();
+    try {
+        (void)http::encode_prompt(http_tokenizer, std::string(4199, 'x'), 4096);
+        throw std::runtime_error("HTTP accepted an oversized prompt");
+    } catch (const std::invalid_argument& e) {
+        if (std::string_view(e.what()) != "Prompt (4200 tokens) exceeds model context (4096)")
+            throw std::runtime_error("HTTP context error must report actual token counts");
+    }
     reject([&] { parse(R"({"input":"test","text":{"format":{"type":"json_schema","schema":{"type":"object","required":["x"]}}}})", Protocol::responses); });
     reject([&] { parse(R"({"messages":[{"role":"user","content":"test"}],"response_format":{"type":"json_object"},"tools":[{"type":"function","function":{"name":"demo"}}],"tool_choice":"auto"})", Protocol::chat); });
     const auto omitted = parse(R"({"messages":[{"role":"user","content":"test"}]})", Protocol::chat);
@@ -3725,6 +3798,7 @@ int main() {
 #ifdef FUSIONRT_ENABLE_VULKAN
         test_vulkan_all_devices();
         test_vulkan_batched_vs_unbatched();
+        test_vulkan_continued_turn();
 #endif
 #if defined(FUSIONRT_ENABLE_CUDA) && defined(FUSIONRT_ENABLE_VULKAN)
         test_phase2_loaders_prefill_and_vulkan_e2e(cuda_ctx);

@@ -2004,8 +2004,10 @@ std::vector<float> FusionModel::forward_prefill_cuda(CudaContext& ctx, const std
                                                      std::span<const InputEmbedding> inputs_embeds) {
     validate_input_embeddings(inputs_embeds, token_ids.size(), static_cast<int>(tok_embeddings_.shape[1]));
     if (token_ids.empty()) return {};
-    if (start_pos < 0 || token_ids.size() > static_cast<size_t>(cfg_.dense.max_seq_len - std::min(start_pos, cfg_.dense.max_seq_len))) {
-        throw std::invalid_argument("Prompt exceeds model context");
+    if (start_pos < 0) throw std::invalid_argument("Invalid prefill start position");
+    const auto total_tokens = static_cast<size_t>(start_pos) + token_ids.size();
+    if (total_tokens > static_cast<size_t>(cfg_.dense.max_seq_len)) {
+        throw prompt_context_error(total_tokens, cfg_.dense.max_seq_len);
     }
     clear_cuda_history();
     return prefill_cuda_impl(ctx, token_ids.data(), static_cast<int>(token_ids.size()), start_pos, use_fused,
@@ -2015,9 +2017,9 @@ std::vector<float> FusionModel::forward_prefill_cuda(CudaContext& ctx, const std
 std::vector<float> FusionModel::prefill_cached_cuda(CudaContext& ctx, const std::vector<int32_t>& prompt,
                                                     bool use_fused, int* prefilled_tokens, LayerTrace* trace,
                                                     OpTrace* op_trace) {
-    if (prompt.empty() || prompt.size() > static_cast<size_t>(cfg_.dense.max_seq_len)) {
-        throw std::invalid_argument("Prompt is empty or exceeds model context");
-    }
+    if (prompt.empty()) throw std::invalid_argument("Prompt is empty");
+    if (prompt.size() > static_cast<size_t>(cfg_.dense.max_seq_len))
+        throw prompt_context_error(prompt.size(), cfg_.dense.max_seq_len);
     const int length = static_cast<int>(prompt.size());
     struct Match {
         size_t index = 0;
@@ -2309,14 +2311,15 @@ std::vector<int32_t> FusionModel::generate_cuda(CudaContext& ctx, const std::vec
     std::vector<int32_t> tokens = prompt_ids;
     if (tokens.empty()) tokens.push_back(std::min(1, cfg_.vocab_size - 1));
     for (auto& token : tokens) token = std::clamp(token, int32_t{0}, cfg_.vocab_size - 1);
-    const int prompt_len = static_cast<int>(tokens.size());
     const auto embeds = options.inputs_embeds;
     validate_input_embeddings(embeds, prompt_ids.size(), static_cast<int>(tok_embeddings_.shape[1]));
     if (!embeds.empty() && (keep_state || draft || options.spec_ngram > 0))
         throw std::invalid_argument("Image input requires a fresh prompt and standard decoding");
-    if (static_cast<int64_t>(start_pos) + prompt_len > cfg_.dense.max_seq_len) {
-        throw std::invalid_argument("Prompt exceeds model context");
+    const auto total_tokens = static_cast<size_t>(start_pos) + tokens.size();
+    if (total_tokens > static_cast<size_t>(cfg_.dense.max_seq_len)) {
+        throw prompt_context_error(total_tokens, cfg_.dense.max_seq_len);
     }
+    const int prompt_len = static_cast<int>(tokens.size());
     max_new_tokens = std::min(max_new_tokens, cfg_.dense.max_seq_len - start_pos - prompt_len);
     if (json && max_new_tokens == 0) throw std::invalid_argument("JSON generation needs room for output tokens");
     const int batch_limit = (draft || options.spec_ngram > 0) && max_new_tokens > 1
@@ -2330,7 +2333,17 @@ std::vector<int32_t> FusionModel::generate_cuda(CudaContext& ctx, const std::vec
     else if (!reuse) reset_kv_and_state(ctx);
     const bool greedy = options.sampling.greedy() && !json;
     const bool stochastic = options.sampling.temperature > 0;
-    use_graph = use_graph && greedy && !options.op_trace;
+    if (use_graph) {
+        const char* fallback = nullptr;
+        if (options.op_trace) fallback = "operation tracing is enabled";
+        else if (json) fallback = "JSON grammar is enabled";
+        else if (stochastic) fallback = "temperature is greater than zero";
+        else if (options.sampling.repeat_penalty != 1.0f) fallback = "repeat_penalty is not 1";
+        else if (!can_use_cuda_graph(moe_layers_)) fallback = "some expert weights are on the CPU";
+        if (fallback && options.warn_on_graph_fallback)
+            std::clog << "--graph requested, using eager decoding because " << fallback << '\n';
+        use_graph = fallback == nullptr;
+    }
     std::mt19937_64 rng;
     if (!greedy) rng.seed(options.sampling.seed);
     std::mt19937_64 draft_rng(options.sampling.seed ^ UINT64_C(0x9e3779b97f4a7c15));
@@ -2386,6 +2399,7 @@ std::vector<int32_t> FusionModel::generate_cuda(CudaContext& ctx, const std::vec
         timer = std::make_unique<CudaOpTimer>(ir.nodes.size());
         options.op_trace->mode = "decode";
     }
+    bool used_cuda_graph = false;
     auto decode = [&](bool first_step) {
         ensure_cuda_kv(ctx, pos, pos + 1);
         run_forward_token_step_cuda(ctx, cfg_, tok_embeddings_, ir, ws,
@@ -2394,6 +2408,7 @@ std::vector<int32_t> FusionModel::generate_cuda(CudaContext& ctx, const std::vec
                                     cuda_workspace_.decode_graph, cuda_workspace_.graph_captured, cuda_workspace_.graph_fused, cuda_workspace_.graph_has_argmax,
                                     cuda_workspace_.graph_split_bucket,
                                     pos++, use_fused, use_graph, greedy, first_step, options.op_trace, timer.get());
+        used_cuda_graph = use_graph;
     };
     auto emit = [&](int32_t token) {
         tokens.push_back(token);
@@ -2583,6 +2598,7 @@ std::vector<int32_t> FusionModel::generate_cuda(CudaContext& ctx, const std::vec
         stats->prefilled_tokens = prefilled;
         stats->spec_proposed = spec_proposed;
         stats->spec_accepted = spec_accepted;
+        stats->used_cuda_graph = used_cuda_graph;
         stats->prefill_ms = prefill_ms;
         stats->decode_ms = decode_ms;
         stats->prefill_tok_per_s = (prefill_ms > 0.0) ? (static_cast<double>(prefilled) * 1000.0 / prefill_ms) : 0.0;

@@ -15,6 +15,7 @@
 #include <functional>
 #include <map>
 #include <memory>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -91,6 +92,11 @@ struct HybridModelConfig {
     float final_logit_softcapping = 0.0f;
 };
 
+inline std::invalid_argument prompt_context_error(size_t tokens, int context) {
+    return std::invalid_argument("Prompt (" + std::to_string(tokens) + " tokens) exceeds model context (" +
+                                 std::to_string(context) + ")");
+}
+
 struct GenerationStats {
     int prompt_tokens = 0;
     int generated_tokens = 0;
@@ -101,6 +107,7 @@ struct GenerationStats {
     int prefilled_tokens = 0;
     int spec_proposed = 0;
     int spec_accepted = 0;
+    bool used_cuda_graph = false;
 };
 
 struct OpTiming {
@@ -141,6 +148,7 @@ struct GenerationOptions {
     FusionModel* draft_model = nullptr;
     int draft_tokens = 4;
     std::span<const InputEmbedding> inputs_embeds;
+    bool warn_on_graph_fallback = false;
 };
 
 struct ModelMemory {

@@ -40,11 +40,12 @@ void print_usage() {
               << "  fusionrt info\n"
               << "  fusionrt run [--arch dense|hybrid|moe] [--dtype f32|q8|q4] [--backend cuda|vulkan]\n"
               << "               [--vk-device 0] [--model <gguf|safetensors>] [--prompt \"text\"]\n"
-              << "               [--steps 16] [--max-seq 4096] [--graph|--no-graph] [--unfused] [--stream]\n"
+              << "               [--steps <n>] [--max-seq 4096] [--graph|--no-graph] [--unfused] [--stream]\n"
               << "               [--temp 0] [--top-k 40] [--top-p 0.95] [--min-p 0.05] [--repeat-penalty 1] [--seed 42]\n"
               << "               [--profile <json>] [--profile-ops <json>] [--trace-layers <json>]\n"
               << "               [--json-grammar] [--spec-ngram <k> | --draft-model <gguf> [--draft-tokens 4]]\n"
               << "               [--mmproj <gguf> --image <path> ...] (use <image> to place images in the prompt)\n"
+              << "               --steps defaults to 512 with --model and 16 for synthetic models.\n"
               << "  fusionrt inspect --model <path> [--max-seq 4096] [--device-memory]\n"
               << "  fusionrt chat --model <path> [--system <text>] [--temp 0.7] [--max-tokens 512]\n"
               << "  fusionrt serve --model <path> [--mmproj <gguf>] [--image <preset> ...]\n"
@@ -176,14 +177,32 @@ bool parse_sampling(std::string_view option, const std::string& value, SamplingP
     return true;
 }
 
-bool load_tokenizer(BpeTokenizer& tok, const std::string& model_path) {
+#if defined(FUSIONRT_ENABLE_CUDA) || defined(FUSIONRT_ENABLE_VULKAN)
+void load_tokenizer(BpeTokenizer& tok, const std::string& model_path) {
+    std::string error;
     if (is_gguf(model_path)) {
         GgufFile gf;
-        return gf.load(model_path) && tok.load_from_gguf(gf);
+        if (gf.load(model_path, &error)) {
+            if (tok.load_from_gguf(gf)) return;
+            error = "missing or empty tokenizer.ggml.tokens metadata";
+        }
+        throw std::runtime_error("Cannot load tokenizer from GGUF " + model_path + ": " + error);
     }
-    auto path = (utf8_path(model_path).parent_path() / "tokenizer.json").u8string();
-    return !model_path.empty() && tok.load_from_json(std::string(path.begin(), path.end()));
+    const auto model = utf8_path(model_path);
+    std::error_code ec;
+    const auto path = ((std::filesystem::is_directory(model, ec) ? model : model.parent_path()) / "tokenizer.json").u8string();
+    const std::string expected(path.begin(), path.end());
+    if (tok.load_from_json(expected, &error)) return;
+    if (error.empty()) error = "expected a supported model.vocab object";
+    throw std::runtime_error("Cannot load tokenizer at " + expected + ": " + error);
 }
+
+const char* stop_reason(int generated, int steps, bool eos, bool context_full) {
+    if (eos) return "eos";
+    if (generated == steps) return "max_steps";
+    return context_full ? "context_limit" : "json_complete";
+}
+#endif
 
 #ifdef FUSIONRT_ENABLE_CUDA
 void load_cuda_model(CudaContext& ctx, FusionModel& model, const std::string& path, int max_seq,
@@ -197,7 +216,7 @@ void load_cuda_model(CudaContext& ctx, FusionModel& model, const std::string& pa
 
 int interactive_chat(CudaContext& ctx, FusionModel& model, const BpeTokenizer& tok,
                      const std::string& system, const SamplingParams& sampling,
-                     int steps, bool use_fused, bool use_graph, bool stop_on_eos) {
+                     int steps, bool use_fused, std::optional<bool> graph, bool stop_on_eos) {
     std::vector<ChatMessage> messages;
     if (!system.empty()) messages.push_back({"system", system});
     std::cout << "fusionrt interactive chat (type 'exit' to quit)\n> " << std::flush;
@@ -205,9 +224,10 @@ int interactive_chat(CudaContext& ctx, FusionModel& model, const BpeTokenizer& t
         if (line == "exit" || line == "quit") break;
         messages.push_back({"user", line});
         auto prompt = tok.encode(tok.format_chat_messages(messages));
-        if (prompt.size() >= static_cast<size_t>(model.config().dense.max_seq_len)) {
+        const int context = model.config().dense.max_seq_len;
+        if (prompt.size() >= static_cast<size_t>(context)) {
             messages.pop_back();
-            std::cerr << "Conversation exceeds the model context. Start a new chat or use --max-seq.\n";
+            std::cerr << prompt_context_error(prompt.size(), context).what() << ". Start a new chat or use --max-seq.\n";
             std::cout << "> " << std::flush;
             continue;
         }
@@ -220,12 +240,14 @@ int interactive_chat(CudaContext& ctx, FusionModel& model, const BpeTokenizer& t
         GenerationOptions options;
         options.sampling = sampling;
         options.reuse_prefix = true;
+        options.warn_on_graph_fallback = graph.value_or(false);
         options.on_token = [&](int32_t id) {
             if (stop_on_eos && tok.is_end_of_generation(id)) return false;
             emit(utf8.push(tok.decode_token(id)));
             return true;
         };
-        model.generate_cuda(ctx, prompt, steps, use_fused, use_graph, nullptr, false, 0, -1, options);
+        model.generate_cuda(ctx, prompt, steps, use_fused, graph.value_or(model.recommended_cuda_graph()),
+                            nullptr, false, 0, -1, options);
         emit(utf8.finish());
         messages.push_back({"assistant", std::move(answer)});
         std::cout << "\n> " << std::flush;
@@ -418,7 +440,6 @@ int cmd_daily(const std::string& cmd, int argc, char** argv) {
     model.set_num_slots(slots);
     placement.apply(model);
     load_cuda_model(ctx, model, path, max_seq, profile);
-    const bool use_graph = graph.value_or(model.recommended_cuda_graph());
     if (cmd == "inspect") {
         WeightSummary sizes;
         std::string err;
@@ -455,13 +476,13 @@ int cmd_daily(const std::string& cmd, int argc, char** argv) {
         return 0;
     }
     BpeTokenizer tokenizer;
-    if (!load_tokenizer(tokenizer, path)) throw std::runtime_error("Model tokenizer could not be loaded");
-    if (cmd == "chat") return interactive_chat(ctx, model, tokenizer, system, sampling, steps, true, use_graph, true);
+    load_tokenizer(tokenizer, path);
+    if (cmd == "chat") return interactive_chat(ctx, model, tokenizer, system, sampling, steps, true, graph, true);
     std::unique_ptr<VisionEncoder> vision;
     if (!mmproj.empty()) vision = std::make_unique<VisionEncoder>(ctx, mmproj, model.config().dense.hidden_size);
     std::vector<Image> preset_images;
     for (const auto& image_path : image_paths) preset_images.push_back(load_image(image_path));
-    serve_http(ctx, model, tokenizer, model_filename(path), host, port, use_graph, vision.get(), preset_images);
+    serve_http(ctx, model, tokenizer, model_filename(path), host, port, graph, vision.get(), preset_images);
     return 0;
 #endif
 }
@@ -546,7 +567,7 @@ int cmd_run(int argc, char** argv) {
     std::string mmproj;
     std::vector<std::string> image_paths;
     std::string prompt = "Hello fusionrt";
-    int steps = 16;
+    std::optional<int> steps_option;
     int spec_ngram = 0, draft_tokens = 4;
     int max_seq = 4096;
     int vk_dev = 0;
@@ -578,7 +599,7 @@ int cmd_run(int argc, char** argv) {
             draft_tokens_set = true;
         }
         else if (a == "--prompt" && i + 1 < argc) prompt = argv[++i];
-        else if (a == "--steps" && i + 1 < argc) steps = parse_integer(a, argv[++i]);
+        else if (a == "--steps" && i + 1 < argc) steps_option = parse_integer(a, argv[++i]);
         else if (a == "--max-seq" && i + 1 < argc) max_seq = parse_integer(a, argv[++i]);
         else if (a == "--kv-type" && i + 1 < argc) kv_dtype = parse_kv_type(argv[++i]);
         else if (a == "--graph" || a == "--no-graph") graph_option = a == "--graph";
@@ -596,6 +617,7 @@ int cmd_run(int argc, char** argv) {
             sampling_set = true;
         } else throw std::invalid_argument("Unknown or incomplete run option: " + a);
     }
+    const int steps = steps_option.value_or(model_path.empty() ? 16 : 512);
     sampling.validate();
     if (kv_dtype && backend_s != "cuda") throw std::invalid_argument("--kv-type requires the CUDA backend");
     if (placement.specified && backend_s != "cuda") throw std::invalid_argument("Placement options require the CUDA backend");
@@ -632,13 +654,9 @@ int cmd_run(int argc, char** argv) {
 
     FusionModel model(cfg);
     BpeTokenizer tok;
-    tok.init_byte_fallback(cfg.vocab_size);
+    if (model_path.empty()) tok.init_byte_fallback(cfg.vocab_size);
     size_t weight_mb = estimate_arena_mb(model_path);
     (void)weight_mb;
-
-    auto load_tok_if_present = [&] {
-        if (!load_tokenizer(tok, model_path)) tok.init_byte_fallback(model.config().vocab_size);
-    };
 
     if (backend_s == "cuda") {
 #ifndef FUSIONRT_ENABLE_CUDA
@@ -650,18 +668,19 @@ int cmd_run(int argc, char** argv) {
         placement.apply(model);
         if (kv_dtype) ctx.set_kv_dtype(*kv_dtype);
         if (!model_path.empty()) {
+            load_tokenizer(tok, model_path);
             load_cuda_model(ctx, model, model_path, max_seq, profile);
         } else {
             model.init_synthetic(ctx, 42);
             model.set_device_profile(ctx, DeviceProfile::load(profile));
         }
-        load_tok_if_present();
         std::unique_ptr<VisionEncoder> vision;
         if (!mmproj.empty()) vision = std::make_unique<VisionEncoder>(ctx, mmproj, model.config().dense.hidden_size);
         std::unique_ptr<FusionModel> draft;
         if (!draft_path.empty()) {
             BpeTokenizer draft_tok;
-            if (!load_tokenizer(draft_tok, draft_path) || !tok.has_compatible_vocab(draft_tok)) {
+            load_tokenizer(draft_tok, draft_path);
+            if (!tok.has_compatible_vocab(draft_tok)) {
                 throw std::invalid_argument("Draft tokenizer must have the same vocabulary and EOS as the target");
             }
             draft = std::make_unique<FusionModel>(HybridModelConfig{});
@@ -670,13 +689,12 @@ int cmd_run(int argc, char** argv) {
                 throw std::runtime_error("Error loading draft model: " + error);
             }
         }
-        const bool use_graph = graph_option.value_or(model.recommended_cuda_graph()) &&
-                               sampling.greedy() && profile_ops.empty();
+        const bool use_graph = graph_option.value_or(model.recommended_cuda_graph());
         const bool stop_on_eos = !model_path.empty() && !ignore_eos;
         const double load_ms = std::chrono::duration<double, std::milli>(
             std::chrono::steady_clock::now() - load_start).count();
         if (chat_mode) {
-            return interactive_chat(ctx, model, tok, "", sampling, steps, use_fused, use_graph, stop_on_eos);
+            return interactive_chat(ctx, model, tok, "", sampling, steps, use_fused, graph_option, stop_on_eos);
         }
 
         if (!image_paths.empty() && prompt.find(image_placeholder) == std::string::npos) {
@@ -712,6 +730,7 @@ int cmd_run(int argc, char** argv) {
         options.inputs_embeds = prepared.inputs_embeds;
         options.op_trace = profile_ops.empty() ? nullptr : &op_trace;
         options.layer_trace = layer_trace.empty() ? nullptr : &trace;
+        options.warn_on_graph_fallback = graph_option.value_or(false);
         if (stream || stop_on_eos) {
             options.on_token = [&](int32_t id) {
                 if (stop_on_eos && tok.is_end_of_generation(id)) return false;
@@ -727,14 +746,17 @@ int cmd_run(int argc, char** argv) {
         if (options.op_trace) op_trace.write(profile_ops, name);
         if (options.layer_trace) trace.write(layer_trace, name);
         const auto& ir_st = (use_fused ? model.fused_ir_graph() : model.raw_ir_graph()).stats;
+        const bool eos = st.generated_tokens > 0 && (stop_on_eos || constraint) && tok.is_end_of_generation(out_ids.back());
         std::cout << "backend=cuda arch=" << model.config().arch
                   << " dtype=" << dtype_name(model.config().dense.weight_dtype)
                   << " fused=" << (use_fused ? "true" : "false")
-                  << " graph=" << (use_graph ? "true" : "false")
+                  << " graph=" << (st.used_cuda_graph ? "true" : "false")
                   << " ir_ops=" << ir_st.raw_nodes << "->" << ir_st.opt_nodes
                   << " prompt_toks=" << prompt_ids.size()
                   << " load_ms=" << load_ms
                   << " gen_toks=" << st.generated_tokens
+                  << " stop_reason=" << stop_reason(st.generated_tokens, steps, eos, out_ids.size() >=
+                                                  static_cast<size_t>(model.config().dense.max_seq_len))
                   << " prefill_ms=" << st.prefill_ms
                   << " prefill_tok/s=" << st.prefill_tok_per_s
                   << " decode_ms=" << st.decode_ms
@@ -764,6 +786,7 @@ int cmd_run(int argc, char** argv) {
         }
         VkContext ctx(static_cast<uint32_t>(vk_dev), weight_mb, 256);
         if (!model_path.empty()) {
+            load_tokenizer(tok, model_path);
             std::string err;
             bool ok = (model_path.size() >= 5 && model_path.substr(model_path.size() - 5) == ".gguf")
                 ? model.load_gguf_vulkan(ctx, model_path, &err, max_seq)
@@ -775,7 +798,8 @@ int cmd_run(int argc, char** argv) {
         } else {
             model.init_synthetic_vulkan(ctx, 42);
         }
-        load_tok_if_present();
+        if (graph_option.value_or(false))
+            std::clog << "--graph requested, using eager decoding because the backend is Vulkan\n";
         int32_t eos_stop = (!model_path.empty() && !ignore_eos) ? tok.eos_id() : -1;
         auto format_chatml_turn = [&](const std::string& msg) {
             return (tok.has_chatml())
@@ -795,7 +819,7 @@ int cmd_run(int argc, char** argv) {
                 GenerationStats st;
                 auto out_ids = model.generate_vulkan(ctx, p_ids, steps, &st, true, cur_pos, eos_stop);
                 cur_pos += static_cast<int>(out_ids.size());
-                std::vector<int32_t> gen_only(out_ids.begin() + static_cast<std::ptrdiff_t>(p_ids.size()), out_ids.end());
+                std::vector<int32_t> gen_only(out_ids.end() - st.generated_tokens, out_ids.end());
                 std::cout << tok.decode(gen_only)
                           << "\n[prefill=" << st.prefill_ms << "ms, decode=" << st.decode_ms << "ms]\n> " << std::flush;
             }
@@ -806,11 +830,14 @@ int cmd_run(int argc, char** argv) {
         auto prompt_ids = tok.encode(final_prompt, true);
         GenerationStats st;
         auto out_ids = model.generate_vulkan(ctx, prompt_ids, steps, &st, false, 0, eos_stop);
+        const bool eos = st.generated_tokens > 0 && out_ids.back() == eos_stop;
         std::cout << "backend=vulkan:" << vk_dev << " device=\"" << ctx.info().name << "\""
                   << " arch=" << model.config().arch
                   << " dtype=" << dtype_name(model.config().dense.weight_dtype)
                   << " prompt_toks=" << prompt_ids.size()
                   << " gen_toks=" << st.generated_tokens
+                  << " stop_reason=" << stop_reason(st.generated_tokens, steps, eos, out_ids.size() >=
+                                                  static_cast<size_t>(model.config().dense.max_seq_len))
                   << " prefill_ms=" << st.prefill_ms
                   << " prefill_tok/s=" << st.prefill_tok_per_s
                   << " decode_ms=" << st.decode_ms
@@ -818,7 +845,7 @@ int cmd_run(int argc, char** argv) {
         std::cout << "output_ids:";
         for (int32_t id : out_ids) std::cout << " " << id;
         std::cout << "\n";
-        std::vector<int32_t> gen_only(out_ids.begin() + static_cast<std::ptrdiff_t>(prompt_ids.size()), out_ids.end());
+        std::vector<int32_t> gen_only(out_ids.end() - st.generated_tokens, out_ids.end());
         std::cout << "output_text: " << tok.decode(gen_only) << "\n";
         return 0;
 #endif

@@ -170,6 +170,7 @@ void responses_input(AgentRequest& req, const JsonValue& input, ImageBudget& bud
     for (const auto& item : array(input, "input")) {
         const auto& o = object(item, "input item");
         const auto type = optional_string(o, "type");
+        if (type == "reasoning") continue;  // Replay the adjacent assistant text and tools.
         if (type.empty() || type == "message") {
             auto r = role(identifier(o, "role"));
             if (r == Role::tool) throw std::invalid_argument("Use function_call_output for tool results");
@@ -205,6 +206,7 @@ void anthropic_messages(AgentRequest& req, const JsonValue& input, ImageBudget& 
             for (const auto& entry : array(content, "content")) {
                 const auto& b = object(entry, "content block");
                 const auto type = identifier(b, "type");
+                if (type == "thinking" && msg.role == Role::assistant) continue;
                 if (type == "text") {
                     msg.content.emplace_back(string(field(b, "text"), "text"));
                 } else if (type == "image") {
@@ -304,6 +306,19 @@ int generation_limit(const GenerationParams& params, int context, size_t prompt_
 
 GenerationParams parse_generation(const JsonObject& obj, const char* limit_key) {
     GenerationParams params;
+    const auto& n = field(obj, "n");
+    if (!n.is_null() && (!n.is_int() || n.as_int() != 1))
+        throw std::invalid_argument("Only n=1 is supported");
+    if (boolean(obj, "logprobs")) throw std::invalid_argument("logprobs is unsupported");
+    if (!field(obj, "top_logprobs").is_null()) throw std::invalid_argument("top_logprobs is unsupported");
+    for (const char* key : {"presence_penalty", "frequency_penalty"}) {
+        const auto& value = field(obj, key);
+        if (!value.is_null() && (!value.is_number() || value.as_double() != 0.0))
+            throw std::invalid_argument(std::string(key) + " is unsupported");
+    }
+    const auto& bias = field(obj, "logit_bias");
+    if (!bias.is_null() && !object(bias, "logit_bias").empty())
+        throw std::invalid_argument("logit_bias is unsupported");
     params.max_tokens = static_cast<int>(integer(obj, limit_key, params.max_tokens, std::numeric_limits<int>::max()));
     auto number = [&](const char* key, float& out) {
         const auto& v = field(obj, key);

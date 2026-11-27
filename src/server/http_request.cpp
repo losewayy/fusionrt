@@ -1,4 +1,5 @@
 #include "http_request.h"
+#include "fusionrt/models.h"
 
 #include <algorithm>
 #include <charconv>
@@ -54,6 +55,24 @@ JsonObject error_body(std::string_view status, const std::string& message, std::
     JsonObject body{{"error", JsonObject{{"message", message}, {"type", type}}}};
     if (anthropic) body["type"] = "error";
     return body;
+}
+
+JsonObject health_body(const std::string& model, const HybridModelConfig& cfg, int slots, const ModelMemory& cache) {
+    const auto& arch = cfg.model_architecture.empty() ? cfg.arch : cfg.model_architecture;
+    return {{"status", "ok"}, {"model", model}, {"arch", arch}, {"backend", "cuda"},
+            {"max_seq", cfg.dense.max_seq_len}, {"slots", slots}, {"kv_pages", cache.kv_pages},
+            {"kv_bytes", static_cast<int64_t>(cache.kv_bytes)},
+            {"kv_reserved_bytes", static_cast<int64_t>(cache.kv_reserved_bytes)},
+            {"host_kv_bytes", static_cast<int64_t>(cache.host_kv_bytes)},
+            {"host_kv_pages", cache.host_kv_pages},
+            {"ssm_bytes", static_cast<int64_t>(cache.ssm_bytes)}};
+}
+
+std::vector<int32_t> encode_prompt(const BpeTokenizer& tokenizer, const std::string& text, int context) {
+    auto prompt = tokenizer.encode(text);
+    if (prompt.empty()) prompt.push_back(tokenizer.bos_id() >= 0 ? tokenizer.bos_id() : 0);
+    if (prompt.size() >= static_cast<size_t>(context)) throw prompt_context_error(prompt.size(), context);
+    return prompt;
 }
 
 }  // namespace fusionrt::http

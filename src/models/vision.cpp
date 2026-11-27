@@ -508,7 +508,7 @@ VisionPrompt encode_vision_prompt(CudaContext& ctx, const VisionEncoder& encoder
     auto append = [&](std::string_view chunk, bool bos) {
         const auto ids = tokenizer.encode(std::string(chunk), bos);
         prompt.tokens.insert(prompt.tokens.end(), ids.begin(), ids.end());
-        if (prompt.tokens.size() >= static_cast<size_t>(context)) throw std::invalid_argument("Prompt exceeds model context");
+        if (prompt.tokens.size() >= static_cast<size_t>(context)) throw prompt_context_error(prompt.tokens.size(), context);
     };
     size_t consumed = 0;
     for (size_t i = 0; i < images.size(); ++i) {
