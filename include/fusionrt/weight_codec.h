@@ -128,6 +128,99 @@ struct WeightCodec {
         }
     }
 
+#ifdef __CUDACC__
+    static constexpr int kWarpBlockLanes = Format == DType::PTQ1_0 ? 8 : 32;
+
+    // Each lane unpacks the weights that share a packed byte or sub-block scale.
+    // The caller reduces across the warp after accumulating the row's blocks.
+    static __device__ __forceinline__ float warp_dot_block(const uint8_t* b, const float* x, int lane) {
+        using namespace codec_detail;
+        float sum = 0.0f;
+        if constexpr (Format == DType::PTQ1_0) {
+            // Eight lanes cover two primary bytes, one secondary byte, and
+            // one tail trit each. A warp processes four complete blocks.
+            const uint8_t lo = b[lane], hi = b[lane + 8], mid = b[lane + 16];
+            float sum_hi = 0.f, sum_mid = 0.f;
+#pragma unroll
+            for (int digit = 0; digit < 5; ++digit) {
+                sum += x[digit * 16 + lane] * ternary(lo, digit);
+                sum_hi += x[digit * 16 + lane + 8] * ternary(hi, digit);
+                sum_mid += x[80 + digit * 8 + lane] * ternary(mid, digit);
+            }
+            return half(b + 26) * (sum + sum_hi + sum_mid +
+                                  x[120 + lane] * ternary(b[24 + (lane & 1)], lane / 2));
+        } else if constexpr (Format == DType::TQ1_0) {
+            const auto packed = b[lane];
+#pragma unroll
+            for (int digit = 0; digit < 5; ++digit) sum += x[digit * 32 + lane] * ternary(packed, digit);
+            if (lane < 16) {
+                const auto tail = b[32 + lane];
+#pragma unroll
+                for (int digit = 0; digit < 5; ++digit) sum += x[160 + digit * 16 + lane] * ternary(tail, digit);
+                sum += x[240 + lane] * ternary(b[48 + (lane & 3)], lane / 4);
+            }
+            return half(b + 52) * sum;
+        } else if constexpr (Format == DType::Q2_0 || Format == DType::PQ2_0) {
+            if (lane < kBlockSize / 4) {
+                const auto packed = b[2 + lane];
+                const float4 a = reinterpret_cast<const float4*>(x)[lane];
+                sum = a.x * (static_cast<int>(packed & 3) - 1) +
+                      a.y * (static_cast<int>(packed >> 2 & 3) - 1) +
+                      a.z * (static_cast<int>(packed >> 4 & 3) - 1) +
+                      a.w * (static_cast<int>(packed >> 6) - 1);
+            }
+            return half(b) * sum;
+        } else if constexpr (Format == DType::TQ2_0) {
+#pragma unroll
+            for (int group = 0; group < 2; ++group) {
+                const auto packed = b[lane + group * 32];
+#pragma unroll
+                for (int i = 0; i < 4; ++i)
+                    sum += x[lane + group * 128 + i * 32] * (static_cast<int>((packed >> (i * 2)) & 3) - 1);
+            }
+            return half(b + 64) * sum;
+        } else if constexpr (Format == DType::IQ4_NL || Format == DType::MXFP4 || Format == DType::IQ4_XS) {
+            if (lane < 16) {
+                if constexpr (Format == DType::IQ4_XS) {
+                    const unsigned high = le16(b + 2);
+#pragma unroll
+                    for (int group = 0; group < 8; ++group) {
+                        const int low = (b[4 + group / 2] >> (4 * (group % 2))) & 15;
+                        const int scale = (low | (static_cast<int>(high >> (2 * group) & 3) << 4)) - 32;
+                        const auto packed = b[8 + group * 16 + lane];
+                        sum += scale * (x[group * 32 + lane] * kvalues_iq4nl[packed & 15] +
+                                        x[group * 32 + lane + 16] * kvalues_iq4nl[packed >> 4]);
+                    }
+                } else if constexpr (Format == DType::IQ4_NL) {
+                    const auto packed = b[2 + lane];
+                    sum = x[lane] * kvalues_iq4nl[packed & 15] + x[lane + 16] * kvalues_iq4nl[packed >> 4];
+                } else {
+                    const auto packed = b[1 + lane];
+                    sum = x[lane] * kvalues_fp4[packed & 15] + x[lane + 16] * kvalues_fp4[packed >> 4];
+                }
+            }
+            if constexpr (Format == DType::MXFP4) return e8m0_half(b[0]) * sum;
+            else return half(b) * sum;
+        } else if constexpr (Format == DType::Q3_K) {
+            const int mask = b[lane];
+#pragma unroll
+            for (int group = 0; group < 8; ++group) {
+                const int sub = group * 2 + lane / 16;
+                const int low = (b[96 + sub % 8] >> (4 * (sub / 8))) & 15;
+                const int high = (b[104 + sub % 4] >> (2 * (sub / 4))) & 3;
+                const int quant = ((b[32 + group / 4 * 32 + lane] >> (2 * (group % 4))) & 3)
+                    - ((mask >> group & 1) ? 0 : 4);
+                sum += x[group * 32 + lane] * (((low | (high << 4)) - 32) * quant);
+            }
+            return half(b + 108) * sum;
+        } else {
+#pragma unroll
+            for (int i = 0; i < kBlockSize; i += 32) sum += x[i + lane] * value(b, i + lane);
+            return sum;
+        }
+    }
+#endif
+
     static FUSIONRT_CODEC_INLINE void dequant_block(const uint8_t* b, float* out) {
         for (int i = 0; i < kBlockSize; ++i) out[i] = value(b, i);
     }

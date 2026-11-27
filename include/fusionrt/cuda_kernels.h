@@ -101,6 +101,8 @@ void fused_add_rmsnorm_linear_q8_a(const float* a, const float* b, const float* 
                                    const void* weight_q8_a, float* res_out, float* y,
                                    int N, int K, float eps, cudaStream_t stream);
 void split_q_gate_f32(const float* q_full, float* q_out, float* gate_out, int M, int num_q_heads, int head_dim, cudaStream_t stream, int src_row_stride = 0);
+void apply_row_sigmoid_gate_f32(float* values, const float* gate, int rows, int cols, cudaStream_t stream);
+void scale_moe_routes_f32(float* weights, const int* indices, const float* scales, int n, cudaStream_t stream);
 void apply_sigmoid_gate_f32(float* attn_out, const float* gate, int n, cudaStream_t stream);
 
 inline constexpr int kArgmaxParts = 128;
@@ -318,7 +320,7 @@ void moe_indexed_swiglu_gemv(
     const float* x, const int* topk_idx, const void* gate_w, DType gate_type,
     const void* up_w, DType up_type, const void* down_w, DType down_type,
     const float* topk_weight, float* out, float* scratch_inter,
-    int hidden, int inter, int top_k, int resident, cudaStream_t stream, int first_expert = 0);
+    int hidden, int inter, int top_k, int resident, cudaStream_t stream, int first_expert = 0, bool geglu = false, const float* gate_scale = nullptr, const float* up_scale = nullptr);
 
 inline void moe_indexed_swiglu_gemv_f32(
     const float* x, const int* topk_idx, const float* gate_up_w, const float* down_w,

@@ -518,10 +518,21 @@ void cpu_moe_quantize_q8(const float* input, CpuQ8K* output, int cols) {
     }
 }
 
-int cpu_moe_accumulate_layer(CpuWorkers* workers, CpuMoeWorkspace& scratch,
+template<bool ExpertOps>
+static int accumulate_layer(CpuWorkers* workers, CpuMoeWorkspace& scratch,
     const HostTensor& gate, const HostTensor& up, const HostTensor& down,
     const int32_t* indices, const float* weights, int first_cold, int host_first, int rows, int top_k,
-    const float* input, float* output, CpuMoeMode mode) {
+    const float* input, float* output, CpuMoeMode mode, bool geglu, const float* gate_scale,
+    const float* up_scale) {
+    auto activate = [&](float g, float u, int route) {
+        if constexpr (ExpertOps) {
+            const int expert = indices[route];
+            if (gate_scale) g *= gate_scale[expert];
+            if (up_scale) u *= up_scale[expert];
+            if (geglu) return (0.5f * g) * (1.f + std::tanh(0.7978845608f * g * (1.f + 0.044715f * g * g))) * u;
+        }
+        return (g / (1.0f + std::exp(-g))) * u;
+    };
     auto& jobs = scratch.jobs;
     jobs.clear();
     jobs.reserve(static_cast<size_t>(rows) * top_k);
@@ -637,7 +648,7 @@ int cpu_moe_accumulate_layer(CpuWorkers* workers, CpuMoeWorkspace& scratch,
             dot(gate_rows_q8, gate_codec, gate_q8, gate_small, gate_dot, job.gate + row * gate_stride, g);
             dot(up_rows_q8, up_codec, up_q8, up_small, up_dot, job.up + row * up_stride, u);
             for (int m = 0; m < count; ++m)
-                act[static_cast<size_t>(ids[m]) * inter + row] = (g[m] / (1.0f + std::exp(-g[m]))) * u[m];
+                act[static_cast<size_t>(ids[m]) * inter + row] = activate(g[m], u[m], jobs[ids[m]].row);
         }
     };
     auto gate_up = [&](int64_t begin, int64_t end) {
@@ -656,7 +667,7 @@ int cpu_moe_accumulate_layer(CpuWorkers* workers, CpuMoeWorkspace& scratch,
                 gate_small ? gate_small(g_row, sx, hidden) : gate_dot(g_row, x, hidden);
             const float u = up_q8 ? up_q8(u_row, qx, hidden) :
                 up_small ? up_small(u_row, sx, hidden) : up_dot(u_row, x, hidden);
-            act[static_cast<size_t>(job_id) * inter + row] = (g / (1.0f + std::exp(-g))) * u;
+            act[static_cast<size_t>(job_id) * inter + row] = activate(g, u, job.row);
         }
     };
     auto down_accumulate = [&](int64_t begin, int64_t end) {
@@ -736,6 +747,17 @@ int cpu_moe_accumulate_layer(CpuWorkers* workers, CpuMoeWorkspace& scratch,
     } else if (workers) workers->run(down_rows, down_accumulate);
     else down_accumulate(0, down_rows);
     return cold;
+}
+
+int cpu_moe_accumulate_layer(CpuWorkers* workers, CpuMoeWorkspace& scratch,
+    const HostTensor& gate, const HostTensor& up, const HostTensor& down,
+    const int32_t* indices, const float* weights, int first_cold, int host_first, int rows, int top_k,
+    const float* input, float* output, CpuMoeMode mode, bool geglu, const float* gate_scale, const float* up_scale) {
+    if (geglu || gate_scale || up_scale)
+        return accumulate_layer<true>(workers, scratch, gate, up, down, indices, weights, first_cold, host_first,
+                                      rows, top_k, input, output, mode, geglu, gate_scale, up_scale);
+    return accumulate_layer<false>(workers, scratch, gate, up, down, indices, weights, first_cold, host_first,
+                                   rows, top_k, input, output, mode, false, nullptr, nullptr);
 }
 
 void cpu_moe_accumulate(const HostTensor& gate, const HostTensor& up, const HostTensor& down,

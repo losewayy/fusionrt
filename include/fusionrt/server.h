@@ -11,12 +11,14 @@ struct ServeSpeculation {
     int ngram = 0;
     FusionModel* draft = nullptr;
     int draft_tokens = 4;
+    bool mtp = false;
 
     GenerationOptions for_inputs(std::span<const InputEmbedding> embeds) const {
         GenerationOptions options;
         options.inputs_embeds = embeds;
         if (embeds.empty()) {
             options.spec_ngram = ngram;
+            options.spec_mtp = mtp;
             options.draft_model = draft;
             options.draft_tokens = draft_tokens;
         }

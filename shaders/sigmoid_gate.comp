@@ -1,0 +1,11 @@
+#version 450
+
+layout(local_size_x = 256) in;
+layout(std430, binding = 0) buffer Values { float values[]; };
+layout(std430, binding = 1) readonly buffer Gates { float gates[]; };
+layout(push_constant) uniform Params { int count, broadcast; };
+
+void main() {
+    int i = int(gl_GlobalInvocationID.x);
+    if (i < count) values[i] /= 1.0 + exp(-gates[broadcast != 0 ? 0 : i]);
+}

@@ -22,7 +22,7 @@ bool expand_vk_embedding(DType dtype, bool tied) {
 }
 
 bool pack_vk_qkv(const LoadedLayerRaw& layer, int hidden) {
-    return hidden % 4 == 0 && layer.q_proj.desc.dtype != DType::Q4_0 && layer.q_proj.desc.dtype != DType::Q8_0;
+    return !layer.gated_q_attn && hidden % 4 == 0 && layer.q_proj.desc.dtype != DType::Q4_0 && layer.q_proj.desc.dtype != DType::Q8_0;
 }
 
 void reserve_vulkan_model(VkContext& ctx, const LoadedModelRaw& raw) {
@@ -50,6 +50,7 @@ void reserve_vulkan_model(VkContext& ctx, const LoadedModelRaw& raw) {
         add(f32(l.experts_gate_up) + (l.experts_up.bytes().empty() ? 0 : f32(l.experts_up)));
         add(f32(l.experts_down));
         if (l.has_shared) { matrix(l.shared_gate_up); matrix(l.shared_down); }
+        if (!l.shared_gate.bytes().empty()) matrix(l.shared_gate);
     };
     auto dense_ffn = [&](const LoadedLayerRaw& l) {
         add(f32(l.mlp_norm));
@@ -77,7 +78,8 @@ void reserve_vulkan_model(VkContext& ctx, const LoadedModelRaw& raw) {
             for (const auto* w : {&l.qkv_proj, &l.z_proj, &l.a_proj, &l.b_proj}) matrix(*w);
             for (const auto* w : {&l.conv_w, &l.conv_bias, &l.A_log, &l.dt_bias, &l.gdn_norm_w}) add(f32(*w));
             matrix(l.o_proj);
-            dense_ffn(l);
+            if (l.router_w.bytes().empty()) dense_ffn(l);
+            else routed(l);
             const auto& g = cfg.gdn;
             state_tensor(static_cast<VkDeviceSize>(l.conv_w.desc.shape[0]) * 3 * sizeof(float));
             state_tensor(static_cast<VkDeviceSize>(g.num_v_heads) * g.head_k_dim * g.head_v_dim * sizeof(float));
@@ -136,10 +138,22 @@ static void upload_raw_model_to_vulkan(VkContext& ctx, const LoadedModelRaw& raw
         L.cfg.intermediate_size = static_cast<int>(lr.experts_down.desc.shape[2]);
         L.norm_w = ctx.upload(to_f32_host(lr.mlp_norm.bytes().empty() ? lr.attn_norm : lr.mlp_norm), true);
         L.router_w = ctx.upload(to_f32_host(lr.router_w), true);
+        if (!lr.shared_gate.bytes().empty()) L.shared_gate_w = ctx.upload(lr.shared_gate, true);
+        auto scale_experts = [](HostTensor& w, const HostTensor& scales, int offset, int width) {
+            if (scales.bytes().empty()) return;
+            const auto cols = w.desc.shape[2];
+            for (int e = 0; e < w.desc.shape[0]; ++e) {
+                auto* start = w.data<float>() + (e * w.desc.shape[1] + offset) * cols;
+                for (int64_t i = 0; i < width * cols; ++i) start[i] *= scales.data<float>()[e];
+            }
+        };
         auto gate = to_f32_host(lr.experts_gate_up);
+        const int I = L.cfg.intermediate_size;
+        scale_experts(gate, lr.expert_gate_scale, 0, I);
         if (!lr.experts_up.bytes().empty()) {
-            const auto up = to_f32_host(lr.experts_up);
-            const int E = L.cfg.num_experts, I = L.cfg.intermediate_size;
+            auto up = to_f32_host(lr.experts_up);
+            scale_experts(up, lr.expert_up_scale, 0, I);
+            const int E = L.cfg.num_experts;
             auto packed = HostTensor::create({E, 2 * I, H}, DType::F32);
             const size_t bytes = gate.bytes().size() / E;
             for (int e = 0; e < E; ++e) {
@@ -147,9 +161,13 @@ static void upload_raw_model_to_vulkan(VkContext& ctx, const LoadedModelRaw& raw
                 std::memcpy(packed.storage.data() + (2 * e + 1) * bytes, up.bytes().data() + e * bytes, bytes);
             }
             gate = std::move(packed);
+        } else {
+            scale_experts(gate, lr.expert_up_scale, I, I);
         }
+        auto down = to_f32_host(lr.experts_down);
+        scale_experts(down, lr.expert_down_scale, 0, H);
         L.gpu_gate_up_w = ctx.upload(gate, true);
-        L.gpu_down_w = ctx.upload(to_f32_host(lr.experts_down), true);
+        L.gpu_down_w = ctx.upload(down, true);
         if (lr.has_shared) {
             L.cfg.shared_intermediate_size = static_cast<int>(lr.shared_down.desc.shape[1]);
             L.shared_gate_up_w = upload_vk_weight(lr.shared_gate_up);
@@ -164,6 +182,7 @@ static void upload_raw_model_to_vulkan(VkContext& ctx, const LoadedModelRaw& raw
         if (lr.kind == 0) {
             VkDenseGQALayer L;
             L.cfg = cfg_out.dense;
+            L.cfg.gated_q_attn = lr.gated_q_attn;
             L.attn_norm_w = ctx.upload(to_f32_host(lr.attn_norm), true);
             const bool packed_fp32 = pack_vk_qkv(lr, H);
             if (packed_fp32) {
@@ -212,11 +231,15 @@ static void upload_raw_model_to_vulkan(VkContext& ctx, const LoadedModelRaw& raw
             L.dt_bias = ctx.upload(to_f32_host(lr.dt_bias), true);
             L.norm_w = ctx.upload(to_f32_host(lr.gdn_norm_w), true);
             L.o_proj = upload_vk_weight(lr.o_proj);
-            L.mlp_norm_w = ctx.upload(to_f32_host(lr.mlp_norm), true);
-            L.gate_up_proj = lr.gate_up.bytes().empty()
-                    ? ctx.upload(concat_rows_same_dtype({to_f32_host(lr.gate), to_f32_host(lr.up)}), true)
-                    : upload_vk_weight(lr.gate_up);
-            L.down_proj = upload_vk_weight(lr.down);
+            if (lr.router_w.bytes().empty()) {
+                L.mlp_norm_w = ctx.upload(to_f32_host(lr.mlp_norm), true);
+                L.gate_up_proj = lr.gate_up.bytes().empty()
+                        ? ctx.upload(concat_rows_same_dtype({to_f32_host(lr.gate), to_f32_host(lr.up)}), true)
+                        : upload_vk_weight(lr.gate_up);
+                L.down_proj = upload_vk_weight(lr.down);
+            } else {
+                L.moe_index = upload_moe(lr);
+            }
             int conv_dim = static_cast<int>(lr.conv_w.desc.shape[0]);
             L.conv_state = ctx.weight_arena().alloc_tensor({conv_dim, 3}, DType::F32, "vk_cs");
             L.ssm_state = ctx.weight_arena().alloc_tensor({L.cfg.num_v_heads, L.cfg.head_k_dim, L.cfg.head_v_dim}, DType::F32, "vk_ss");
@@ -308,6 +331,7 @@ void FusionModel::init_synthetic_vulkan(VkContext& ctx, uint64_t seed) {
 bool FusionModel::load_gguf_vulkan(VkContext& ctx, const std::string& path, std::string* err, int max_seq_override) {
     LoadedModelRaw raw;
     if (!parse_gguf_model_raw(path, max_seq_override, raw, err)) return false;
+    raw.layers.resize(raw.cfg.num_layers);
     if (raw.hadamard_folded) {
         if (err) *err = "Hadamard-folded GGUF weights require the CUDA backend";
         return false;
@@ -407,7 +431,7 @@ std::vector<float> FusionModel::forward_token_vulkan(VkContext& ctx, int32_t tok
         }
         vk_ops::append_linear_dispatch(ops, xn, L.router_w, rl, 1, E, H, ps);
         {
-            vk_ops::PushMoeTopk pc{E, K, L.cfg.norm_topk_prob ? 1 : 0};
+            vk_ops::PushMoeTopk pc{E, K, L.cfg.norm_topk_prob ? 1 : 0, L.cfg.expert_weights_scale};
             ops.push_back({"moe_topk.comp", 1, 1, 1, {rl, tidx, tw}, sp(pc), sizeof(pc)});
         }
         {
@@ -429,6 +453,13 @@ std::vector<float> FusionModel::forward_token_vulkan(VkContext& ctx, int32_t tok
             vk_ops::PushSwiglu spc{1, shI};
             ops.push_back({"swiglu.comp", static_cast<uint32_t>((shI + 255) / 256), 1, 1, {shgu, shsw}, sp(spc), sizeof(spc)});
             vk_ops::append_linear_dispatch(ops, shsw, L.shared_down_w, shd, 1, H, shI, ps);
+            if (L.shared_gate_w.vk_buffer) {
+                auto gate = ctx.scratch_arena().alloc_tensor({1}, DType::F32);
+                vk_ops::append_linear_dispatch(ops, xn, L.shared_gate_w, gate, 1, 1, H, ps);
+                const int pc[] = {H, 1};
+                ops.push_back({"sigmoid_gate.comp", static_cast<uint32_t>((H + 255) / 256), 1, 1,
+                               {shd, gate}, sp(pc), sizeof(pc)});
+            }
             vk_ops::PushResidual rpc{H};
             ops.push_back({"add_residual.comp", static_cast<uint32_t>((H + 255) / 256), 1, 1, {mout, shd, mout}, sp(rpc), sizeof(rpc)});
         }
@@ -448,6 +479,11 @@ std::vector<float> FusionModel::forward_token_vulkan(VkContext& ctx, int32_t tok
             int rot_dim = std::max(2, static_cast<int>(hd * L.cfg.partial_rotary_factor) & ~1);
             Tensor xn = ctx.scratch_arena().alloc_tensor({H}, DType::F32);
             Tensor qb = ctx.scratch_arena().alloc_tensor({q_dim}, DType::F32);
+            Tensor q_gate, q_full;
+            if (L.cfg.gated_q_attn) {
+                q_gate = ctx.scratch_arena().alloc_tensor({q_dim}, DType::F32);
+                q_full = ctx.scratch_arena().alloc_tensor({2 * q_dim}, DType::F32);
+            }
             Tensor kb = ctx.scratch_arena().alloc_tensor({kv_dim}, DType::F32);
             Tensor vb = ctx.scratch_arena().alloc_tensor({kv_dim}, DType::F32);
             Tensor aout = ctx.scratch_arena().alloc_tensor({q_dim}, DType::F32);
@@ -463,7 +499,8 @@ std::vector<float> FusionModel::forward_token_vulkan(VkContext& ctx, int32_t tok
             } else {
                 vk_ops::PushRmsNorm npc{1, H, L.cfg.rms_norm_eps};
                 ops.push_back({"rmsnorm.comp", 1, 1, 1, {*cur, L.attn_norm_w, xn}, sp(npc), sizeof(npc)});
-                vk_ops::append_linear_dispatch(ops, xn, L.q_proj, qb, 1, q_dim, H, ps);
+                vk_ops::append_linear_dispatch(ops, xn, L.q_proj, L.cfg.gated_q_attn ? q_full : qb,
+                                               1, L.cfg.gated_q_attn ? 2 * q_dim : q_dim, H, ps);
                 vk_ops::append_linear_dispatch(ops, xn, L.k_proj, kb, 1, kv_dim, H, ps);
                 vk_ops::append_linear_dispatch(ops, xn, L.v_proj, vb, 1, kv_dim, H, ps);
             }
@@ -473,7 +510,12 @@ std::vector<float> FusionModel::forward_token_vulkan(VkContext& ctx, int32_t tok
                 ops.push_back({"add_residual.comp", static_cast<uint32_t>((cols + 255) / 256), 1, 1,
                                {value, bias, value}, sp(pc), sizeof(pc)});
             };
-            add_bias(qb, L.q_bias, q_dim);
+            if (L.cfg.gated_q_attn) {
+                add_bias(q_full, L.q_bias, 2 * q_dim);
+                const int pc[] = {q_dim, hd};
+                ops.push_back({"split_query_gate.comp", static_cast<uint32_t>((q_dim + 255) / 256), 1, 1,
+                               {q_full, qb, q_gate}, sp(pc), sizeof(pc)});
+            } else add_bias(qb, L.q_bias, q_dim);
             add_bias(kb, L.k_bias, kv_dim);
             add_bias(vb, L.v_bias, kv_dim);
             {
@@ -486,6 +528,11 @@ std::vector<float> FusionModel::forward_token_vulkan(VkContext& ctx, int32_t tok
                 vk_ops::PushGqaDecode pc{nq, nkv, hd, pos + 1, 1.0f / std::sqrt(static_cast<float>(hd))};
                 ops.push_back({"gqa_decode.comp", static_cast<uint32_t>(nq), 1, 1,
                                {qb, L.k_cache, L.v_cache, aout}, sp(pc), sizeof(pc)});
+            }
+            if (L.cfg.gated_q_attn) {
+                const int pc[] = {q_dim, 0};
+                ops.push_back({"sigmoid_gate.comp", static_cast<uint32_t>((q_dim + 255) / 256), 1, 1,
+                               {aout, q_gate}, sp(pc), sizeof(pc)});
             }
             vk_ops::append_linear_dispatch(ops, aout, L.o_proj, ob, 1, H, q_dim, ps);
             {
@@ -542,6 +589,11 @@ std::vector<float> FusionModel::forward_token_vulkan(VkContext& ctx, int32_t tok
             {
                 vk_ops::PushResidual pc{H};
                 ops.push_back({"add_residual.comp", static_cast<uint32_t>((H + 255) / 256), 1, 1, {*cur, ob, *nxt}, sp(pc), sizeof(pc)});
+            }
+            if (L.moe_index >= 0) {
+                append_moe(vk_moe_layers_[L.moe_index], *nxt, *nxt);
+                std::swap(cur, nxt);
+                continue;
             }
             vk_ops::append_rmsnorm_linear_dispatch(ops, *nxt, L.mlp_norm_w, L.gate_up_proj, xn, gub, 1, 2 * inter, H, L.cfg.rms_norm_eps, ps);
             {

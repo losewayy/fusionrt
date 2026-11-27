@@ -73,7 +73,8 @@ int residual(MiniGraph& graph, int input, int update, const std::string& name, c
 
 template <typename Layer>
 int append_ffn(MiniGraph& graph, int input, const Layer& layer, const std::string& prefix,
-               const Tensor* post_norm = nullptr, bool geglu = false, float scale = 1.0f) {
+               const Tensor* post_norm = nullptr, bool geglu = false, float scale = 1.0f,
+               bool add_residual = true) {
     const int normalized = norm(graph, input, layer.mlp_norm_w, graph.hidden_size,
                                 layer.cfg.rms_norm_eps, prefix + "n2", prefix + "mnorm");
     const int width = layer.cfg.intermediate_size;
@@ -95,7 +96,7 @@ int append_ffn(MiniGraph& graph, int input, const Layer& layer, const std::strin
         down = norm(graph, down, *post_norm, graph.hidden_size, layer.cfg.rms_norm_eps,
                     prefix + "ffn_post_norm", prefix + "ffn_post_norm");
     }
-    return residual(graph, input, down, prefix + "h2", prefix + "add2", scale);
+    return add_residual ? residual(graph, input, down, prefix + "h2", prefix + "add2", scale) : down;
 }
 
 int append_moe(MiniGraph& graph, int input, int index, const std::string& prefix) {
@@ -157,11 +158,24 @@ int append_dense(MiniGraph& graph, int input, int index, const CudaDenseGQALayer
                          prefix + "attn_post_norm", prefix + "attn_post_norm");
     }
     const int next = residual(graph, input, projected, prefix + "h1", prefix + "add1");
-    if (layer.moe_index >= 0) return append_moe(graph, next, layer.moe_index, prefix);
-    if (!layer.ple_gate.data)
-        return append_ffn(graph, next, layer, prefix, &layer.ffn_post_norm_w, layer.geglu, layer.output_scale);
-
-    const int ffn = append_ffn(graph, next, layer, prefix, &layer.ffn_post_norm_w, layer.geglu);
+    if (layer.moe_index >= 0 && !layer.dense_post_norm_w.data) return append_moe(graph, next, layer.moe_index, prefix);
+    int ffn;
+    if (layer.dense_post_norm_w.data) {
+        const int shared = append_ffn(graph, next, layer, prefix, &layer.dense_post_norm_w, true, 1.f, false);
+        const int routed = append_moe(graph, next, layer.moe_index, prefix);
+        const int routed_norm = norm(graph, routed, layer.routed_post_norm_w, graph.hidden_size, cfg.rms_norm_eps,
+                                     prefix + "routed_norm", prefix + "routed_norm");
+        const int combined = residual(graph, shared, routed_norm, prefix + "ffn_sum", prefix + "ffn_sum");
+        const int post = norm(graph, combined, layer.ffn_post_norm_w, graph.hidden_size, cfg.rms_norm_eps,
+                              prefix + "ffn_post_norm", prefix + "ffn_post_norm");
+        ffn = residual(graph, next, post, prefix + "h2", prefix + "add2",
+                       layer.ple_gate.data ? 1.f : layer.output_scale);
+    } else {
+        if (!layer.ple_gate.data)
+            return append_ffn(graph, next, layer, prefix, &layer.ffn_post_norm_w, layer.geglu, layer.output_scale);
+        ffn = append_ffn(graph, next, layer, prefix, &layer.ffn_post_norm_w, layer.geglu);
+    }
+    if (!layer.ple_gate.data) return ffn;
     const int gate = linear(graph, ffn, layer.ple_gate, prefix + "ple_gate");
     IRNode gated;
     gated.op = OpKind::GEMMA_PLE_GATE;
@@ -196,6 +210,7 @@ int append_recurrent(MiniGraph& graph, int input, int index, const CudaGatedDelt
     graph.add_node(std::move(node));
     const int projected = linear(graph, output, layer.o_proj, prefix + "o");
     const int next = residual(graph, input, projected, prefix + "h1", prefix + "add1");
+    if (layer.moe_index >= 0) return append_moe(graph, next, layer.moe_index, prefix);
     return append_ffn(graph, next, layer, prefix);
 }
 
@@ -212,7 +227,7 @@ void FusionModel::rebuild_cuda_ir() {
     }
     graph.input_value = graph.new_value(graph.hidden_size, "hidden_in");
     int hidden = graph.input_value;
-    for (size_t i = 0; i < layer_kinds_.size(); ++i) {
+    for (int i = 0; i < cfg_.num_layers; ++i) {
         const auto index = static_cast<int>(layer_indices_[i]);
         const std::string prefix = "L" + std::to_string(i) + "_";
         if (layer_kinds_[i] == 0) hidden = append_dense(graph, hidden, index, dense_layers_[index], prefix);
@@ -222,6 +237,19 @@ void FusionModel::rebuild_cuda_ir() {
     const int normalized = norm(graph, hidden, final_norm_w_, graph.hidden_size, cfg_.dense.rms_norm_eps,
                                 "final_norm", "fnorm");
     graph.output_value = linear(graph, normalized, lm_head_w_, "lm_head", nullptr, true);
+    if (has_native_mtp()) {
+        graph.nextn_hidden = normalized;
+        MiniGraph draft;
+        draft.hidden_size = graph.hidden_size;
+        draft.input_value = draft.new_value(draft.hidden_size, "nextn_input");
+        const int layer = static_cast<int>(layer_indices_.back());
+        const int next = append_dense(draft, draft.input_value, layer, dense_layers_[layer], "nextn_");
+        draft.nextn_hidden = norm(draft, next, mtp_.head_norm, draft.hidden_size,
+                                  cfg_.dense.rms_norm_eps, "nextn_hidden", "nextn_norm");
+        draft.output_value = linear(draft, draft.nextn_hidden, mtp_.head, "nextn_head", nullptr, true);
+        optimize_graph(draft);
+        mtp_.graph = std::move(draft);
+    }
     graph.stats.raw_nodes = graph.stats.opt_nodes = static_cast<int>(graph.nodes.size());
     raw_ir_graph_ = std::move(graph);
     fused_ir_graph_ = raw_ir_graph_;

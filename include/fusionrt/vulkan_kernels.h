@@ -14,7 +14,7 @@ struct PushSwiglu { int rows, inter_dim; };
 struct PushGdnStep { int num_k_heads, num_v_heads, dk, dv; float eps, q_scale; int has_conv_bias, tiled_value_heads; };
 struct PushResidual { int n; };
 struct PushEmbed { int M, hidden, dtype; };
-struct PushMoeTopk { int num_experts, top_k, norm_topk; };
+struct PushMoeTopk { int num_experts, top_k, norm_topk; float scale; };
 struct PushMoeSwiglu { int hidden, inter, top_k, mode; };
 
 double gemv_vec4(VkContext& ctx, const Tensor& x, const Tensor& w, Tensor& y, int M, int N, int K);

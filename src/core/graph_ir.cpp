@@ -53,6 +53,7 @@ std::vector<int> compute_use_counts(const MiniGraph& g) {
     if (g.output_value >= 0 && g.output_value < static_cast<int>(uses.size())) {
         uses[g.output_value]++;
     }
+    if (g.nextn_hidden >= 0) uses[g.nextn_hidden]++;
     return uses;
 }
 
@@ -142,7 +143,7 @@ void optimize_graph(MiniGraph& g) {
     }
 
     for (auto& norm : g.nodes) {
-        if (!norm.alive || norm.op != OpKind::RMSNORM) continue;
+        if (!norm.alive || norm.op != OpKind::RMSNORM || norm.out == g.nextn_hidden) continue;
         int consumers = 0;
         bool supported = true;
         for (const auto& node : g.nodes) {

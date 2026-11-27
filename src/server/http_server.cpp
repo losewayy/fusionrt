@@ -398,7 +398,7 @@ void serve_http(CudaContext& ctx, FusionModel& model, const BpeTokenizer& tokeni
                 auto health = http::health_body(model_name, cfg, model.num_slots(), model.cuda_max_active_tokens(),
                                                 model.cuda_cache_memory());
                 health["vision"] = vision != nullptr;
-                health["speculative"] = speculation.ngram > 0 || speculation.draft != nullptr;
+                health["speculative"] = speculation.ngram > 0 || speculation.draft != nullptr || speculation.mtp;
                 health["kv_dtype_requested"] = ctx.requested_kv_dtype() ? dtype_name(*ctx.requested_kv_dtype()) : "auto";
                 health["kv_dtype"] = dtype_name(model.cuda_kv_dtype());
                 health["borrowed_expert_bytes"] = static_cast<int64_t>(model.cuda_borrowed_expert_bytes());

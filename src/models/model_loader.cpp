@@ -55,6 +55,7 @@ static void validate_gdn_layer(const LoadedLayerRaw& layer, int64_t taps, const 
     check("o_proj", layer.o_proj, {hidden, value_width});
     check("attn_norm", layer.attn_norm, {hidden});
     check("mlp_norm", layer.mlp_norm, {hidden});
+    if (!layer.router_w.bytes().empty()) return;
     if (layer.gate_up.bytes().empty()) {
         check("gate", layer.gate, {cfg.intermediate_size, hidden});
         check("up", layer.up, {cfg.intermediate_size, hidden});
@@ -330,7 +331,7 @@ struct GgufHadamard {
 };
 
 constexpr GgufArchitecture supported_architectures[] = {
-    {"llama", false}, {"qwen2", true}, {"qwen3", true}, {"qwen35", true, true},
+    {"llama", false}, {"qwen2", true}, {"qwen3", true}, {"qwen35", true, true}, {"qwen35moe", true, true},
     {"qwen3moe", true}, {"deepseek2", false}, {"mistral", true}, {"phi3", true},
     {"gemma", true}, {"gemma4", true}, {"dense", true}, {"hybrid", true, true}, {"moe", true},
 };
@@ -350,6 +351,7 @@ bool parse_gguf_model_raw(const std::string& path, int max_seq_override, LoadedM
     }
     out.cfg.model_architecture = arch;
     const bool gemma4 = arch == "gemma4";
+    const bool qwen35moe = arch == "qwen35moe";
     const bool deepseek2 = arch == "deepseek2";
     const std::string prefix = arch + ".";
     auto get_arch_int = [&](const std::string& suffix, int64_t def) {
@@ -360,10 +362,6 @@ bool parse_gguf_model_raw(const std::string& path, int max_seq_override, LoadedM
     };
 
     if (gemma4) {
-        if (get_arch_int("expert_count", 0) > 0) {
-            if (err) *err = "Gemma 4 expert layers are unsupported";
-            return false;
-        }
         const bool multimodal = std::any_of(gf.tensors().begin(), gf.tensors().end(), [](const GgufTensorInfo& t) {
             return t.name.starts_with("v.") || t.name.starts_with("a.") || t.name.starts_with("mm.") ||
                 t.name.starts_with("vision.") || t.name.starts_with("vision_") || t.name.starts_with("audio.");
@@ -467,7 +465,12 @@ bool parse_gguf_model_raw(const std::string& path, int max_seq_override, LoadedM
     }
 
     out.cfg.vocab_size = static_cast<int>(emb_vocab);
-    out.cfg.num_layers = num_layers;
+    const auto mtp_layers = (arch == "qwen35" || qwen35moe) ? get_arch_int("nextn_predict_layers", 0) : 0;
+    if (mtp_layers < 0 || mtp_layers > 1 || mtp_layers >= num_layers) {
+        if (err) *err = "Qwen GGUF supports a single optional NextN block after the trunk";
+        return false;
+    }
+    out.cfg.num_layers = num_layers - static_cast<int>(mtp_layers);
     if (gemma4) {
         out.cfg.embed_scale = std::sqrt(static_cast<float>(H));
         out.cfg.final_logit_softcapping = static_cast<float>(get_arch_float("final_logit_softcapping", 0.0));
@@ -488,7 +491,7 @@ bool parse_gguf_model_raw(const std::string& path, int max_seq_override, LoadedM
     out.cfg.gdn.hidden_size = H;
     out.cfg.gdn.intermediate_size = inter;
     out.cfg.gdn.rms_norm_eps = eps;
-    out.cfg.gdn.tiled_value_heads = arch == "qwen35";
+    out.cfg.gdn.tiled_value_heads = arch == "qwen35" || qwen35moe;
     out.cfg.gdn.num_k_heads = static_cast<int>(get_arch_int("ssm.group_count", nkv));
     out.cfg.gdn.num_v_heads = static_cast<int>(get_arch_int("ssm.time_step_rank", nq));
     out.cfg.gdn.head_k_dim = static_cast<int>(get_arch_int("ssm.state_size", hd));
@@ -504,6 +507,17 @@ bool parse_gguf_model_raw(const std::string& path, int max_seq_override, LoadedM
     out.cfg.moe.norm_topk_prob = gf.get_bool(prefix + "expert_weights_norm",
         gf.get_bool(prefix + "norm_topk_prob", !deepseek2));
     const int mla_experts = out.cfg.moe.num_experts;
+    if (qwen35moe) {
+        const auto scale = static_cast<float>(get_arch_float("expert_weights_scale", 1.0));
+        if (!std::isfinite(scale) || scale < 0) {
+            if (err) *err = "Invalid Qwen expert_weights_scale";
+            return false;
+        }
+        out.cfg.moe.norm_topk_prob = true;
+        out.cfg.moe.expert_weights_scale = scale == 0 ? 1.0f : scale;
+    } else if (gemma4) {
+        out.cfg.moe.norm_topk_prob = true;
+    }
     const int shared_experts = deepseek2 ? static_cast<int>(get_arch_int("expert_shared_count", 0)) : 0;
     if (deepseek2) {
         const auto gating = get_arch_int("expert_gating_func", 1);
@@ -638,6 +652,7 @@ bool parse_gguf_model_raw(const std::string& path, int max_seq_override, LoadedM
             out.rope_factors = std::move(frequencies);
         }
         for (int i = 0; i < num_layers; ++i) {
+            const bool mtp = i >= out.cfg.num_layers;
             std::string p = "blk." + std::to_string(i) + ".";
             LoadedLayerRaw& L = out.layers[static_cast<size_t>(i)];
             int layer_nq = nq, layer_nkv = nkv, layer_hd = hd, layer_inter = inter;
@@ -687,21 +702,36 @@ bool parse_gguf_model_raw(const std::string& path, int max_seq_override, LoadedM
             if (deepseek2 && has_moe != (i >= mla.leading_dense_layers)) {
                 throw std::runtime_error("DeepSeek MLA layer disagrees with leading_dense_block_count: " + p);
             }
+            if (mtp && (!has_attn || has_gdn))
+                throw std::runtime_error("Qwen NextN requires a full-attention block: " + p);
             if (has_gdn && !spec->recurrent) throw std::runtime_error("Unexpected GGUF recurrent attention: " + arch);
-            if (has_moe && gemma4) throw std::runtime_error("Gemma 4 expert layers are unsupported");
+            if (qwen35moe && !has_moe) throw std::runtime_error("Missing Qwen MoE router: " + p);
             if (!has_attn && !has_gdn && !has_moe) throw std::runtime_error("GGUF layer has no supported attention: " + p);
             if (has_moe) {
-                if (has_gdn) throw std::runtime_error("Combined recurrent attention and MoE is unsupported");
-                if (gf.find_tensor(p + "ffn_gate_inp_shexp.weight")) {
-                    throw std::runtime_error("GGUF shared expert requires a separate routing gate: " + p);
-                }
                 saw_moe = true;
-                L.mlp_norm = to_f32_host(req(p + "ffn_norm.weight"));
+                const auto f32_vector = [&](const std::string& name, int width) {
+                    auto t = to_f32_host(req(p + name));
+                    if (t.desc.ndim != 1 || t.desc.shape[0] != width ||
+                        std::any_of(t.data<float>(), t.data<float>() + width, [](float x) { return !std::isfinite(x); }))
+                        throw std::runtime_error("Invalid GGUF vector: " + p + name);
+                    return t;
+                };
+                const auto ff_norm = p + "post_attention_norm.weight";
+                L.mlp_norm = f32_vector(qwen35moe && gf.find_tensor(ff_norm) ? "post_attention_norm.weight" : "ffn_norm.weight", H);
+                if (gemma4) {
+                    L.routed_norm = f32_vector("pre_ffw_norm_2.weight", H);
+                    L.dense_post_norm = f32_vector("post_ffw_norm_1.weight", H);
+                    L.routed_post_norm = f32_vector("post_ffw_norm_2.weight", H);
+                    L.router_scale = f32_vector("ffn_gate_inp.scale", H);
+                    for (int h = 0; h < H; ++h) L.router_scale.data<float>()[h] /= std::sqrt(static_cast<float>(H));
+                }
                 L.router_w = to_f32_host(req(p + "ffn_gate_inp.weight"));
-                int E = static_cast<int>(L.router_w.desc.shape[0]);
+                if (L.router_w.desc.shape[0] > std::numeric_limits<int>::max())
+                    throw std::runtime_error("GGUF expert count exceeds supported indexing: " + p);
+                const int E = static_cast<int>(L.router_w.desc.shape[0]);
                 if (L.mlp_norm.desc.ndim != 1 || L.mlp_norm.desc.shape[0] != H ||
                     L.router_w.desc.ndim != 2 || L.router_w.desc.shape[1] != H || E < out.cfg.moe.top_k ||
-                    out.cfg.moe.top_k <= 0 || E > 256) {
+                    out.cfg.moe.top_k <= 0 || ((gemma4 || qwen35moe) && E != mla_experts)) {
                     throw std::runtime_error("Unsupported GGUF expert router shape: " + p);
                 }
                 if (deepseek2) {
@@ -767,6 +797,15 @@ bool parse_gguf_model_raw(const std::string& path, int max_seq_override, LoadedM
                     L.experts_down.desc.shape[1] != H || L.experts_down.desc.shape[2] != I) {
                     throw std::runtime_error("Invalid GGUF expert FFN shapes: " + p);
                 }
+                if (I <= 0 || E > std::numeric_limits<int>::max() / std::max<int64_t>(2LL * I, H))
+                    throw std::runtime_error("GGUF expert data exceeds supported indexing: " + p);
+                if (gf.find_tensor(p + "ffn_gate_exps.scale"))
+                    L.expert_gate_scale = f32_vector("ffn_gate_exps.scale", E);
+                if (gf.find_tensor(p + "ffn_up_exps.scale"))
+                    L.expert_up_scale = f32_vector("ffn_up_exps.scale", E);
+                if (gf.find_tensor(p + "ffn_down_exps.scale"))
+                    L.expert_down_scale = f32_vector("ffn_down_exps.scale", E);
+                if (L.experts_up.bytes().empty()) L.expert_gate_scale = L.expert_up_scale;
                 for (const auto* weight : {&L.experts_gate_up, &L.experts_up, &L.experts_down}) {
                     if (weight->desc.dtype == DType::I32) {
                         throw std::runtime_error("Unsupported GGUF expert weight dtype: " + p);
@@ -778,11 +817,12 @@ bool parse_gguf_model_raw(const std::string& path, int max_seq_override, LoadedM
                     auto gate = req(p + "ffn_gate_shexp.weight");
                     auto up = req(p + "ffn_up_shexp.weight");
                     L.shared_down = req(p + "ffn_down_shexp.weight");
-                    if (deepseek2) {
-                        const int64_t width = int64_t{I} * shared_experts;
+                    if (deepseek2 || qwen35moe) {
+                        const int64_t width = deepseek2 ? int64_t{I} * shared_experts :
+                            get_arch_int("expert_shared_feed_forward_length", layer_inter);
                         if (width <= 0 || width > std::numeric_limits<int>::max() / 2 ||
                             !matrix(gate, width, H) || !matrix(up, width, H) || !matrix(L.shared_down, H, width)) {
-                            throw std::runtime_error("Invalid DeepSeek MoE shared expert shapes: " + p);
+                            throw std::runtime_error("Invalid MoE shared expert shapes: " + p);
                         }
                         if (gate.desc.dtype != up.desc.dtype) {
                             gate = quantize_host_matrix(to_f32_host(gate), DType::F16);
@@ -797,7 +837,13 @@ bool parse_gguf_model_raw(const std::string& path, int max_seq_override, LoadedM
                 if (deepseek2 && shared_experts > 0 && !L.has_shared) {
                     throw std::runtime_error("Missing DeepSeek MoE shared expert weights: " + p);
                 }
-                if (!has_attn) {
+                if (qwen35moe || gf.find_tensor(p + "ffn_gate_inp_shexp.weight")) {
+                    if (!L.has_shared) throw std::runtime_error("Incomplete GGUF gated shared expert: " + p);
+                    L.shared_gate = f32_vector("ffn_gate_inp_shexp.weight", H);
+                    L.shared_gate.desc = L.shared_gate.desc.view({1, H});
+                }
+                if (!has_attn && !has_gdn) {
+                    if (gemma4 || qwen35moe) throw std::runtime_error("Missing attention in GGUF MoE block: " + p);
                     L.kind = 2;
                     continue;
                 }
@@ -963,7 +1009,10 @@ bool parse_gguf_model_raw(const std::string& path, int max_seq_override, LoadedM
                 L.o_proj = req(p + "attn_output.weight");
                 if (!matrix(L.o_proj, H, q_dim)) throw std::runtime_error("Invalid GGUF attention output shape: " + p);
             }
-            if (has_moe) continue;
+            if (has_moe && !gemma4) {
+                if (L.kind == 1) validate_gdn_layer(L, get_arch_int("ssm.conv_kernel", 4), out.cfg.gdn, p);
+                continue;
+            }
             L.mlp_norm = to_f32_host(!gemma4 && gf.find_tensor(p + "post_attention_norm.weight") ? gf.view_tensor(p + "post_attention_norm.weight") : req(p + "ffn_norm.weight"));
             if ((gemma4 || deepseek2) && (L.mlp_norm.desc.ndim != 1 || L.mlp_norm.desc.shape[0] != H)) {
                 throw std::runtime_error("Invalid GGUF FFN norm shape: " + p);
@@ -998,6 +1047,40 @@ bool parse_gguf_model_raw(const std::string& path, int max_seq_override, LoadedM
                     L.o_proj.desc.hadamard_key_heads = out.cfg.gdn.num_k_heads;
                 }
             }
+        }
+        if (mtp_layers) {
+            const std::string nextn = "blk." + std::to_string(out.cfg.num_layers) + ".nextn.";
+            auto weights = [&](const std::string& name, int64_t rows, int64_t cols, bool optional) {
+                const auto key = nextn + name + ".weight";
+                if (optional && !gf.find_tensor(key)) return HostTensor{};
+                auto t = req(key);
+                if (!matrix(t, rows, cols)) throw std::runtime_error("Invalid Qwen NextN matrix: " + key);
+                return t;
+            };
+            auto norm = [&](const std::string& name, bool optional) {
+                const auto key = nextn + name + ".weight";
+                if (optional && !gf.find_tensor(key)) return HostTensor{};
+                auto t = to_f32_host(req(key));
+                if (t.desc.ndim != 1 || t.desc.shape[0] != H)
+                    throw std::runtime_error("Invalid Qwen NextN norm: " + key);
+                return t;
+            };
+            out.mtp_projection = weights("eh_proj", H, 2LL * H, false);
+            out.mtp_embedding = weights("embed_tokens", emb_vocab, H, true);
+            out.mtp_head = weights("shared_head_head", emb_vocab, H, true);
+            out.mtp_enorm = norm("enorm", false);
+            out.mtp_hnorm = norm("hnorm", false);
+            out.mtp_head_norm = norm("shared_head_norm", true);
+            const auto scale = [&](std::string_view name) {
+                const auto key = nextn + std::string(name) + ".scale";
+                if (!gf.find_tensor(key)) return 1.f;
+                const auto t = to_f32_host(req(key));
+                if (t.desc.ndim != 1 || t.desc.shape[0] != 1 || !std::isfinite(t.data<float>()[0]))
+                    throw std::runtime_error("Invalid Qwen NextN scale: " + key);
+                return t.data<float>()[0];
+            };
+            out.mtp_projection_scale = scale("eh_proj");
+            if (!out.mtp_head.bytes().empty()) out.mtp_head_scale = scale("shared_head_head");
         }
     } catch (const std::exception& e) {
         if (err) *err = e.what();

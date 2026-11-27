@@ -1,0 +1,15 @@
+#version 450
+
+layout(local_size_x = 256) in;
+layout(std430, binding = 0) readonly buffer Packed { float packed[]; };
+layout(std430, binding = 1) writeonly buffer Query { float query[]; };
+layout(std430, binding = 2) writeonly buffer Gate { float gate[]; };
+layout(push_constant) uniform Params { int count, head_dim; };
+
+void main() {
+    int i = int(gl_GlobalInvocationID.x);
+    if (i >= count) return;
+    int base = 2 * (i / head_dim) * head_dim + i % head_dim;
+    query[i] = packed[base];
+    gate[i] = packed[base + head_dim];
+}

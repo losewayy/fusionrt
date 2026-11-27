@@ -404,6 +404,7 @@ __global__ void k_qk_norm_rope_kv_append(
     }
 }
 
+template<int StaticExperts>
 __global__ void k_moe_topk_router(const float* __restrict__ logits,
                                   int* __restrict__ topk_idx,
                                   float* __restrict__ topk_weight,
@@ -413,8 +414,10 @@ __global__ void k_moe_topk_router(const float* __restrict__ logits,
     logits += static_cast<size_t>(blockIdx.x) * num_experts;
     topk_idx += static_cast<size_t>(blockIdx.x) * top_k;
     topk_weight += static_cast<size_t>(blockIdx.x) * top_k;
-    float probs[256];
-    const int ne = min(num_experts, 256);
+    extern __shared__ float dynamic_probs[];
+    float static_probs[StaticExperts > 0 ? StaticExperts : 1];
+    float* probs = StaticExperts > 0 ? static_probs : dynamic_probs;
+    const int ne = StaticExperts > 0 ? min(num_experts, StaticExperts) : num_experts;
     if (sigmoid) {
         for (int e = 0; e < ne; ++e) probs[e] = 1.0f / (1.0f + expf(-logits[e]));
     } else {
@@ -499,32 +502,44 @@ __device__ float codec_warp_dot(const float* x, const uint8_t* weight, int row, 
     const int blocks = cols / Codec::kBlockSize;
     const auto* b = weight + static_cast<size_t>(row) * blocks * Codec::kBlockBytes;
     float sum = 0.0f;
-    for (int block = 0; block < blocks; ++block, b += Codec::kBlockBytes) {
-        for (int i = lane; i < Codec::kBlockSize; i += 32)
-            sum += x[block * Codec::kBlockSize + i] * Codec::value(b, i);
-    }
+    constexpr int lanes = Codec::kWarpBlockLanes;
+    constexpr int step = 32 / lanes;
+    const int lane_block = lane / lanes;
+    for (int block = lane_block; block < blocks; block += step)
+        sum += Codec::warp_dot_block(b + block * Codec::kBlockBytes,
+                                     x + block * Codec::kBlockSize, lane % lanes);
     return warp_reduce_sum(sum);
 }
 
 template<class Codec>
 __global__ void k_codec_gemv(const float* x, const uint8_t* w, float* out, int rows, int n, int k) {
-    const int64_t i = static_cast<int64_t>(blockIdx.x) * (blockDim.x / 32) + threadIdx.x / 32;
-    if (i >= static_cast<int64_t>(rows) * n) return;
-    const float sum = codec_warp_dot<Codec>(x + i / n * k, w, static_cast<int>(i % n), k);
-    if ((threadIdx.x & 31) == 0) out[i] = sum;
+    const int col = blockIdx.x * (blockDim.x / 32) + threadIdx.x / 32;
+    if (col >= n) return;
+    for (int row = blockIdx.y; row < rows; row += gridDim.y) {
+        const float sum = codec_warp_dot<Codec>(x + static_cast<int64_t>(row) * k, w, col, k);
+        if ((threadIdx.x & 31) == 0) out[static_cast<int64_t>(row) * n + col] = sum;
+    }
 }
 
 template<class Codec, bool Embedding>
 __global__ void k_codec_unpack(const uint8_t* w, const int32_t* ids,
                                void* out, int rows, int cols, int first) {
-    const int64_t i = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-    if (i >= static_cast<int64_t>(rows) * cols) return;
-    const int64_t row = Embedding ? ids[i / cols] : i / cols + first;
-    const auto col = i % cols;
-    const auto block = (row * cols + col) / Codec::kBlockSize;
-    const float v = Codec::value(w + block * Codec::kBlockBytes, static_cast<int>(col % Codec::kBlockSize));
-    if constexpr (Embedding) static_cast<float*>(out)[i] = v;
-    else static_cast<half*>(out)[i] = __float2half_rn(v);
+    constexpr int warps = 8;
+    const int block = blockIdx.x * warps + threadIdx.x / 32;
+    const int row_blocks = cols / Codec::kBlockSize;
+    if (block >= row_blocks) return;
+    for (int row = blockIdx.y; row < rows; row += gridDim.y) {
+        const int64_t src_row = Embedding ? ids[row] : static_cast<int64_t>(row) + first;
+        const auto* b = w + (src_row * row_blocks + block) * Codec::kBlockBytes;
+        const int64_t pos = static_cast<int64_t>(row) * cols + block * Codec::kBlockSize;
+#pragma unroll
+        for (int offset = 0; offset < Codec::kBlockSize; offset += 32) {
+            const int i = offset + (threadIdx.x & 31);
+            const float v = Codec::value(b, i);
+            if constexpr (Embedding) static_cast<float*>(out)[pos + i] = v;
+            else static_cast<half*>(out)[pos + i] = __float2half_rn(v);
+        }
+    }
 }
 
 template<bool CodecWeights>
@@ -553,14 +568,15 @@ __device__ float moe_warp_dot(const float* x, const void* w, DType type, int row
     }
 }
 
-template<bool CodecWeights>
+template<bool CodecWeights, bool ExpertOps>
 __global__ void k_moe_indexed_gate_up_swiglu(
     const float* __restrict__ x,
     const int* __restrict__ topk_idx,
     const void* gate_w, DType gate_type,
     const void* up_w, DType up_type,
     float* __restrict__ scratch_inter,
-    int hidden, int inter, int top_k, int resident, int first_expert)
+    int hidden, int inter, int top_k, int resident, int first_expert,
+    bool geglu, const float* gate_scale, const float* up_scale)
 {
     int wid = (blockIdx.x * blockDim.x + threadIdx.x) >> 5;
     int lane = threadIdx.x & 31;
@@ -576,7 +592,13 @@ __global__ void k_moe_indexed_gate_up_swiglu(
     const float u_acc = up_w ? moe_warp_dot<CodecWeights>(x, up_w, up_type, gate_row, hidden) :
                                moe_warp_dot<CodecWeights>(x, gate_w, gate_type, gate_row + inter, hidden);
     if (lane == 0) {
-        scratch_inter[k_slot * inter + c] = silu_f(g_acc) * u_acc;
+        float gate = g_acc, up = u_acc;
+        if constexpr (ExpertOps) {
+            if (gate_scale) gate *= gate_scale[e + first_expert];
+            if (up_scale) up *= up_scale[e + first_expert];
+        }
+        scratch_inter[k_slot * inter + c] = ExpertOps && geglu ?
+            gated_activation<true>(gate, up) : gated_activation<false>(gate, up);
     }
 }
 
@@ -1056,32 +1078,45 @@ void fused_qk_norm_rope_kv_append_f32(
 void moe_topk_router_f32(const float* logits, int* topk_idx, float* topk_weight,
                          int num_experts, int top_k, bool norm_topk, cudaStream_t stream,
                          const float* selection_bias, bool sigmoid, float scale, int groups, int groups_used, int rows) {
-    if (rows <= 0 || num_experts <= 0 || num_experts > 256 || top_k <= 0 || groups <= 0 || groups > 128 ||
+    if (rows <= 0 || num_experts <= 0 || static_cast<size_t>(num_experts) * sizeof(float) > 48 * 1024 || top_k <= 0 || groups <= 0 || groups > 128 ||
         groups_used <= 0 || groups_used > groups || num_experts % groups != 0 ||
         groups_used * (num_experts / groups) < top_k) {
         throw std::invalid_argument("Invalid CUDA MoE router dimensions");
     }
-    k_moe_topk_router<<<rows, 1, 0, stream>>>(logits, topk_idx, topk_weight, num_experts, top_k, norm_topk,
-                                          selection_bias, sigmoid, scale, groups, groups_used);
+    constexpr int local_capacity = 256;
+    if (num_experts <= local_capacity) {
+        k_moe_topk_router<local_capacity><<<rows, 1, 0, stream>>>(logits, topk_idx, topk_weight, num_experts,
+            top_k, norm_topk, selection_bias, sigmoid, scale, groups, groups_used);
+    } else {
+        k_moe_topk_router<0><<<rows, 1, num_experts * sizeof(float), stream>>>(logits, topk_idx, topk_weight,
+            num_experts, top_k, norm_topk, selection_bias, sigmoid, scale, groups, groups_used);
+    }
 }
 
 void moe_indexed_swiglu_gemv(
     const float* x, const int* topk_idx, const void* gate_w, DType gate_type,
     const void* up_w, DType up_type, const void* down_w, DType down_type,
     const float* topk_weight, float* out, float* scratch_inter,
-    int hidden, int inter, int top_k, int resident, cudaStream_t stream, int first_expert)
+    int hidden, int inter, int top_k, int resident, cudaStream_t stream, int first_expert,
+    bool geglu, const float* gate_scale, const float* up_scale)
 {
     constexpr int WARPS = 8;
     int total_up_rows = top_k * inter;
     int up_blocks = (total_up_rows + WARPS - 1) / WARPS;
-    auto gate_up = [&]<bool CodecWeights>() {
-        k_moe_indexed_gate_up_swiglu<CodecWeights><<<up_blocks, WARPS * 32, 0, stream>>>(
-            x, topk_idx, gate_w, gate_type, up_w, up_type, scratch_inter, hidden, inter, top_k, resident, first_expert);
+    auto gate_up = [&]<bool CodecWeights, bool ExpertOps>() {
+        k_moe_indexed_gate_up_swiglu<CodecWeights, ExpertOps><<<up_blocks, WARPS * 32, 0, stream>>>(
+            x, topk_idx, gate_w, gate_type, up_w, up_type, scratch_inter, hidden, inter, top_k, resident,
+            first_expert, geglu, gate_scale, up_scale);
     };
-    if (is_weight_codec_dtype(gate_type) || (up_w && is_weight_codec_dtype(up_type)))
-        gate_up.template operator()<true>();
-    else
-        gate_up.template operator()<false>();
+    const bool codec = is_weight_codec_dtype(gate_type) || (up_w && is_weight_codec_dtype(up_type));
+    const bool transforms = geglu || gate_scale || up_scale;
+    if (codec) {
+        if (transforms) gate_up.template operator()<true, true>();
+        else gate_up.template operator()<true, false>();
+    } else {
+        if (transforms) gate_up.template operator()<false, true>();
+        else gate_up.template operator()<false, false>();
+    }
 
     const int down_blocks = (hidden + WARPS - 1) / WARPS;
     auto down = [&]<bool CodecWeights>() {
@@ -1116,9 +1151,9 @@ void codec_gemv_f32(const float* x, const void* weight, DType dtype, float* out,
                      int rows, int out_cols, int in_cols, cudaStream_t stream) {
     (void)row_nbytes(dtype, in_cols);
     constexpr int warps = 4;
-    const auto blocks = (static_cast<int64_t>(rows) * out_cols + warps - 1) / warps;
+    const dim3 blocks((out_cols - 1) / warps + 1, std::min(rows, 65535));
     visit_weight_codec(dtype, [&]<class Codec>() {
-        k_codec_gemv<Codec><<<static_cast<unsigned>(blocks), warps * 32, 0, stream>>>(
+        k_codec_gemv<Codec><<<blocks, warps * 32, 0, stream>>>(
             x, static_cast<const uint8_t*>(weight), out, rows, out_cols, in_cols);
     });
 }
@@ -1126,9 +1161,9 @@ void codec_gemv_f32(const float* x, const void* weight, DType dtype, float* out,
 void codec_dequant_tile_f16(const void* weight, DType dtype, uint16_t* out,
                              int first_row, int rows, int cols, cudaStream_t stream) {
     (void)row_nbytes(dtype, cols);
-    const auto blocks = (static_cast<int64_t>(rows) * cols + 255) / 256;
     visit_weight_codec(dtype, [&]<class Codec>() {
-        k_codec_unpack<Codec, false><<<static_cast<unsigned>(blocks), 256, 0, stream>>>(
+        const dim3 blocks((cols / Codec::kBlockSize + 7) / 8, std::min(rows, 65535));
+        k_codec_unpack<Codec, false><<<blocks, 256, 0, stream>>>(
             static_cast<const uint8_t*>(weight), nullptr, out, rows, cols, first_row);
     });
 }
@@ -1138,9 +1173,9 @@ void embed_lookup_f32(const void* emb_table, DType table_dtype,
                       int M, int hidden, cudaStream_t stream) {
     if (is_weight_codec_dtype(table_dtype)) {
         (void)row_nbytes(table_dtype, hidden);
-        const auto blocks = (static_cast<int64_t>(M) * hidden + 255) / 256;
         visit_weight_codec(table_dtype, [&]<class Codec>() {
-            k_codec_unpack<Codec, true><<<static_cast<unsigned>(blocks), 256, 0, stream>>>(
+            const dim3 blocks((hidden / Codec::kBlockSize + 7) / 8, std::min(M, 65535));
+            k_codec_unpack<Codec, true><<<blocks, 256, 0, stream>>>(
                 static_cast<const uint8_t*>(emb_table), token_ids_dev, out, M, hidden, 0);
         });
         return;
@@ -1205,6 +1240,25 @@ void split_q_gate_f32(const float* q_full, float* q_out, float* gate_out,
     int total = M * num_q_heads * head_dim;
     int srs = (src_row_stride > 0) ? src_row_stride : (2 * num_q_heads * head_dim);
     k_split_q_gate_f32<<<(total + 255) / 256, 256, 0, stream>>>(q_full, q_out, gate_out, M, num_q_heads, head_dim, srs);
+}
+
+__global__ void k_apply_row_sigmoid_gate(float* values, const float* gate, int n, int cols) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) values[i] /= 1.f + expf(-gate[i / cols]);
+}
+
+void apply_row_sigmoid_gate_f32(float* values, const float* gate, int rows, int cols, cudaStream_t stream) {
+    const int n = rows * cols;
+    k_apply_row_sigmoid_gate<<<(n + 255) / 256, 256, 0, stream>>>(values, gate, n, cols);
+}
+
+__global__ void k_scale_moe_routes(float* weights, const int* indices, const float* scales, int n) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) weights[i] *= scales[indices[i]];
+}
+
+void scale_moe_routes_f32(float* weights, const int* indices, const float* scales, int n, cudaStream_t stream) {
+    k_scale_moe_routes<<<(n + 255) / 256, 256, 0, stream>>>(weights, indices, scales, n);
 }
 
 void apply_sigmoid_gate_f32(float* attn_out, const float* gate, int n, cudaStream_t stream) {

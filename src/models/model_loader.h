@@ -23,7 +23,8 @@ struct LoadedLayerRaw {
     HostTensor z_proj, a_proj, b_proj, conv_w, conv_bias, A_log, dt_bias, gdn_norm_w;
     // MoE extras
     HostTensor router_w, experts_gate_up, experts_up, experts_down, shared_gate_up, shared_down;
-    HostTensor router_bias;
+    HostTensor router_bias, shared_gate, router_scale, expert_gate_scale, expert_up_scale, expert_down_scale;
+    HostTensor routed_norm, dense_post_norm, routed_post_norm;
     bool has_shared = false;
 };
 
@@ -33,6 +34,8 @@ struct LoadedModelRaw {
     HostTensor final_norm_w;
     HostTensor lm_head_w;
     HostTensor rope_factors;
+    HostTensor mtp_projection, mtp_embedding, mtp_enorm, mtp_hnorm, mtp_head_norm, mtp_head;
+    float mtp_projection_scale = 1.f, mtp_head_scale = 1.f;
     GemmaLayerInputWeights<HostTensor> gemma_inputs;
     bool hadamard_folded = false;
     std::vector<LoadedLayerRaw> layers;

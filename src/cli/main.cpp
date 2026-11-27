@@ -45,14 +45,14 @@ void print_usage() {
               << "               [--temp 0] [--top-k 40] [--top-p 0.95] [--min-p 0.05] [--repeat-penalty 1] [--seed 42]\n"
               << "               [--profile <json>] [--profile-ops <json>] [--trace-layers <json>]\n"
               << "               [--slots <n>] [--warmup <n>] [--trace-moe] [--trace-moe-routes <jsonl>] [--cpu-moe-f32]\n"
-              << "               [--json-grammar] [--spec-ngram <k> | --draft-model <gguf> [--draft-tokens 4]]\n"
+              << "               [--json-grammar] [--spec-ngram <k> | --draft-model <gguf> | --spec-mtp] [--draft-tokens 4]\n"
               << "               [--mmproj <gguf> --image <path> ...] (use <image> to place images in the prompt)\n"
               << "               --steps defaults to 512 with --model and 16 for synthetic models.\n"
               << "  fusionrt inspect --model <path> [--max-seq 4096] [--device-memory]\n"
               << "  fusionrt chat --model <path> [--system <text>] [--temp 0.7] [--max-tokens 512]\n"
               << "  fusionrt serve --model <path> [--mmproj <gguf>] [--image <preset> ...]\n"
               << "                 [--host 127.0.0.1] [--port 8080] [--max-seq 4096] [--slots 1] [--profile <json>]\n"
-              << "                 [--spec-ngram <k> | --draft-model <gguf> [--draft-tokens 4]] [--trace-moe-routes <jsonl>]\n"
+              << "                 [--spec-ngram <k> | --draft-model <gguf> | --spec-mtp] [--draft-tokens 4] [--trace-moe-routes <jsonl>]\n"
               << "  fusionrt bench-model --model <path> [--pp 128] [--tg 64] [--decode-prefix 0] [--ubatch 512] [--reps 5] [--graph] [--profile-ops <json>]\n"
               << "  CUDA run, chat, serve, inspect and bench-model accept --kv-dtype {auto|f32|f16|q8_0}.\n"
               << "  CUDA --threads <n> controls CPU execution (0: auto). --cpu-affinity spread pins workers.\n"
@@ -323,6 +323,10 @@ int cmd_daily(const std::string& cmd, int argc, char** argv) {
             graph = arg == "--graph";
             continue;
         }
+        if (cmd == "serve" && arg == "--spec-mtp") {
+            speculative.mtp = true;
+            continue;
+        }
         if (cmd == "inspect" && arg == "--device-memory") {
             inspect_device = true;
             continue;
@@ -468,6 +472,7 @@ int cmd_daily(const std::string& cmd, int argc, char** argv) {
     FusionModel model(HybridModelConfig{});
     model.set_num_slots(slots);
     placement.apply(ctx, model);
+    model.enable_native_mtp(speculative.mtp);
     load_cuda_model(ctx, model, path, max_seq, profile);
     if (cmd == "inspect") {
         WeightSummary sizes;
@@ -516,7 +521,7 @@ int cmd_daily(const std::string& cmd, int argc, char** argv) {
     if (!route_trace_path.empty()) route_trace = std::make_unique<MoeRouteTrace>(route_trace_path);
     ctx.moe_route_trace = route_trace.get();
     serve_http(ctx, model, tokenizer, model_filename(path), host, port, graph, vision.get(), preset_images,
-               {speculative.ngram, draft.get(), speculative.draft_tokens});
+               {speculative.ngram, draft.get(), speculative.draft_tokens, speculative.mtp});
     return 0;
 #endif
 }
@@ -624,6 +629,7 @@ int cmd_run(int argc, char** argv) {
         else if (a == "--vk-device" && i + 1 < argc) vk_dev = parse_integer(a, argv[++i]);
         else if (a == "--model" && i + 1 < argc) model_path = argv[++i];
         else if (a == "--json-grammar") json_grammar = true;
+        else if (a == "--spec-mtp") speculative.mtp = true;
         else if (i + 1 < argc && speculative.parse(a, argv[i + 1])) ++i;
         else if (a == "--mmproj" && i + 1 < argc) mmproj = argv[++i];
         else if (a == "--image" && i + 1 < argc) image_paths.push_back(argv[++i]);
@@ -715,6 +721,7 @@ int cmd_run(int argc, char** argv) {
                 const auto requested = std::max(size_t{1}, text_ids.size()) + std::max(steps, warmup);
                 model.set_kv_commitment_tokens(static_cast<int>(std::min(requested, static_cast<size_t>(max_seq))));
             }
+            model.enable_native_mtp(speculative.mtp);
             load_cuda_model(ctx, model, model_path, max_seq, profile);
         } else {
             model.init_synthetic(ctx, 42);
@@ -764,6 +771,7 @@ int cmd_run(int argc, char** argv) {
         options.sampling = sampling;
         options.json_constraint = constraint ? &*constraint : nullptr;
         options.spec_ngram = speculative.ngram;
+        options.spec_mtp = speculative.mtp;
         options.draft_model = draft.get();
         options.draft_tokens = speculative.draft_tokens;
         options.inputs_embeds = prepared.inputs_embeds;

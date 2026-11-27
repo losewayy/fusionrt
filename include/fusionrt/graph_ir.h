@@ -121,6 +121,7 @@ struct GemmaLayerInputWeights {
 struct MiniGraph {
     int input_value = -1;
     int output_value = -1;
+    int nextn_hidden = -1;
     int hidden_size = 0;
     float final_logit_softcapping = 0.0f;
     int decode_split_kv_heads = 0;

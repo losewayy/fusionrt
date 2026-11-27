@@ -58,7 +58,8 @@ struct CpuMoeWorkspace {
 int cpu_moe_accumulate_layer(CpuWorkers* workers, CpuMoeWorkspace& scratch,
     const HostTensor& gate, const HostTensor& up, const HostTensor& down,
     const int32_t* indices, const float* weights, int first_cold, int host_first, int rows, int top_k,
-    const float* input, float* output, CpuMoeMode mode = CpuMoeMode::Parallel);
+    const float* input, float* output, CpuMoeMode mode = CpuMoeMode::Parallel,
+    bool geglu = false, const float* gate_scale = nullptr, const float* up_scale = nullptr);
 
 // The gate tensor also holds up when the separate up tensor is empty.
 void cpu_moe_accumulate(const HostTensor& gate, const HostTensor& up, const HostTensor& down,

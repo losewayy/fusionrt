@@ -255,7 +255,7 @@ void test_cuda_weight_codecs(CudaContext& ctx) {
     ctx.set_mmq_crossover_m(2);
     double max_gemv = 0, max_gemm = 0, max_moe = 0;
     for (const auto& f : codec_fixtures) {
-        constexpr int M = 7, N = 131;
+        constexpr int M = 23, N = 131;
         const int K = 2 * f.elements;
         const auto src = packed_fixture(f, {N, K});
         const auto fp = model_io::to_f32_host(src);
@@ -466,6 +466,318 @@ void test_cuda_hadamard(CudaContext& ctx) {
         arena.reset(mark);
     }
     std::cout << "  [PASS] FWHT 64-1024 CUDA max_rel_l2=" << max_error << '\n';
+}
+#endif
+
+struct FrontierFixture {
+    static constexpr int hidden = 64, vocab = 16, intermediate = 16, shared = 8;
+    std::string arch, path;
+    int experts, used = 2, trunk;
+    bool mtp;
+    std::map<std::string, GgufMetaValue> meta;
+    std::vector<std::pair<std::string, HostTensor>> tensors;
+
+    FrontierFixture(bool gemma, bool nextn) :
+        arch(gemma ? "gemma4" : "qwen35moe"), path("test-" + arch + (nextn ? "-mtp" : "") + ".gguf"),
+        experts(gemma ? 5 : 300), trunk(gemma ? 1 : 2), mtp(nextn) {
+        meta["general.architecture"] = arch;
+        auto hparam = [&](const char* key, int n) { meta[arch + "." + key] = uint32_t(n); };
+        hparam("block_count", trunk + mtp);
+        hparam("embedding_length", hidden);
+        hparam("feed_forward_length", intermediate);
+        hparam("attention.head_count", 1);
+        hparam("attention.head_count_kv", 1);
+        hparam("attention.key_length", hidden);
+        hparam("expert_count", experts);
+        hparam("expert_used_count", used);
+        hparam("expert_feed_forward_length", intermediate);
+        hparam("context_length", 64);
+        std::mt19937_64 rng(2821);
+        auto normal = [&](const std::string& name, int len, float value) {
+            auto t = model_io::make_ones_f32({len});
+            std::fill_n(t.data<float>(), len, value);
+            tensors.emplace_back(name, std::move(t));
+        };
+        auto w = [&](const std::string& name, std::vector<int64_t> shape, float scale) {
+            tensors.emplace_back(name, scale == 0.0f ?
+                model_io::make_zeros_f32(shape) : model_io::make_rand_f32(shape, rng, scale));
+        };
+        w("token_embd.weight", {vocab, hidden}, 0.2f);
+        if (mtp) for (int id = 0; id < vocab; ++id) tensors.back().second.data<float>()[id * hidden] += 2.f;
+        normal("output_norm.weight", hidden, 1.1f);
+        w("output.weight", {vocab, hidden}, mtp ? 0.0f : 0.1f);
+        if (mtp) tensors.back().second.data<float>()[0] = 1.f;
+        if (gemma) {
+            meta[arch + ".attention.sliding_window_pattern"] = std::vector<bool>{false};
+            meta[arch + ".final_logit_softcapping"] = 0.5f;
+        } else {
+            hparam("expert_shared_feed_forward_length", shared);
+            hparam("ssm.conv_kernel", 4);
+            hparam("ssm.state_size", 16);
+            hparam("ssm.group_count", 1);
+            hparam("ssm.time_step_rank", 2);
+            hparam("ssm.inner_size", 32);
+            hparam("nextn_predict_layers", mtp ? 1 : 0);
+            meta[arch + ".expert_weights_scale"] = 0.85f;
+        }
+        for (int i = 0; i < trunk + mtp; ++i) {
+            const auto p = "blk." + std::to_string(i) + ".";
+            normal(p + "attn_norm.weight", hidden, 0.95f);
+            if (i == 0 && !gemma) {
+                w(p + "attn_qkv.weight", {64, hidden}, 0.1f);
+                w(p + "attn_gate.weight", {32, hidden}, 0.1f);
+                w(p + "ssm_alpha.weight", {2, hidden}, 0.1f);
+                w(p + "ssm_beta.weight", {2, hidden}, 0.1f);
+                w(p + "ssm_conv1d.weight", {64, 4}, 0.1f);
+                normal(p + "ssm_a", 2, -0.75f);
+                normal(p + "ssm_dt.bias", 2, 0.01f);
+                normal(p + "ssm_norm.weight", 16, 1.f);
+                w(p + "ssm_out.weight", {hidden, 32}, 0.f);
+            } else {
+                w(p + "attn_q.weight", {gemma ? hidden : 2 * hidden, hidden}, 0.1f);
+                w(p + "attn_k.weight", {hidden, hidden}, 0.1f);
+                w(p + "attn_v.weight", {hidden, hidden}, 0.1f);
+                w(p + "attn_output.weight", {hidden, hidden}, i == trunk ? 0.05f : 0.f);
+                normal(p + "attn_q_norm.weight", hidden, 1.f);
+                normal(p + "attn_k_norm.weight", hidden, 1.f);
+            }
+            if (gemma) {
+                normal(p + "post_attention_norm.weight", hidden, 1.05f);
+                normal(p + "ffn_norm.weight", hidden, 0.81f);
+                normal(p + "post_ffw_norm.weight", hidden, 0.25f);
+                normal(p + "post_ffw_norm_1.weight", hidden, 0.75f);
+                normal(p + "post_ffw_norm_2.weight", hidden, 0.91f);
+                normal(p + "pre_ffw_norm_2.weight", hidden, 1.23f);
+                normal(p + "ffn_gate_inp.scale", hidden, 0.68f);
+                normal(p + "layer_output_scale.weight", 1, 0.88f);
+                w(p + "ffn_gate.weight", {intermediate, hidden}, 0.08f);
+                w(p + "ffn_up.weight", {intermediate, hidden}, 0.09f);
+                w(p + "ffn_down.weight", {hidden, intermediate}, 0.08f);
+            } else {
+                normal(p + "post_attention_norm.weight", hidden, 1.15f);
+                w(p + "ffn_gate_inp_shexp.weight", {hidden}, 0.15f);
+                w(p + "ffn_gate_shexp.weight", {shared, hidden}, 0.08f);
+                w(p + "ffn_up_shexp.weight", {shared, hidden}, 0.08f);
+                w(p + "ffn_down_shexp.weight", {hidden, shared}, 0.08f);
+            }
+            w(p + "ffn_gate_inp.weight", {experts, hidden}, 0.15f);
+            auto* router = tensors.back().second.data<float>();
+            // Two opposite gates above expert 256 must remain eligible.
+            router[(experts - 1) * hidden] = 12.f;
+            router[(experts - 2) * hidden] = -12.f;
+            w(p + "ffn_gate_exps.weight", {experts, intermediate, hidden}, 0.07f);
+            w(p + "ffn_up_exps.weight", {experts, intermediate, hidden}, 0.07f);
+            w(p + "ffn_down_exps.weight", {experts, hidden, intermediate}, 0.065f);
+            normal(p + "ffn_gate_exps.scale", experts, 0.81f);
+            normal(p + "ffn_up_exps.scale", experts, 1.05f);
+            normal(p + "ffn_down_exps.scale", experts, 1.21f);
+            for (size_t j = tensors.size() - 3; j < tensors.size(); ++j) {
+                auto* s = tensors[j].second.data<float>();
+                for (int e = 0; e < experts; ++e) s[e] += 0.02f * (e % 5);
+            }
+            if (i == trunk) {
+                normal(p + "nextn.enorm.weight", hidden, 1.f);
+                normal(p + "nextn.hnorm.weight", hidden, 0.7f);
+                w(p + "nextn.eh_proj.weight", {hidden, 2 * hidden}, 0.0f);
+                auto* proj = tensors.back().second.data<float>();
+                for (int j = 0; j < hidden; ++j) proj[j * (2 * hidden) + hidden + j] = 1.f;
+                normal(p + "nextn.eh_proj.scale", 1, 1.25f);
+            }
+        }
+        std::string err;
+        if (!GgufFile::write_v3(path, meta, tensors, &err)) throw std::runtime_error(err);
+    }
+
+    ~FrontierFixture() { std::error_code ec; std::filesystem::remove(path, ec); }
+
+    const HostTensor& tensor(const std::string& name) const {
+        const auto it = std::find_if(tensors.begin(), tensors.end(), [&](const auto& t) { return t.first == name; });
+        if (it == tensors.end()) throw std::runtime_error("Missing fixture tensor " + name);
+        return it->second;
+    }
+};
+
+std::vector<float> frontier_reference(const FrontierFixture& f, int32_t token) {
+    const bool gemma = f.arch == "gemma4";
+    constexpr int H = FrontierFixture::hidden, I = FrontierFixture::intermediate;
+    const auto* emb = f.tensor("token_embd.weight").data<float>() + token * H;
+    std::vector<float> hidden(emb, emb + H);
+    if (gemma) for (auto& x : hidden) x *= std::sqrt(static_cast<float>(H));
+
+    auto rms = [](std::vector<float> in, const HostTensor& w) {
+        const auto factor = 1.0 / std::sqrt(codec_reference_dot(in.data(), in.data(), static_cast<int>(in.size())) /
+                                           in.size() + 1e-6);
+        for (size_t i = 0; i < in.size(); ++i) in[i] = static_cast<float>(in[i] * factor * w.data<float>()[i]);
+        return in;
+    };
+    auto activate = [&](double x) {
+        return gemma ? x * 0.5 * (1.0 + std::tanh(0.7978845608 * x * (1.0 + 0.044715 * x * x)))
+                     : x / (1.0 + std::exp(-x));
+    };
+    auto branch = [&](const std::vector<float>& input, const std::string& prefix, const char* suffix,
+                       int width, int expert, bool scaled) {
+        const auto* gate = f.tensor(prefix + "ffn_gate" + suffix + ".weight").data<float>() + expert * width * H;
+        const auto* up = f.tensor(prefix + "ffn_up" + suffix + ".weight").data<float>() + expert * width * H;
+        const auto* down = f.tensor(prefix + "ffn_down" + suffix + ".weight").data<float>() + expert * width * H;
+        const double gs = scaled ? f.tensor(prefix + "ffn_gate_exps.scale").data<float>()[expert] : 1.0;
+        const double us = scaled ? f.tensor(prefix + "ffn_up_exps.scale").data<float>()[expert] : 1.0;
+        std::vector<float> act(width), output(H);
+        for (int i = 0; i < width; ++i)
+            act[i] = static_cast<float>(activate(gs * codec_reference_dot(gate + i * H, input.data(), H)) *
+                                       us * codec_reference_dot(up + i * H, input.data(), H));
+        for (int h = 0; h < H; ++h)
+            output[h] = static_cast<float>(codec_reference_dot(down + h * width, act.data(), width));
+        return output;
+    };
+
+    // Attention output projections on the trunk are zero. This isolates the
+    // FFN math while CUDA and Vulkan still execute the underlying blocks.
+    for (int layer = 0; layer < f.trunk; ++layer) {
+        const auto p = "blk." + std::to_string(layer) + ".";
+        const auto normalized = rms(hidden, f.tensor(p + (gemma ? "ffn_norm.weight" : "post_attention_norm.weight")));
+        const auto x = gemma ? rms(hidden, f.tensor(p + "pre_ffw_norm_2.weight")) : normalized;
+        auto route = gemma ? rms(hidden, f.tensor(p + "ffn_gate_inp.scale")) : normalized;
+        if (gemma) for (auto& r : route) r /= std::sqrt(static_cast<float>(H));
+        const auto* router = f.tensor(p + "ffn_gate_inp.weight").data<float>();
+        std::vector<std::pair<double, int>> ranked;
+        for (int e = 0; e < f.experts; ++e)
+            ranked.emplace_back(codec_reference_dot(router + e * H, route.data(), H), e);
+        std::partial_sort(ranked.begin(), ranked.begin() + f.used, ranked.end(), [](const auto& a, const auto& b) {
+            return a.first == b.first ? a.second < b.second : a.first > b.first;
+        });
+        double mass = 0.0;
+        for (int k = 0; k < f.used; ++k) mass += std::exp(ranked[k].first - ranked[0].first);
+        std::vector<float> routed(H, 0.f);
+        for (int k = 0; k < f.used; ++k) {
+            const auto [v, e] = ranked[k];
+            const double dw = f.tensor(p + "ffn_down_exps.scale").data<float>()[e];
+            const double weight = std::exp(v - ranked[0].first) / mass * dw *
+                (gemma ? 1.0 : std::get<float>(f.meta.at(f.arch + ".expert_weights_scale")));
+            const auto expert = branch(x, p, "_exps", I, e, true);
+            for (int h = 0; h < H; ++h) routed[h] += static_cast<float>(weight * expert[h]);
+        }
+        if (gemma) {
+            auto shared = rms(branch(normalized, p, "", I, 0, false), f.tensor(p + "post_ffw_norm_1.weight"));
+            routed = rms(std::move(routed), f.tensor(p + "post_ffw_norm_2.weight"));
+            for (int h = 0; h < H; ++h) routed[h] += shared[h];
+            routed = rms(std::move(routed), f.tensor(p + "post_ffw_norm.weight"));
+            for (int h = 0; h < H; ++h) hidden[h] = (hidden[h] + routed[h]) * 0.88f;
+        } else {
+            const double g = codec_reference_dot(f.tensor(p + "ffn_gate_inp_shexp.weight").data<float>(), x.data(), H);
+            const auto shared = branch(x, p, "_shexp", FrontierFixture::shared, 0, false);
+            for (int h = 0; h < H; ++h) hidden[h] += routed[h] + static_cast<float>(shared[h] / (1.0 + std::exp(-g)));
+        }
+    }
+    const auto n = rms(hidden, f.tensor("output_norm.weight"));
+    std::vector<float> logits(FrontierFixture::vocab);
+    for (int id = 0; id < FrontierFixture::vocab; ++id) {
+        const auto z = codec_reference_dot(f.tensor("output.weight").data<float>() + id * H, n.data(), H);
+        logits[id] = static_cast<float>(gemma ? 0.5 * std::tanh(z / 0.5) : z);
+    }
+    return logits;
+}
+
+void test_frontier_gguf() {
+    for (const bool gemma : {false, true}) {
+        const FrontierFixture f(gemma, false);
+        model_io::LoadedModelRaw raw;
+        std::string error;
+        if (!model_io::parse_gguf_model_raw(f.path, 64, raw, &error)) throw std::runtime_error(error);
+        if (raw.cfg.moe.num_experts != f.experts || raw.cfg.num_layers != f.trunk ||
+            (gemma ? raw.layers[0].router_scale.bytes().empty() : raw.layers[0].kind != 1))
+            throw std::runtime_error("Frontier GGUF geometry");
+        const auto ref = frontier_reference(f, 3);
+        if (!std::isfinite(ref[0])) throw std::runtime_error("Frontier CPU reference is finite");
+    }
+    const FrontierFixture f(false, true);
+    model_io::LoadedModelRaw raw;
+    std::string error;
+    if (!model_io::parse_gguf_model_raw(f.path, 64, raw, &error) || raw.cfg.num_layers != 2 ||
+        raw.layers.size() != 3 || raw.mtp_projection.desc.shape[1] != 2 * f.hidden || raw.mtp_projection_scale != 1.25f)
+        throw std::runtime_error("Qwen NextN GGUF roundtrip " + error);
+}
+
+#ifdef FUSIONRT_ENABLE_CUDA
+void test_cuda_frontier(CudaContext& ctx) {
+    {
+        auto& arena = ctx.scratch_arena();
+        const auto mark = arena.mark();
+        auto host = model_io::make_zeros_f32({513});
+        host.data<float>()[512] = 10.f;
+        host.data<float>()[257] = 9.f;
+        const auto input = ctx.upload(host, false);
+        auto ids = arena.alloc_tensor({2}, DType::I32);
+        auto scores = arena.alloc_tensor({2}, DType::F32);
+        cuda_ops::moe_topk_router_f32(input.ptr<float>(), ids.ptr<int32_t>(), scores.ptr<float>(), 513, 2, true, ctx.stream());
+        const auto routed_ids = ctx.download(ids);
+        if (routed_ids.data<int32_t>()[0] != 512 || routed_ids.data<int32_t>()[1] != 257)
+            throw std::runtime_error("CUDA preserves expert IDs beyond 256");
+        arena.reset(mark);
+    }
+    const std::vector<int32_t> prompt{1, 3, 2};
+    for (const bool gemma : {false, true}) {
+        const FrontierFixture f(gemma, false);
+        const auto ref = frontier_reference(f, prompt.back());
+        std::vector<int32_t> expected;
+        double max_error = 0;
+        for (const int resident : {f.experts, gemma ? 3 : 270, 0}) {
+            FusionModel model(HybridModelConfig{});
+            model.set_moe_gpu_experts(resident);
+            std::string error;
+            if (!model.load_gguf(ctx, f.path, &error, 64, true)) throw std::runtime_error(error);
+            const auto logits = model.forward_prefill_cuda(ctx, prompt, 0, true);
+            max_error = std::max(max_error, codec_rel_l2(logits, ref));
+            require_codec_close(DType::F32, "Frontier MoE CPU reference", logits, ref);
+            for (const bool graph : {false, true}) {
+                const auto ids = model.generate_cuda(ctx, prompt, 8, true, graph);
+                if (expected.empty()) expected = ids;
+                if (ids != expected) throw std::runtime_error("Frontier MoE greedy ID parity");
+            }
+        }
+#ifdef FUSIONRT_ENABLE_VULKAN
+        if (!gemma && !VkContext::enumerate_devices().empty()) {
+            VkContext vk(0, 2, 8);
+            FusionModel model(HybridModelConfig{});
+            std::string error;
+            if (!model.load_gguf_vulkan(vk, f.path, &error, 64)) throw std::runtime_error(error);
+            if (model.generate_vulkan(vk, prompt, 8) != expected)
+                throw std::runtime_error("Qwen Vulkan greedy ID parity");
+        }
+#endif
+        std::cout << "  [PASS] " << f.arch << " CPU reference / CUDA eager, graph and tiered exact tokens, max rel_l2="
+                  << max_error << '\n';
+    }
+
+    FrontierFixture f(false, true);
+    FusionModel model(HybridModelConfig{});
+    model.enable_native_mtp(true);
+    std::string error;
+    if (!model.load_gguf(ctx, f.path, &error, 64, true)) throw std::runtime_error(error);
+    GenerationOptions mtp;
+    mtp.spec_mtp = true;
+    mtp.draft_tokens = 3;
+    GenerationStats stats;
+    const auto normal = model.generate_cuda(ctx, prompt, 16);
+    const auto speculative = model.generate_cuda(ctx, prompt, 16, true, true, &stats, false, 0, -1, mtp);
+    if (normal != speculative || stats.spec_proposed == 0 || stats.spec_accepted == 0)
+        throw std::runtime_error("Qwen integrated MTP verification or acceptance");
+    std::cout << "  [PASS] Qwen native MTP exact greedy IDs, accepted " << stats.spec_accepted
+              << '/' << stats.spec_proposed << '\n';
+
+    auto conflicting_head = model_io::make_zeros_f32({f.vocab, f.hidden});
+    // Rows 1 and 2 have opposite logits. The trunk's greedy choice is 0.
+    conflicting_head.data<float>()[f.hidden] = 1.f;
+    conflicting_head.data<float>()[2 * f.hidden] = -1.f;
+    f.tensors.emplace_back("blk.2.nextn.shared_head_head.weight", std::move(conflicting_head));
+    std::filesystem::remove(f.path);
+    f.path = "test-qwen35moe-mtp-reject.gguf";
+    if (!GgufFile::write_v3(f.path, f.meta, f.tensors, &error) ||
+        !model.load_gguf(ctx, f.path, &error, 64, true)) throw std::runtime_error(error);
+    const auto rejected = model.generate_cuda(ctx, prompt, 16, true, true, &stats, false, 0, -1, mtp);
+    if (rejected != normal || stats.spec_proposed == 0 || stats.spec_accepted == stats.spec_proposed)
+        throw std::runtime_error("Native MTP rollback after rejected drafts");
+    std::cout << "  [PASS] Qwen native MTP rejected drafts preserve the target IDs, accepted "
+              << stats.spec_accepted << '/' << stats.spec_proposed << '\n';
 }
 #endif
 
@@ -4925,6 +5237,7 @@ int main() {
     try {
         test_quant_and_io();
         test_gdn_loader_shapes();
+        test_frontier_gguf();
         test_q2_k_format();
         test_universal_weight_codecs();
         test_hadamard_cpu();
@@ -4945,6 +5258,7 @@ int main() {
         test_cuda_failed_graph_recapture(cuda_ctx);
         test_cuda_q2_k(cuda_ctx);
         test_cuda_weight_codecs(cuda_ctx);
+        test_cuda_frontier(cuda_ctx);
         test_cuda_hadamard(cuda_ctx);
         test_cuda_codec_model(cuda_ctx);
         test_cuda_step1_fast_paths(cuda_ctx);

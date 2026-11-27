@@ -156,6 +156,7 @@ struct GenerationOptions {
     LayerTrace* layer_trace = nullptr;
     const JsonConstraint* json_constraint = nullptr;
     int spec_ngram = 0;
+    bool spec_mtp = false;
     FusionModel* draft_model = nullptr;
     int draft_tokens = 4;
     std::span<const InputEmbedding> inputs_embeds;
@@ -184,7 +185,7 @@ struct CudaDenseGQALayer {
     float output_scale = 1.0f;
     bool v_norm = false;
     bool geglu = false;
-    Tensor attn_post_norm_w, ffn_post_norm_w;
+    Tensor attn_post_norm_w, ffn_post_norm_w, dense_post_norm_w, routed_post_norm_w;
     Tensor attn_norm_w;     // [hidden]
     Tensor q_proj;          // [q_dim, hidden]
     Tensor k_proj;          // [kv_dim, hidden]
@@ -207,6 +208,7 @@ struct CudaDenseGQALayer {
 
 struct CudaGatedDeltaNetLayer {
     GatedDeltaNetConfig cfg;
+    int moe_index = -1;
     Tensor attn_norm_w;     // [hidden]
     Tensor qkv_proj;        // [conv_dim, hidden]
     Tensor z_proj;          // [nv*dv, hidden]
@@ -235,6 +237,9 @@ struct CudaSparseMoELayer {
     Tensor norm_w;                // [hidden]
     Tensor router_w;              // [num_experts, hidden]
     Tensor router_bias;           // Optional correction for expert selection.
+    Tensor router_scale, shared_gate_w, gate_scale, up_scale, down_scale;
+    HostTensor cpu_gate_scale, cpu_up_scale;
+    bool geglu = false;
     Tensor gpu_gate_up_w;         // [gpu_resident_experts, (2*)inter, hidden]
     Tensor gpu_up_w;              // Separate up projection for unpacked gate/up weights.
     Tensor gpu_down_w;            // [gpu_resident_experts, hidden, inter]
@@ -282,6 +287,7 @@ struct VkDenseGQALayer {
 
 struct VkGatedDeltaNetLayer {
     GatedDeltaNetConfig cfg;
+    int moe_index = -1;
     Tensor attn_norm_w;
     Tensor qkv_proj;
     Tensor z_proj;
@@ -302,6 +308,7 @@ struct VkGatedDeltaNetLayer {
 
 struct VkSparseMoELayer {
     MoEConfig cfg;
+    Tensor shared_gate_w;
     Tensor norm_w;
     Tensor router_w;
     Tensor gpu_gate_up_w;
@@ -325,6 +332,8 @@ public:
         requested_kv_budget_ = bytes;
     }
     void set_kv_commitment_tokens(int tokens);
+    void enable_native_mtp(bool enabled) { load_mtp_ = enabled; }
+    bool has_native_mtp() const { return mtp_.projection.data != nullptr; }
     void validate_cuda_kv_capacity(int tokens) const;
     void set_kv_host_budget_bytes(size_t bytes) { cuda_kv_pool_.set_kv_host_budget_bytes(bytes); }
     void set_moe_gpu_experts(int count);
@@ -451,6 +460,13 @@ private:
     };
     std::vector<ExpertSlab> expert_slabs_;
     size_t expert_slab_bytes_ = 0;
+    struct NativeMtp {
+        Tensor projection, embedding, enorm, hnorm, head_norm, head, target_hidden;
+        float projection_scale = 1.f, head_scale = 1.f;
+        MiniGraph graph;
+    } mtp_;
+    bool load_mtp_ = false;
+    bool capture_mtp_hidden_ = false;
     MiniGraph raw_ir_graph_;
     MiniGraph fused_ir_graph_;
     bool recommend_cuda_graph_ = false;
