@@ -1,0 +1,196 @@
+#version 450
+
+layout(local_size_x = 64) in;
+
+layout(std430, binding = 0) readonly buffer QKV { float qkv[]; };
+layout(std430, binding = 1) readonly buffer QNorm { float q_norm_w[]; };
+layout(std430, binding = 2) readonly buffer KNorm { float k_norm_w[]; };
+layout(std430, binding = 3) writeonly buffer QOut { float q_out[]; };
+layout(std430, binding = 4) buffer KCache { uint k_cache[]; };
+layout(std430, binding = 5) buffer VCache { uint v_cache[]; };
+layout(std430, binding = 6) readonly buffer RopeFactors { float rope_factors[]; };
+
+layout(push_constant) uniform Push {
+    int M;
+    int num_q_heads;
+    int num_kv_heads;
+    int head_dim;
+    int rot_dim;
+    int start_pos;
+    int kv_dtype;
+    int flags;
+    float theta;
+    float eps;
+} pc;
+
+const int F32 = 0;
+const int Q8_0 = 3;
+const int MAX_HEAD_DIM = 512;
+const int LANES = 64;
+const int Q8_BLOCK = 32;
+const uint Q8_HALFWORDS = 17u;
+
+shared float head[MAX_HEAD_DIM];
+shared float sum_sq[LANES];
+shared vec2 q8_max[MAX_HEAD_DIM / Q8_BLOCK];
+
+uint pack_half_rte(float value) {
+    uint bits = floatBitsToUint(value);
+    uint magnitude = bits & 0x7fffffffu;
+    uint sign = (bits >> 16) & 0x8000u;
+    // Pack an exactly representable value so the driver's rounding mode cannot change it.
+    if (magnitude < 0x38800000u) return sign | uint(roundEven(abs(value) * 16777216.0));
+    if (magnitude >= 0x477ff000u) return sign | (magnitude > 0x7f800000u ? 0x7e00u : 0x7c00u);
+    uint rounded = bits + 0xfffu + ((bits >> 13) & 1u);
+    return packHalf2x16(vec2(uintBitsToFloat(rounded & 0xffffe000u), 0.0));
+}
+
+uint quantize(float value, float multiplier) {
+    int quant = int(clamp(roundEven(value * multiplier), -127.0, 127.0));
+    return uint(quant) & 255u;
+}
+
+uvec2 cache_halfword(uint i, uint v_base) {
+    if (pc.kv_dtype != Q8_0) {
+        return uvec2(pack_half_rte(head[i]), pack_half_rte(qkv[v_base + i]));
+    }
+
+    uint block = i / Q8_HALFWORDS;
+    uint slot = i % Q8_HALFWORDS;
+    vec2 peak = q8_max[block];
+    if (slot == 0u) {
+        vec2 scale = peak * (1.0 / 127.0);
+        return uvec2(pack_half_rte(scale.x), pack_half_rte(scale.y));
+    }
+
+    uint d = block * Q8_BLOCK + 2u * (slot - 1u);
+    vec2 multiplier = vec2(peak.x > 0.0 ? 127.0 / peak.x : 0.0,
+                           peak.y > 0.0 ? 127.0 / peak.y : 0.0);
+    return uvec2(quantize(head[d], multiplier.x) | (quantize(head[d + 1u], multiplier.x) << 8),
+                 quantize(qkv[v_base + d], multiplier.y) | (quantize(qkv[v_base + d + 1u], multiplier.y) << 8));
+}
+
+void store_cache_word(uint word, uvec2 packed, uint mask) {
+    if (mask == 0xffffffffu) {
+        k_cache[word] = packed.x;
+        v_cache[word] = packed.y;
+        return;
+    }
+
+    // Adjacent heads or tokens can share an edge word. Both owners update only their half.
+    uint expected = 0u;
+    for (;;) {
+        uint current = atomicCompSwap(k_cache[word], expected, (expected & ~mask) | packed.x);
+        if (current == expected) break;
+        expected = current;
+    }
+    expected = 0u;
+    for (;;) {
+        uint current = atomicCompSwap(v_cache[word], expected, (expected & ~mask) | packed.y);
+        if (current == expected) break;
+        expected = current;
+    }
+}
+
+void main() {
+    int h = int(gl_WorkGroupID.x);
+    int m = int(gl_WorkGroupID.y);
+    int lane = int(gl_LocalInvocationID.x);
+    if (m >= pc.M || h >= pc.num_q_heads + pc.num_kv_heads) return;
+
+    bool is_q = h < pc.num_q_heads;
+    int pos = pc.start_pos + m;
+    uint src_base = uint(m) * uint(pc.num_q_heads + 2 * pc.num_kv_heads) * uint(pc.head_dim)
+                  + uint(h) * uint(pc.head_dim);
+    uint v_base = src_base + uint(pc.num_kv_heads) * uint(pc.head_dim);
+    bool normalize = (pc.flags & 1) != 0;
+
+    float sq = 0.0;
+    for (int i = lane; i < pc.head_dim; i += LANES) {
+        float value = qkv[src_base + i];
+        head[i] = value;
+        if (normalize) sq += value * value;
+    }
+
+    if (normalize) {
+        sum_sq[lane] = sq;
+        barrier();
+        for (int stride = LANES / 2; stride > 0; stride >>= 1) {
+            if (lane < stride) sum_sq[lane] += sum_sq[lane + stride];
+            barrier();
+        }
+        float inv_rms = inversesqrt(sum_sq[0] / float(pc.head_dim) + pc.eps);
+        float bias = (pc.flags & 8) != 0 ? 1.0 : 0.0;
+        for (int i = lane; i < pc.head_dim; i += LANES) {
+            float w = is_q ? q_norm_w[i] : k_norm_w[i];
+            head[i] *= inv_rms * (w + bias);
+        }
+    }
+    barrier();
+
+    int half_rot = pc.rot_dim / 2;
+    bool neox = (pc.flags & 2) != 0;
+    for (int i = lane; i < half_rot; i += LANES) {
+        float angle = float(pos) * pow(pc.theta, -float(2 * i) / float(pc.rot_dim));
+        if ((pc.flags & 4) != 0) angle /= rope_factors[i];
+        float c = cos(angle);
+        float s = sin(angle);
+        int a = neox ? i : 2 * i;
+        int b = neox ? i + half_rot : 2 * i + 1;
+        float x0 = head[a];
+        float x1 = head[b];
+        head[a] = x0 * c - x1 * s;
+        head[b] = x0 * s + x1 * c;
+    }
+    barrier();
+
+    if (is_q) {
+        uint q_base = (uint(m) * uint(pc.num_q_heads) + uint(h)) * uint(pc.head_dim);
+        for (int i = lane; i < pc.head_dim; i += LANES) q_out[q_base + i] = head[i];
+        return;
+    }
+
+    uint entry = uint(pos) * uint(pc.num_kv_heads) + uint(h - pc.num_q_heads);
+    if (pc.kv_dtype == F32) {
+        uint base = entry * uint(pc.head_dim);
+        for (int i = lane; i < pc.head_dim; i += LANES) {
+            k_cache[base + i] = floatBitsToUint(head[i]);
+            v_cache[base + i] = floatBitsToUint(qkv[v_base + i]);
+        }
+        return;
+    }
+
+    uint halfwords = uint(pc.head_dim);
+    if (pc.kv_dtype == Q8_0) {
+        int blocks = pc.head_dim / Q8_BLOCK;
+        halfwords = uint(blocks) * Q8_HALFWORDS;
+        if (lane < blocks) {
+            vec2 peak = vec2(0.0);
+            int start = lane * Q8_BLOCK;
+            for (int i = start; i < start + Q8_BLOCK; ++i) {
+                peak = max(peak, abs(vec2(head[i], qkv[v_base + i])));
+            }
+            q8_max[lane] = peak;
+        }
+        barrier();
+    }
+
+    // The cache buffer range includes any padding needed to round up to a uint.
+    uint begin = entry * halfwords;
+    uint end = begin + halfwords;
+    for (uint word = (begin >> 1) + uint(lane); word < ((end + 1u) >> 1); word += LANES) {
+        uint lo = 2u * word;
+        uint hi = lo + 1u;
+        uvec2 packed = uvec2(0u);
+        uint mask = 0u;
+        if (lo >= begin) {
+            packed = cache_halfword(lo - begin, v_base);
+            mask = 0xffffu;
+        }
+        if (hi < end) {
+            packed |= cache_halfword(hi - begin, v_base) << 16;
+            mask |= 0xffff0000u;
+        }
+        store_cache_word(word, packed, mask);
+    }
+}

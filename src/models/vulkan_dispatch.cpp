@@ -14,10 +14,10 @@ namespace {
 
 template <typename Push>
 void append(VulkanDispatch::Batch& batch, const char* shader, uint32_t groups,
-            std::initializer_list<Tensor> buffers, const Push& push) {
+            std::initializer_list<Tensor> buffers, const Push& push, uint32_t rows = 1) {
     auto& storage = batch.push.emplace_back(sizeof(push));
     std::memcpy(storage.data(), &push, sizeof(push));
-    batch.ops.push_back({shader, groups, 1, 1, buffers, storage.data(), sizeof(push)});
+    batch.ops.push_back({shader, groups, rows, 1, buffers, storage.data(), sizeof(push)});
 }
 
 uint32_t element_groups(int elements) {
@@ -28,58 +28,103 @@ void append_residual(VulkanDispatch::Batch& batch, const Tensor& input, const Te
     append(batch, "add_residual.comp", element_groups(width), {input, update, output}, vk_ops::PushResidual{width});
 }
 
+void append_linear(VulkanDispatch::Batch& batch, const Tensor& input, const Tensor& weights,
+                   Tensor& output, int rows, int width, int extent) {
+    vk_ops::append_linear_dispatch(batch.ops, input, weights, output, rows, width, extent, batch.push, &batch.ctx);
+}
+
+void append_pack_rows(VulkanDispatch::Batch& batch, const Tensor& input, const Tensor& packed,
+                      int rows, int width, int packed_width, int packed_offset) {
+    std::vector<VkBufferCopy> copies;
+    copies.reserve(rows);
+    const auto bytes = static_cast<VkDeviceSize>(width) * sizeof(float);
+    for (int row = 0; row < rows; ++row)
+        copies.push_back({row * bytes, (static_cast<VkDeviceSize>(row) * packed_width + packed_offset) * sizeof(float), bytes});
+    VulkanDispatch::append_copy(batch, input, packed, std::move(copies));
+}
+
+void append_bias(VulkanDispatch::Batch& batch, const Tensor& bias, Tensor& projection, const Tensor& scratch,
+                 int rows, int width) {
+    if (!bias.vk_buffer) return;
+    if (rows == 1) {
+        append_residual(batch, projection, bias, projection, width);
+        return;
+    }
+
+    const auto bytes = static_cast<VkDeviceSize>(width) * sizeof(float);
+    std::vector<VkBufferCopy> copies;
+    copies.reserve(rows);
+    for (int row = 0; row < rows; ++row) copies.push_back({0, row * bytes, bytes});
+    VulkanDispatch::append_copy(batch, bias, scratch, std::move(copies));
+    append_residual(batch, projection, scratch, projection, rows * width);
+}
+
 }  // namespace
 
+void VulkanDispatch::append_copy(Batch& batch, const Tensor& source, const Tensor& target,
+                                 std::vector<VkBufferCopy> regions) {
+    batch.ops.push_back({"copy", 0, 0, 0, {source, target}, nullptr, 0, std::move(regions)});
+}
+
 void VulkanDispatch::append_embedding(Batch& batch, const Tensor& embeddings, const Tensor& token,
-                                      const Tensor& output, int hidden) {
-    append(batch, "embed_lookup.comp", element_groups(hidden), {embeddings, token, output},
-           vk_ops::PushEmbed{1, hidden, static_cast<int>(embeddings.dtype)});
+                                      const Tensor& output, int hidden, int rows) {
+    append(batch, "embed_lookup.comp", element_groups(rows * hidden), {embeddings, token, output},
+           vk_ops::PushEmbed{rows, hidden, static_cast<int>(embeddings.dtype)});
 }
 
 void VulkanDispatch::append_dense(Batch& batch, const VulkanDenseWeights& layer, const VulkanDenseKv& kv,
-                                  DenseScratch& scratch, const Tensor& input, const Tensor& output, int hidden, int pos) {
+                                  DenseScratch& scratch, const Tensor& input, const Tensor& output,
+                                  int hidden, int pos, int rows) {
     const auto& cfg = layer.cfg;
     const int nq = cfg.num_attention_heads, nkv = cfg.num_key_value_heads, hd = cfg.head_dim;
-    const int q_dim = nq * hd, kv_dim = nkv * hd;
-    const int rot_dim = std::max(2, static_cast<int>(hd * cfg.partial_rotary_factor) & ~1);
+    const int q_dim = nq * hd, kv_dim = nkv * hd, qkv_dim = q_dim + 2 * kv_dim;
+    const int rot_dim = std::clamp(static_cast<int>(hd * cfg.partial_rotary_factor) & ~1, 0, hd & ~1);
+    const bool separate_qkv = !layer.qkv_proj_fused.vk_buffer;
 
-    if (layer.qkv_proj_fused.vk_buffer && layer.qkv_proj_fused.dtype == DType::F32 && (hidden % 4) == 0) {
-        struct PushFusedQkv { int q_dim, kv_dim, K; float eps; };
-        append(batch, "fused_rmsnorm_qkv_vec4.comp", static_cast<uint32_t>(q_dim + 2 * kv_dim),
-               {input, layer.attn_norm_w, layer.qkv_proj_fused, scratch.query, scratch.key, scratch.value},
-               PushFusedQkv{q_dim, kv_dim, hidden, cfg.rms_norm_eps});
+    if (!separate_qkv) {
+        vk_ops::append_rmsnorm_linear_dispatch(batch.ops, input, layer.attn_norm_w, layer.qkv_proj_fused,
+            scratch.normalized, scratch.qkv, rows, qkv_dim, hidden, cfg.rms_norm_eps, batch.push, &batch.ctx);
     } else {
-        append(batch, "rmsnorm.comp", 1, {input, layer.attn_norm_w, scratch.normalized},
-               vk_ops::PushRmsNorm{1, hidden, cfg.rms_norm_eps});
-        vk_ops::append_linear_dispatch(batch.ops, scratch.normalized, layer.q_proj,
-                                       cfg.gated_q_attn ? scratch.query_full : scratch.query,
-                                       1, cfg.gated_q_attn ? 2 * q_dim : q_dim, hidden, batch.push);
-        vk_ops::append_linear_dispatch(batch.ops, scratch.normalized, layer.k_proj, scratch.key, 1, kv_dim, hidden, batch.push);
-        vk_ops::append_linear_dispatch(batch.ops, scratch.normalized, layer.v_proj, scratch.value, 1, kv_dim, hidden, batch.push);
+        append(batch, "rmsnorm.comp", rows, {input, layer.attn_norm_w, scratch.normalized},
+               vk_ops::PushRmsNorm{rows, hidden, cfg.rms_norm_eps});
+        const int q_width = cfg.gated_q_attn ? 2 * q_dim : q_dim;
+        auto& q = cfg.gated_q_attn ? scratch.query_full : scratch.query;
+        append_linear(batch, scratch.normalized, layer.q_proj, q, rows, q_width, hidden);
+        append_linear(batch, scratch.normalized, layer.k_proj, scratch.key, rows, kv_dim, hidden);
+        append_linear(batch, scratch.normalized, layer.v_proj, scratch.value, rows, kv_dim, hidden);
+        append_bias(batch, layer.q_bias, q, scratch.bias, rows, q_width);
+        append_bias(batch, layer.k_bias, scratch.key, scratch.bias, rows, kv_dim);
+        append_bias(batch, layer.v_bias, scratch.value, scratch.bias, rows, kv_dim);
+        if (cfg.gated_q_attn) {
+            const int push[] = {rows * q_dim, hd};
+            append(batch, "split_query_gate.comp", element_groups(rows * q_dim),
+                   {q, scratch.query, scratch.query_gate}, push);
+        }
+        append_pack_rows(batch, scratch.query, scratch.qkv, rows, q_dim, qkv_dim, 0);
+        append_pack_rows(batch, scratch.key, scratch.qkv, rows, kv_dim, qkv_dim, q_dim);
+        append_pack_rows(batch, scratch.value, scratch.qkv, rows, kv_dim, qkv_dim, q_dim + kv_dim);
     }
-
-    if (cfg.gated_q_attn) {
-        if (layer.q_bias.vk_buffer) append_residual(batch, scratch.query_full, layer.q_bias, scratch.query_full, 2 * q_dim);
-        const int push[] = {q_dim, hd};
-        append(batch, "split_query_gate.comp", element_groups(q_dim), {scratch.query_full, scratch.query, scratch.query_gate}, push);
-    } else if (layer.q_bias.vk_buffer) {
-        append_residual(batch, scratch.query, layer.q_bias, scratch.query, q_dim);
-    }
-    if (layer.k_bias.vk_buffer) append_residual(batch, scratch.key, layer.k_bias, scratch.key, kv_dim);
-    if (layer.v_bias.vk_buffer) append_residual(batch, scratch.value, layer.v_bias, scratch.value, kv_dim);
 
     const int flags = (cfg.qk_norm ? 1 : 0) | (cfg.rope_neox ? 2 : 0);
-    append(batch, "rope_kv_append.comp", static_cast<uint32_t>(nq + nkv),
-           {scratch.query, scratch.key, scratch.value, layer.q_norm_w, layer.k_norm_w, kv.key, kv.value},
-           vk_ops::PushRopeKv{nq, nkv, hd, rot_dim, pos, cfg.rope_theta, cfg.rms_norm_eps, flags});
-    append(batch, "gqa_decode.comp", static_cast<uint32_t>(nq), {scratch.query, kv.key, kv.value, scratch.attention},
-           vk_ops::PushGqaDecode{nq, nkv, hd, pos + 1, 1.0f / std::sqrt(static_cast<float>(hd))});
-    if (cfg.gated_q_attn) {
-        const int push[] = {q_dim, 0};
-        append(batch, "sigmoid_gate.comp", element_groups(q_dim), {scratch.attention, scratch.query_gate}, push);
+    const int kv_type = static_cast<int>(kv.key.dtype);
+    append(batch, "sequence/rope_kv_append_batch.spv", nq + nkv,
+           {scratch.qkv, layer.q_norm_w, layer.k_norm_w, scratch.query, kv.key, kv.value, layer.q_norm_w},
+           vk_ops::PushRopeKvBatch{rows, nq, nkv, hd, rot_dim, pos, kv_type, flags, cfg.rope_theta, cfg.rms_norm_eps}, rows);
+    const float scale = 1.0f / std::sqrt(static_cast<float>(hd));
+    const int window = layer.sliding_window;
+    if (rows == 1) {
+        append(batch, "sequence/flash_attention_decode.spv", nq, {scratch.query, kv.key, kv.value, scratch.attention},
+               vk_ops::PushFaDecode{nq, nkv, hd, pos + 1, kv_type, window, scale});
+    } else {
+        append(batch, "sequence/flash_attention_prefill.spv", nq, {scratch.query, kv.key, kv.value, scratch.attention},
+               vk_ops::PushFaPrefill{rows, nq, nkv, hd, pos, pos + rows, kv_type, window, 1, scale}, rows);
     }
-    vk_ops::append_linear_dispatch(batch.ops, scratch.attention, layer.o_proj, scratch.projected, 1, hidden, q_dim, batch.push);
-    append_residual(batch, input, scratch.projected, output, hidden);
+    if (cfg.gated_q_attn) {
+        const int push[] = {rows * q_dim, 0};
+        append(batch, "sigmoid_gate.comp", element_groups(rows * q_dim), {scratch.attention, scratch.query_gate}, push);
+    }
+    append_linear(batch, scratch.attention, layer.o_proj, scratch.projected, rows, hidden, q_dim);
+    append_residual(batch, input, scratch.projected, output, rows * hidden);
 }
 
 void VulkanDispatch::append_gdn(Batch& batch, const VulkanGdnWeights& layer, const VulkanGdnState& state,
@@ -103,13 +148,23 @@ void VulkanDispatch::append_gdn(Batch& batch, const VulkanGdnWeights& layer, con
     append_residual(batch, input, scratch.projected, output, hidden);
 }
 
-void VulkanDispatch::append_ffn(Batch& batch, const Tensor& norm, const Tensor& gate_up, const Tensor& down,
-                                Tensor& normalized, FfnScratch& scratch, const Tensor& activation, int hidden, int inter, float eps) {
-    vk_ops::append_rmsnorm_linear_dispatch(batch.ops, activation, norm, gate_up, normalized, scratch.gate_up,
-                                          1, 2 * inter, hidden, eps, batch.push);
-    append(batch, "swiglu.comp", element_groups(inter), {scratch.gate_up, scratch.activated}, vk_ops::PushSwiglu{1, inter});
-    vk_ops::append_linear_dispatch(batch.ops, scratch.activated, down, scratch.down, 1, hidden, inter, batch.push);
-    append_residual(batch, activation, scratch.down, activation, hidden);
+void VulkanDispatch::append_ffn(Batch& batch, const Tensor& norm, const Tensor& gate_up, const Tensor& gate,
+                                const Tensor& up, const Tensor& down, Tensor& normalized, FfnScratch& scratch,
+                                const Tensor& activation, int hidden, int inter, int rows, float eps) {
+    if (gate_up.vk_buffer) {
+        vk_ops::append_rmsnorm_linear_dispatch(batch.ops, activation, norm, gate_up, normalized, scratch.gate_up,
+                                               rows, 2 * inter, hidden, eps, batch.push, &batch.ctx);
+    } else {
+        append(batch, "rmsnorm.comp", rows, {activation, norm, normalized}, vk_ops::PushRmsNorm{rows, hidden, eps});
+        append_linear(batch, normalized, gate, scratch.gate, rows, inter, hidden);
+        append_linear(batch, normalized, up, scratch.up, rows, inter, hidden);
+        append_pack_rows(batch, scratch.gate, scratch.gate_up, rows, inter, 2 * inter, 0);
+        append_pack_rows(batch, scratch.up, scratch.gate_up, rows, inter, 2 * inter, inter);
+    }
+    append(batch, "swiglu.comp", element_groups(rows * inter), {scratch.gate_up, scratch.activated},
+           vk_ops::PushSwiglu{rows, inter});
+    append_linear(batch, scratch.activated, down, scratch.down, rows, hidden, inter);
+    append_residual(batch, activation, scratch.down, activation, rows * hidden);
 }
 
 void VulkanDispatch::append_moe(Batch& batch, const VkSparseMoELayer& layer, MoeScratch& scratch,

@@ -12,8 +12,7 @@ struct VulkanModelRuntime {
 
     VulkanLoadHooks load_hooks(VkContext& ctx) {
         return {
-            [&](int hidden, int vocab) { executor.allocate_workspace(ctx, hidden, vocab); },
-            [&](const DenseGQAConfig& cfg) { sessions.allocate_dense(ctx, cfg); },
+            [&](const DenseGQAConfig& cfg, DType kv_type) { sessions.allocate_dense(ctx, cfg, kv_type); },
             [&](const GatedDeltaNetConfig& cfg, int conv_dim) { sessions.allocate_gdn(ctx, cfg, conv_dim); }
         };
     }

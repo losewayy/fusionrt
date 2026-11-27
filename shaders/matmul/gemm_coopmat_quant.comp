@@ -1,0 +1,120 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+#extension GL_KHR_cooperative_matrix : require
+#extension GL_KHR_memory_scope_semantics : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+
+// 32x32 output tile. Dispatch (ceil(N / 32), ceil(M / 32), 1).
+// Runtime selects this kernel for 16x16x16 FP16/FP32 CoopMat and subgroup size 32.
+layout(local_size_x = 128) in;
+
+layout(std430, binding = 0) readonly buffer X { float x[]; };
+layout(std430, binding = 1) readonly buffer W { uint w[]; };
+layout(std430, binding = 2) writeonly buffer Y { float y[]; };
+
+layout(push_constant) uniform Push { int M; int N; int K; int dtype; } pc;
+
+#include "../epilogue/codec_common.glsl"
+
+const uint TILE_M = 32u;
+const uint TILE_N = 32u;
+const uint TILE_K = 32u;
+const uint CM = 16u;
+const uint VECTOR = 4u;
+const uint K_STRIDE = TILE_K / VECTOR;
+
+shared f16vec4 tile_x[2u * TILE_M * K_STRIDE];
+shared f16vec4 tile_w[2u * TILE_N * K_STRIDE];
+shared vec4 tile_y[TILE_M * TILE_N / VECTOR];
+
+void load_inputs(uint slot, uint m_base, uint n_base, uint k_base, uint stride, uvec2 block) {
+    uint t = gl_LocalInvocationID.x;
+    for (uint i = t; i < TILE_M * K_STRIDE; i += gl_WorkGroupSize.x) {
+        uint row = i / K_STRIDE;
+        uint m = m_base + row;
+        uint n = n_base + row;
+        uint k = k_base + (i % K_STRIDE) * VECTOR;
+        vec4 a = vec4(0.0);
+        vec4 b = vec4(0.0);
+        for (uint j = 0u; j < VECTOR; ++j) {
+            if (k + j < uint(pc.K)) {
+                if (m < uint(pc.M)) a[j] = x[m * uint(pc.K) + k + j];
+                if (n < uint(pc.N) && stride != 0u) {
+                    b[j] = dequantize_weight(pc.dtype, n * stride, k + j, block);
+                }
+            }
+        }
+        tile_x[slot * TILE_M * K_STRIDE + i] = f16vec4(a);
+        tile_w[slot * TILE_N * K_STRIDE + i] = f16vec4(b);
+    }
+}
+
+#define ACCUMULATOR coopmat<float, gl_ScopeSubgroup, CM, CM, gl_MatrixUseAccumulator>
+
+void multiply_tile(inout ACCUMULATOR sum, uint slot, uint subtile) {
+    uint row = subtile / 2u * CM;
+    uint col = subtile % 2u * CM;
+    for (uint k = 0u; k < TILE_K; k += CM) {
+        coopmat<float16_t, gl_ScopeSubgroup, CM, CM, gl_MatrixUseA> a;
+        coopmat<float16_t, gl_ScopeSubgroup, CM, CM, gl_MatrixUseB> b;
+        coopMatLoad(a, tile_x, (slot * TILE_M + row) * K_STRIDE + k / VECTOR,
+                    K_STRIDE, gl_CooperativeMatrixLayoutRowMajor);
+        coopMatLoad(b, tile_w, (slot * TILE_N + col) * K_STRIDE + k / VECTOR,
+                    K_STRIDE, gl_CooperativeMatrixLayoutColumnMajor);
+        sum = coopMatMulAdd(a, b, sum);
+    }
+}
+
+void store_tile(ACCUMULATOR sum, uint subtile) {
+    uint row = subtile / 2u * CM;
+    uint col = subtile % 2u * CM;
+    coopMatStore(sum, tile_y, (row * TILE_N + col) / VECTOR, TILE_N / VECTOR,
+                 gl_CooperativeMatrixLayoutRowMajor);
+}
+
+void main() {
+    load_codec_grid(pc.dtype);
+
+    uint m_base = gl_WorkGroupID.y * TILE_M;
+    uint n_base = gl_WorkGroupID.x * TILE_N;
+    uint stride = row_bytes_for_dtype(pc.dtype, pc.K);
+    uvec2 block = weight_block_layout(pc.dtype);
+    uint first_tile = gl_SubgroupID;
+    uint second_tile = first_tile + gl_NumSubgroups;
+    ACCUMULATOR sum0 = ACCUMULATOR(0.0);
+    ACCUMULATOR sum1 = ACCUMULATOR(0.0);
+
+    uint slot = 0u;
+    uint K = uint(pc.K);
+    if (K != 0u) {
+        load_inputs(slot, m_base, n_base, 0u, stride, block);
+        barrier();
+    }
+
+    for (uint k = 0u; k < K; k += TILE_K) {
+        bool has_next = k + TILE_K < K;
+        if (has_next) load_inputs(slot ^ 1u, m_base, n_base, k + TILE_K, stride, block);
+
+        // A 64-lane subgroup owns two subtiles, a 32-lane subgroup owns one.
+        if (first_tile < 4u) multiply_tile(sum0, slot, first_tile);
+        if (second_tile < 4u) multiply_tile(sum1, slot, second_tile);
+        if (has_next) barrier();
+        slot ^= 1u;
+    }
+
+    if (first_tile < 4u) store_tile(sum0, first_tile);
+    if (second_tile < 4u) store_tile(sum1, second_tile);
+    barrier();
+
+    for (uint i = gl_LocalInvocationID.x; i < TILE_M * TILE_N / VECTOR; i += gl_WorkGroupSize.x) {
+        uint m = m_base + i / (TILE_N / VECTOR);
+        uint n = n_base + (i % (TILE_N / VECTOR)) * VECTOR;
+        if (m < uint(pc.M)) {
+            vec4 values = tile_y[i];
+            for (uint j = 0u; j < VECTOR; ++j) {
+                if (n + j < uint(pc.N)) y[m * uint(pc.N) + n + j] = values[j];
+            }
+        }
+    }
+}

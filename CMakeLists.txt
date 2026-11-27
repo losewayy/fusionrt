@@ -182,16 +182,47 @@ if(FUSIONRT_ENABLE_VULKAN)
     set(SHADER_BIN_DIR "${CMAKE_CURRENT_BINARY_DIR}/shaders")
     file(MAKE_DIRECTORY "${SHADER_BIN_DIR}")
 
-    file(GLOB SHADER_SOURCES CONFIGURE_DEPENDS "${SHADER_SRC_DIR}/*.comp")
+    # Share the CPU/CUDA codebooks without requiring shaderInt64 on Vulkan.
+    set(SHADER_INCLUDE_DIR "${CMAKE_CURRENT_BINARY_DIR}/shader_includes")
+    set(WEIGHT_CODEBOOKS "${CMAKE_CURRENT_SOURCE_DIR}/include/fusionrt/detail/weight_codebooks.inc")
+    set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${WEIGHT_CODEBOOKS}")
+    file(READ "${WEIGHT_CODEBOOKS}" WEIGHT_CODEBOOK_GLSL)
+    string(REPEAT "[0-9a-fA-F]" 8 CODEBOOK_WORD)
+    string(REGEX REPLACE "0x(${CODEBOOK_WORD})(${CODEBOOK_WORD})," "uvec2(0x\\2u, 0x\\1u),"
+        WEIGHT_CODEBOOK_GLSL "${WEIGHT_CODEBOOK_GLSL}")
+    string(REPLACE "uint64_t" "uvec2" WEIGHT_CODEBOOK_GLSL "${WEIGHT_CODEBOOK_GLSL}")
+    string(REPLACE "uint32_t" "uint" WEIGHT_CODEBOOK_GLSL "${WEIGHT_CODEBOOK_GLSL}")
+    string(REPLACE "uint8_t" "uint" WEIGHT_CODEBOOK_GLSL "${WEIGHT_CODEBOOK_GLSL}")
+    string(REPLACE "int8_t" "int" WEIGHT_CODEBOOK_GLSL "${WEIGHT_CODEBOOK_GLSL}")
+    file(CONFIGURE OUTPUT "${SHADER_INCLUDE_DIR}/weight_codebooks.glsl" CONTENT
+        "#define FUSIONRT_CODEBOOK(type, name, count) const type name[count] = {\n${WEIGHT_CODEBOOK_GLSL}\n#undef FUSIONRT_CODEBOOK\n" @ONLY)
+
+    file(GLOB SHADER_SOURCES CONFIGURE_DEPENDS
+        "${SHADER_SRC_DIR}/*.comp"
+        "${SHADER_SRC_DIR}/matmul/*.comp"
+        "${SHADER_SRC_DIR}/sequence/*.comp"
+    )
     set(SHADER_SPV_OUTPUTS "")
 
     foreach(SHADER_SRC ${SHADER_SOURCES})
-        get_filename_component(SHADER_NAME "${SHADER_SRC}" NAME)
-        set(SHADER_SPV "${SHADER_BIN_DIR}/${SHADER_NAME}.spv")
+        file(RELATIVE_PATH SHADER_NAME "${SHADER_SRC_DIR}" "${SHADER_SRC}")
+        if(SHADER_NAME MATCHES "/")
+            # The orthogonal kernels are loaded as matmul/name.spv or sequence/name.spv.
+            string(REGEX REPLACE "[.]comp$" "" SHADER_STEM "${SHADER_NAME}")
+        else()
+            set(SHADER_STEM "${SHADER_NAME}")
+        endif()
+        set(SHADER_SPV "${SHADER_BIN_DIR}/${SHADER_STEM}.spv")
+        set(SHADER_DEPFILE "${SHADER_INCLUDE_DIR}/${SHADER_STEM}.d")
+        get_filename_component(SHADER_OUTPUT_DIR "${SHADER_SPV}" DIRECTORY)
+        get_filename_component(SHADER_DEPFILE_DIR "${SHADER_DEPFILE}" DIRECTORY)
         add_custom_command(
             OUTPUT "${SHADER_SPV}"
-            COMMAND "${GLSLC_EXECUTABLE}" --target-env=vulkan1.3 -O "${SHADER_SRC}" -o "${SHADER_SPV}"
+            COMMAND "${CMAKE_COMMAND}" -E make_directory "${SHADER_OUTPUT_DIR}" "${SHADER_DEPFILE_DIR}"
+            COMMAND "${GLSLC_EXECUTABLE}" --target-env=vulkan1.3 -O
+                -I "${SHADER_INCLUDE_DIR}" -MD -MF "${SHADER_DEPFILE}" "${SHADER_SRC}" -o "${SHADER_SPV}"
             DEPENDS "${SHADER_SRC}"
+            DEPFILE "${SHADER_DEPFILE}"
             COMMENT "Compiling Vulkan shader ${SHADER_NAME}"
             VERBATIM
         )

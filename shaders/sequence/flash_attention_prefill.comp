@@ -1,0 +1,131 @@
+#version 450
+
+layout(local_size_x = 64) in;
+
+layout(std430, binding = 0) readonly buffer Q { float q[]; };
+layout(std430, binding = 1) readonly buffer KCache { uint k_cache[]; };
+layout(std430, binding = 2) readonly buffer VCache { uint v_cache[]; };
+layout(std430, binding = 3) writeonly buffer O { float o[]; };
+
+layout(push_constant) uniform Push {
+    int M;
+    int num_q_heads;
+    int num_kv_heads;
+    int head_dim;
+    int start_pos;
+    int kv_len;
+    int kv_dtype;
+    int window;
+    int causal;
+    float scale;
+} pc;
+
+const int F32 = 0;
+const int F16 = 1;
+const int LANES = 64;
+const int MAX_HEAD_DIM = 512;
+const int VALUES_PER_LANE = MAX_HEAD_DIM / LANES;
+const int KEY_TILE = 4;
+
+shared vec4 partial[LANES];
+shared vec4 tile_weights;
+shared float previous_weight;
+shared float mass;
+
+uint cache_word(uint i, bool value) {
+    return value ? v_cache[i] : k_cache[i];
+}
+
+uint head_bytes(uint dim) {
+    if (pc.kv_dtype == F32) return 4u * dim;
+    if (pc.kv_dtype == F16) return 2u * dim;
+    return (dim / 32u) * 34u;
+}
+
+float cache_element(uint base, uint d, bool value) {
+    if (pc.kv_dtype == F32) return uintBitsToFloat(cache_word((base >> 2) + d, value));
+    if (pc.kv_dtype == F16) {
+        uint halfword = (base >> 1) + d;
+        return unpackHalf2x16(cache_word(halfword >> 1, value))[halfword & 1u];
+    }
+
+    uint block = base + (d / 32u) * 34u;
+    float scale = unpackHalf2x16(cache_word(block >> 2, value))[(block >> 1) & 1u];
+    uint b = block + 2u + d % 32u;
+    int quant = bitfieldExtract(int(cache_word(b >> 2, value)), int((b & 3u) * 8u), 8);
+    return float(quant) * scale;
+}
+
+void main() {
+    int qh = int(gl_WorkGroupID.x);
+    int m = int(gl_WorkGroupID.y);
+    int lane = int(gl_LocalInvocationID.x);
+    if (m >= pc.M || qh >= pc.num_q_heads) return;
+
+    int kvh = qh / (pc.num_q_heads / pc.num_kv_heads);
+    uint bytes = head_bytes(uint(pc.head_dim));
+    uint kv_stride = uint(pc.num_kv_heads) * bytes;
+    uint kv_offset = uint(kvh) * bytes;
+    uint q_base = (uint(m) * uint(pc.num_q_heads) + uint(qh)) * uint(pc.head_dim);
+
+    int pos = pc.start_pos + m;
+    int first = pc.window > 0 ? max(0, pos - (pc.window - 1)) : 0;
+    int last = pc.causal != 0 ? min(pc.kv_len, pos + 1) : pc.kv_len;
+
+    float query[VALUES_PER_LANE];
+    float acc[VALUES_PER_LANE];
+    int count = (pc.head_dim + LANES - 1 - lane) / LANES;
+    for (int i = 0; i < count; ++i) {
+        query[i] = q[q_base + uint(lane + i * LANES)] * pc.scale;
+        acc[i] = 0.0;
+    }
+
+    float row_max = uintBitsToFloat(0xff800000u);
+    if (lane == 0) mass = 0.0;
+    // Reduce a few scores together and keep the running output in registers.
+    for (int tile = first; tile < last; tile += KEY_TILE) {
+        int keys = min(KEY_TILE, last - tile);
+        uint base = uint(tile) * kv_stride + kv_offset;
+        vec4 dots = vec4(0.0);
+        for (int k = 0; k < keys; ++k) {
+            for (int i = 0; i < count; ++i) {
+                uint d = uint(lane + i * LANES);
+                dots[k] += query[i] * cache_element(base + uint(k) * kv_stride, d, false);
+            }
+        }
+        partial[lane] = dots;
+        barrier();
+        for (int stride = LANES / 2; stride > 0; stride >>= 1) {
+            if (lane < stride) partial[lane] += partial[lane + stride];
+            barrier();
+        }
+
+        if (lane == 0) {
+            vec4 scores = partial[0];
+            float new_max = row_max;
+            for (int k = 0; k < keys; ++k) new_max = max(new_max, scores[k]);
+            previous_weight = mass > 0.0 ? exp(row_max - new_max) : 0.0;
+            mass *= previous_weight;
+            for (int k = 0; k < keys; ++k) {
+                float weight = exp(scores[k] - new_max);
+                tile_weights[k] = weight;
+                mass += weight;
+            }
+            row_max = new_max;
+        }
+        barrier();
+
+        for (int i = 0; i < count; ++i) {
+            uint d = uint(lane + i * LANES);
+            float result = previous_weight * acc[i];
+            for (int k = 0; k < keys; ++k) {
+                result += tile_weights[k] * cache_element(base + uint(k) * kv_stride, d, true);
+            }
+            acc[i] = result;
+        }
+        // The next tile's score reduction finishes before it overwrites the weights.
+    }
+
+    float inv_mass = first < last ? 1.0 / mass : 0.0;
+    for (int i = 0; i < count; ++i) o[q_base + uint(lane + i * LANES)] = acc[i] * inv_mass;
+}

@@ -8,19 +8,19 @@ namespace model_io { struct LoadedModelRaw; }
 
 // Keep the existing arena allocation order while each subsystem owns its own views.
 struct VulkanLoadHooks {
-    std::function<void(int, int)> allocate_workspace;
-    std::function<void(const DenseGQAConfig&)> allocate_dense;
+    std::function<void(const DenseGQAConfig&, DType)> allocate_dense;
     std::function<void(const GatedDeltaNetConfig&, int)> allocate_gdn;
 };
 
 struct VulkanDenseWeights {
     DenseGQAConfig cfg;
     int moe_index = -1;
+    int sliding_window = 0;
     Tensor attn_norm_w;
     Tensor q_proj, k_proj, v_proj, qkv_proj_fused;
     Tensor q_bias, k_bias, v_bias;
     Tensor q_norm_w, k_norm_w, o_proj;
-    Tensor mlp_norm_w, gate_up_proj, down_proj;
+    Tensor mlp_norm_w, gate_up_proj, gate_proj, up_proj, down_proj;
 };
 
 struct VulkanGdnWeights {
@@ -29,7 +29,7 @@ struct VulkanGdnWeights {
     Tensor attn_norm_w;
     Tensor qkv_proj, z_proj, a_proj, b_proj;
     Tensor conv_w, conv_bias, A_log, dt_bias, norm_w, o_proj;
-    Tensor mlp_norm_w, gate_up_proj, down_proj;
+    Tensor mlp_norm_w, gate_up_proj, gate_proj, up_proj, down_proj;
 };
 
 class VulkanModelWeights {
@@ -42,6 +42,7 @@ public:
 
     const HybridModelConfig& config() const { return cfg_; }
     const Tensor& embeddings() const { return tok_embeddings_; }
+    HostTensor gather_host_embeddings(std::span<const int32_t> tokens) const;
     const Tensor& final_norm() const { return final_norm_; }
     const Tensor& lm_head() const { return lm_head_; }
     const auto& layer_kinds() const { return layer_kinds_; }
@@ -51,10 +52,11 @@ public:
     const auto& moe_layers() const { return moe_layers_; }
 
 private:
-    void upload(VkContext&, const model_io::LoadedModelRaw&, const VulkanLoadHooks&);
+    void upload(VkContext&, const model_io::LoadedModelRaw&, const VulkanLoadHooks&, DType default_kv_type);
 
     HybridModelConfig cfg_;
     Tensor tok_embeddings_, final_norm_, lm_head_;
+    HostTensor host_embeddings_;
     std::vector<int> layer_kinds_;
     std::vector<size_t> layer_indices_;
     std::vector<VulkanDenseWeights> dense_layers_;

@@ -2,11 +2,11 @@
 
 namespace fusionrt {
 
-void VulkanSessionManager::allocate_dense(VkContext& ctx, const DenseGQAConfig& cfg) {
+void VulkanSessionManager::allocate_dense(VkContext& ctx, const DenseGQAConfig& cfg, DType dtype) {
     const std::vector<int64_t> shape{cfg.max_seq_len, cfg.num_key_value_heads, cfg.head_dim};
     auto& arena = ctx.weight_arena();
-    dense_kv_.push_back({arena.alloc_tensor(shape, DType::F32, "vk_kc"),
-                         arena.alloc_tensor(shape, DType::F32, "vk_vc")});
+    dense_kv_.push_back({arena.alloc_tensor(shape, dtype, "vk_kc"),
+                         arena.alloc_tensor(shape, dtype, "vk_vc")});
 }
 
 void VulkanSessionManager::allocate_gdn(VkContext& ctx, const GatedDeltaNetConfig& cfg, int conv_dim) {

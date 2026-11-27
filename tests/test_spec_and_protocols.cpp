@@ -582,12 +582,15 @@ void test_vulkan_continued_turn() {
     const int32_t next_user_token = (first.back() + 1) % cfg.vocab_size;
     for (int i = 0; i < next_pos; ++i) (void)fresh.forward_token_vulkan(vk, first[i], i);
     const auto expected = fresh.forward_token_vulkan(vk, next_user_token, next_pos);
+    const std::vector<double> expected_ref(expected.begin(), expected.end());
     for (const auto eos : {int32_t{-1}, first.back()}) {
         FusionModel continued(cfg);
         continued.init_synthetic_vulkan(vk, seed);
         const auto answer = continued.generate_vulkan(vk, prompt, eos < 0 ? 1 : 4, nullptr, true, 0, eos);
-        if (answer != first || continued.forward_token_vulkan(vk, next_user_token, next_pos) != expected)
+        if (answer != first)
             throw std::runtime_error("Vulkan must cache the final token before continuing a turn");
+        const auto got = continued.forward_token_vulkan(vk, next_user_token, next_pos);
+        expect_close(got, expected_ref, 1e-5, 1e-5, "Vulkan continued-turn logits");
     }
     std::cout << "  [PASS] Vulkan continued-turn logits after EOS and max steps\n";
     VkPhysicalDeviceMemoryProperties heaps{};

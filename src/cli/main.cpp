@@ -24,6 +24,7 @@
 #include <limits>
 #include <numeric>
 #include <optional>
+#include <random>
 #include <string>
 #include <vector>
 #ifdef _WIN32
@@ -42,6 +43,7 @@ void print_usage(std::string_view command = {}) {
     const auto placement = "  CUDA: [--kv-dtype auto|f32|f16|q8_0|k8v4] [--profile FILE] [--threads N] [--cpu-affinity spread]\n"
                            "  CUDA: [--kv-vram-mb MiB] [--host-kv-mb MiB] [--moe-gpu-experts N]\n"
                            "  CUDA: [--moe-route-profile FILE] [--moe-dynamic-cache]\n";
+    const auto vulkan = "  Vulkan: [--kv-dtype auto|f32|f16|q8_0] [--profile FILE]\n";
     const auto speculative = "  CUDA: [--spec-ngram K | --draft-model GGUF | --spec-mtp] [--draft-tokens N|auto] [--spec-p-min N]\n"
                              "  CUDA: --draft-tokens auto (or 0) requires --spec-mtp.\n";
     if (command.empty()) std::cout << "fusionrt " << FUSIONRT_VERSION
@@ -52,7 +54,7 @@ void print_usage(std::string_view command = {}) {
         << "  [--stream] [--ignore-eos] [--chatml] [--graph|--no-graph] [--unfused]\n"
         << "  CUDA: [--slots N] [--warmup N] [--json-grammar] [--mmproj GGUF] [--image PATH]...\n"
         << "  CUDA: [--profile-ops FILE] [--trace-layers FILE] [--trace-moe] [--trace-moe-routes FILE] [--cpu-moe-f32]\n"
-        << sampling << placement << speculative << "  --steps defaults to 512 for real models and 16 for synthetic models.\n";
+        << sampling << placement << vulkan << speculative << "  --steps defaults to 512 for real models and 16 for synthetic models.\n";
     if (show("chat")) std::cout << "fusionrt chat --model PATH [--system TEXT] [--max-tokens N] [--max-seq N] [--graph|--no-graph]\n"
         << sampling << placement;
     if (show("serve")) std::cout << "fusionrt serve --model PATH [--host HOST] [--port N] [--max-seq N] [--slots N]\n"
@@ -61,7 +63,8 @@ void print_usage(std::string_view command = {}) {
     if (show("inspect")) std::cout << "fusionrt inspect --model PATH [--max-seq N] [--device-memory]\n"
         << "  CUDA placement flags require --device-memory.\n" << placement;
     if (show("bench-model")) std::cout << "fusionrt bench-model --model PATH [--pp N] [--tg N] [--decode-prefix N]\n"
-        << "  [--ubatch N] [--reps N] [--graph|--no-graph] [--profile-ops FILE]\n" << placement;
+        << "  [--backend cuda|vulkan] [--vk-device N] [--ubatch N] [--reps N] [--graph|--no-graph] [--profile-ops FILE]\n"
+        << placement << vulkan;
     if (show("bench")) std::cout << "fusionrt bench [--suite all|fusions|blocks|vulkan] [--output FILE] [--vk-device N]\n";
     if (command == "info") std::cout << "fusionrt info\n";
 }
@@ -576,9 +579,65 @@ int cmd_daily(const std::string& cmd, int argc, char** argv) {
 #endif
 }
 
+#ifdef FUSIONRT_ENABLE_VULKAN
+void load_vulkan_model(VkContext& ctx, FusionModel& model, const std::string& path, int max_seq) {
+    std::string error;
+    const bool ok = is_gguf(path) ? model.load_gguf_vulkan(ctx, path, &error, max_seq)
+                                  : model.load_safetensors_vulkan(ctx, path, &error, max_seq);
+    if (!ok) throw std::runtime_error("Error loading model on Vulkan: " + error);
+}
+
+std::vector<GenerationStats> bench_model_vulkan(VkContext& ctx, FusionModel& model, int pp, int tg,
+                                                 int reps, int decode_prefix, OpTrace* trace) {
+    using Clock = std::chrono::steady_clock;
+    if (std::max(pp, decode_prefix + tg) > model.config().dense.max_seq_len)
+        throw std::invalid_argument("Benchmark exceeds model context");
+    std::mt19937 rng(42);
+    std::uniform_int_distribution<int32_t> pick(0, model.config().vocab_size - 1);
+    std::vector<int32_t> prompt(pp), steps(tg), prefix(decode_prefix);
+    for (auto* ids : {&prompt, &steps, &prefix})
+        std::generate(ids->begin(), ids->end(), [&] { return pick(rng); });
+
+    const auto prefill = [&](const std::vector<int32_t>& ids, GenerationStats* stats) {
+        if (!ids.empty()) model.generate_vulkan(ctx, ids, 0, stats, true);
+    };
+    const auto decode = [&] {
+        for (int pos = 0; pos < tg; ++pos)
+            model.forward_token_vulkan(ctx, steps[pos], decode_prefix + pos);
+    };
+    std::vector<GenerationStats> samples(reps);
+    for (int rep = -1; rep < reps && pp > 0; ++rep) {
+        model.reset_kv_and_state_vulkan(ctx);
+        prefill(prompt, rep < 0 ? nullptr : &samples[rep]);
+    }
+    for (int rep = -1; rep < reps && tg > 0; ++rep) {
+        model.reset_kv_and_state_vulkan(ctx);
+        prefill(prefix, nullptr);
+        const auto begin = Clock::now();
+        decode();
+        const double ms = std::chrono::duration<double, std::milli>(Clock::now() - begin).count();
+        if (rep >= 0) {
+            samples[rep].generated_tokens = tg;
+            samples[rep].decode_ms = ms;
+            samples[rep].decode_tok_per_s = 1000.0 * tg / ms;
+        }
+    }
+    if (trace) {
+        trace->mode = tg > 0 ? "decode" : "prefill";
+        model.reset_kv_and_state_vulkan(ctx);
+        if (tg > 0) prefill(prefix, nullptr);
+        ctx.set_op_trace(trace);
+        if (tg > 0) decode();
+        else prefill(prompt, nullptr);
+        ctx.set_op_trace(nullptr);
+    }
+    return samples;
+}
+#endif
+
 int cmd_bench_model(int argc, char** argv) {
-#ifdef FUSIONRT_ENABLE_CUDA
-    std::string path;
+    std::string path, backend = "cuda";
+    int vk_dev = 0;
     int pp = 128, tg = 64, reps = 5, decode_prefix = 0, ubatch = 512;
     std::optional<DType> kv_dtype;
     std::optional<bool> graph_option;
@@ -596,6 +655,8 @@ int cmd_bench_model(int argc, char** argv) {
         else if (a == "--profile" && i + 1 < argc) profile = argv[++i];
         else if (a == "--profile-ops" && i + 1 < argc) profile_ops = argv[++i];
         else if ((a == "--kv-type" || a == "--kv-dtype") && i + 1 < argc) kv_dtype = parse_kv_type(argv[++i]);
+        else if (a == "--backend" && i + 1 < argc) backend = argv[++i];
+        else if (a == "--vk-device" && i + 1 < argc) vk_dev = parse_int(a, argv[++i]);
         else if (a == "--model" && i + 1 < argc) path = argv[++i];
         else if (a == "--pp" && i + 1 < argc) pp = parse_int(a, argv[++i]);
         else if (a == "--tg" && i + 1 < argc) tg = parse_int(a, argv[++i]);
@@ -612,27 +673,59 @@ int cmd_bench_model(int argc, char** argv) {
     if (decode_prefix > std::numeric_limits<int>::max() - tg || (decode_prefix != 0 && tg == 0)) {
         throw std::invalid_argument("--decode-prefix requires a positive generation count and a valid context length");
     }
-    CudaContext ctx(0, 0, 256);
-    ctx.set_kv_dtype(kv_dtype);
-    FusionModel model(placement.configure());
-    placement.apply(ctx, model);
-    ctx.set_prefill_batch(ubatch);
-    const auto load_start = std::chrono::steady_clock::now();
-    load_cuda_model(ctx, model, path, std::max(pp, decode_prefix + tg), profile);
-    const double load_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - load_start).count();
-    const bool graph = graph_option.value_or(model.recommended_cuda_graph());
+    const auto max_seq = std::max(pp, decode_prefix + tg);
+    std::vector<GenerationStats> samples;
+    double load_ms = 0.0;
+    bool graph_used = false;
     OpTrace trace;
-    auto samples = model.bench_model_cuda(ctx, pp, tg, reps, graph, profile_ops.empty() ? nullptr : &trace, decode_prefix);
-    const bool graph_used = samples.front().used_cuda_graph;
-    if (graph_option.value_or(false) && !graph_used) {
-        const auto& layers = model.moe_layers();
-        const bool cold = std::any_of(layers.begin(), layers.end(), [](const auto& layer) {
-            return layer.cfg.gpu_resident_experts < layer.cfg.num_experts;
-        });
-        std::clog << "--graph requested, benchmark used eager because "
-                  << (cold ? "some MoE experts are CPU-resident" : "CUDA Graph capture failed") << '\n';
+    auto* op_trace = profile_ops.empty() ? nullptr : &trace;
+    if (backend == "cuda") {
+#ifdef FUSIONRT_ENABLE_CUDA
+        CudaContext ctx(0, 0, 256);
+        ctx.set_kv_dtype(kv_dtype);
+        FusionModel model(placement.configure());
+        placement.apply(ctx, model);
+        ctx.set_prefill_batch(ubatch);
+        const auto load_start = std::chrono::steady_clock::now();
+        load_cuda_model(ctx, model, path, max_seq, profile);
+        load_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - load_start).count();
+        samples = model.bench_model_cuda(ctx, pp, tg, reps, graph_option.value_or(model.recommended_cuda_graph()),
+                                         op_trace, decode_prefix);
+        graph_used = samples.front().used_cuda_graph;
+        if (graph_option.value_or(false) && !graph_used) {
+            const auto& layers = model.moe_layers();
+            const bool cold = std::any_of(layers.begin(), layers.end(), [](const auto& layer) {
+                return layer.cfg.gpu_resident_experts < layer.cfg.num_experts;
+            });
+            std::clog << "--graph requested, benchmark used eager because "
+                      << (cold ? "some MoE experts are CPU-resident" : "CUDA Graph capture failed") << '\n';
+        }
+        ubatch = model.prefill_batch_limit(ctx);
+#else
+        throw std::runtime_error("CUDA backend was not enabled in this build");
+#endif
+    } else if (backend == "vulkan") {
+#ifdef FUSIONRT_ENABLE_VULKAN
+        if (placement.specified) throw std::invalid_argument("Placement options require the CUDA backend");
+        VkContext ctx(static_cast<uint32_t>(vk_dev), 0, 0);
+        ctx.set_kv_dtype(kv_dtype);
+        ctx.set_prefill_batch(ubatch);
+        ctx.set_device_profile(DeviceProfile::load(profile));
+        FusionModel model(HybridModelConfig{});
+        const auto load_start = std::chrono::steady_clock::now();
+        load_vulkan_model(ctx, model, path, max_seq);
+        load_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - load_start).count();
+        if (graph_option.value_or(false))
+            std::clog << "--graph requested, using eager decoding because the backend is Vulkan\n";
+        samples = bench_model_vulkan(ctx, model, pp, tg, reps, decode_prefix, op_trace);
+        ubatch = ctx.prefill_batch();
+#else
+        throw std::runtime_error("Vulkan backend was not enabled in this build");
+#endif
+    } else {
+        throw std::invalid_argument("Unknown backend: " + backend);
     }
-    if (!profile_ops.empty()) trace.write(profile_ops, model_filename(path));
+    if (op_trace) trace.write(profile_ops, model_filename(path));
     auto report = [&](const char* name, int tokens, double GenerationStats::* rate) {
         if (tokens == 0) return;
         std::vector<double> speeds;
@@ -642,19 +735,13 @@ int cmd_bench_model(int argc, char** argv) {
         double mean = std::accumulate(speeds.begin(), speeds.end(), 0.0) / reps;
         std::cout << name << tokens << " median=" << median << " tok/s mean=" << mean << " tok/s\n";
     };
-    std::cout << "model=" << std::filesystem::path(path).filename().string()
-              << " backend=cuda graph=" << (graph_used ? "true" : "false") << " reps=" << reps
-              << " ubatch=" << model.prefill_batch_limit(ctx) << " load_ms=" << load_ms
+    std::cout << "model=" << model_filename(path)
+              << " backend=" << backend << " graph=" << (graph_used ? "true" : "false") << " reps=" << reps
+              << " ubatch=" << ubatch << " load_ms=" << load_ms
               << '\n' << std::fixed << std::setprecision(2);
     report("pp", pp, &GenerationStats::prefill_tok_per_s);
     report("tg", tg, &GenerationStats::decode_tok_per_s);
     return 0;
-#else
-    (void)argc;
-    (void)argv;
-    std::cerr << "CUDA backend was not enabled in this build.\n";
-    return 1;
-#endif
 }
 
 int cmd_run(int argc, char** argv) {
@@ -671,7 +758,6 @@ int cmd_run(int argc, char** argv) {
     int vk_dev = 0;
     std::optional<bool> graph_option;
     std::optional<DType> kv_dtype;
-    bool kv_dtype_set = false;
     CudaPlacementOptions placement;
     SamplingParams sampling;
     std::string profile, profile_ops, layer_trace, route_trace_path;
@@ -702,10 +788,7 @@ int cmd_run(int argc, char** argv) {
         else if (a == "--trace-moe") trace_moe = true;
         else if (a == "--trace-moe-routes" && i + 1 < argc) route_trace_path = argv[++i];
         else if (a == "--cpu-moe-f32") cpu_moe_f32 = true;
-        else if ((a == "--kv-type" || a == "--kv-dtype") && i + 1 < argc) {
-            kv_dtype = parse_kv_type(argv[++i]);
-            kv_dtype_set = true;
-        }
+        else if ((a == "--kv-type" || a == "--kv-dtype") && i + 1 < argc) kv_dtype = parse_kv_type(argv[++i]);
         else if (a == "--graph" || a == "--no-graph") graph_option = a == "--graph";
         else if (a == "--stream") stream = true;
         else if (a == "--profile" && i + 1 < argc) profile = argv[++i];
@@ -723,7 +806,6 @@ int cmd_run(int argc, char** argv) {
     }
     const int steps = steps_option.value_or(model_path.empty() ? 16 : 512);
     sampling.validate();
-    if (kv_dtype_set && backend_s != "cuda") throw std::invalid_argument("--kv-dtype requires the CUDA backend");
     if (placement.specified && backend_s != "cuda") throw std::invalid_argument("Placement options require the CUDA backend");
     if (steps < 0 || max_seq <= 0) throw std::invalid_argument("Invalid --steps or --max-seq");
     if (slots < 1 || warmup < 0) throw std::invalid_argument("Expected --slots >= 1 and --warmup >= 0");
@@ -949,20 +1031,16 @@ int cmd_run(int argc, char** argv) {
         std::cerr << "Vulkan backend was not enabled in this build.\n";
         return 1;
 #else
-        if (sampling_set || stream || !profile.empty() || !profile_ops.empty() || !layer_trace.empty()) {
-            throw std::invalid_argument("Sampling, streaming and profiles require the CUDA backend");
+        if (sampling_set || stream || !profile_ops.empty() || !layer_trace.empty()) {
+            throw std::invalid_argument("Sampling, streaming and operator/layer tracing require the CUDA backend");
         }
-        VkContext ctx(static_cast<uint32_t>(vk_dev), 0, 256);
+        if (vk_dev < 0) throw std::invalid_argument("Expected --vk-device >= 0");
+        VkContext ctx(static_cast<uint32_t>(vk_dev), 0, 0);
+        ctx.set_kv_dtype(kv_dtype);
+        ctx.set_device_profile(DeviceProfile::load(profile));
         if (!model_path.empty()) {
             load_tokenizer(tok, model_path);
-            std::string err;
-            bool ok = (model_path.size() >= 5 && model_path.substr(model_path.size() - 5) == ".gguf")
-                ? model.load_gguf_vulkan(ctx, model_path, &err, max_seq)
-                : model.load_safetensors_vulkan(ctx, model_path, &err, max_seq);
-            if (!ok) {
-                std::cerr << "Error loading model on Vulkan: " << err << "\n";
-                return 1;
-            }
+            load_vulkan_model(ctx, model, model_path, max_seq);
         } else {
             model.init_synthetic_vulkan(ctx, 42);
         }

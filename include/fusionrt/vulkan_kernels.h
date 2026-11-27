@@ -5,6 +5,20 @@
 
 namespace fusionrt::vk_ops {
 
+struct PushQuantMatmul { int M, N, K, dtype; };
+struct PushRopeKvBatch {
+    int M, num_q_heads, num_kv_heads, head_dim, rot_dim, start_pos, kv_dtype, flags;
+    float theta, eps;
+};
+struct PushFaPrefill {
+    int M, num_q_heads, num_kv_heads, head_dim, start_pos, kv_len, kv_dtype, window, causal;
+    float scale;
+};
+struct PushFaDecode {
+    int num_q_heads, num_kv_heads, head_dim, kv_len, kv_dtype, window;
+    float scale;
+};
+
 struct PushRmsNorm { int rows, cols; float eps; };
 struct PushGemm { int M, N, K; };
 struct PushFusedNormGemv { int M, N, K; float eps; };
@@ -23,18 +37,20 @@ double gemm_auto(VkContext& ctx, const Tensor& a, const Tensor& b, Tensor& c, in
 double rmsnorm(VkContext& ctx, const Tensor& x, const Tensor& w, Tensor& y, int rows, int cols, float eps);
 double fused_rmsnorm_gemv(VkContext& ctx, const Tensor& x, const Tensor& norm_w, const Tensor& w, Tensor& y, int M, int N, int K, float eps);
 
-// Helper to append linear dispatch (F32 vec4, Q8_0, Q4_0) into a command buffer batch
+// Choose a small-M GEMV or a tiled prefill kernel for the native weight format.
 void append_linear_dispatch(std::vector<VkBatchDispatch>& ops,
                             const Tensor& x, const Tensor& w, Tensor& y,
                             int M, int N, int K,
-                            std::vector<std::vector<uint8_t>>& push_storage);
+                            std::vector<std::vector<uint8_t>>& push_storage,
+                            const VkContext* ctx = nullptr);
 
 // Helper to append Pre-Norm + Linear (uses fused vec4 when F32 and K%4==0, else rmsnorm + linear)
 void append_rmsnorm_linear_dispatch(std::vector<VkBatchDispatch>& ops,
                                     const Tensor& x, const Tensor& norm_w, const Tensor& w,
                                     Tensor& x_norm_scratch, Tensor& y,
                                     int M, int N, int K, float eps,
-                                    std::vector<std::vector<uint8_t>>& push_storage);
+                                    std::vector<std::vector<uint8_t>>& push_storage,
+                                    const VkContext* ctx = nullptr);
 
 std::vector<VkBatchDispatch> build_dense_layer_dispatches(
     const Tensor& x_in,

@@ -1,5 +1,5 @@
 #include "fusionrt/vulkan_backend.h"
-#include "vulkan_memory.h"
+#include "fusionrt/cost_model.h"
 #include <algorithm>
 #include <cstdlib>
 #include <cstring>
@@ -121,6 +121,9 @@ VkDeviceInfo query_vk_device_info(VkInstance instance, VkPhysicalDevice phys, ui
     VkPhysicalDeviceSubgroupProperties sg_props{};
     sg_props.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_PROPERTIES;
     props2.pNext = &sg_props;
+    VkPhysicalDeviceDriverProperties driver{};
+    driver.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRIVER_PROPERTIES;
+    sg_props.pNext = &driver;
     vkGetPhysicalDeviceProperties2(phys, &props2);
 
     const auto& p = props2.properties;
@@ -153,9 +156,10 @@ VkDeviceInfo query_vk_device_info(VkInstance instance, VkPhysicalDevice phys, ui
     info.has_8bit_storage = has_device_ext(phys, VK_KHR_8BIT_STORAGE_EXTENSION_NAME);
     info.has_coop_matrix = has_device_ext(phys, VK_KHR_COOPERATIVE_MATRIX_EXTENSION_NAME);
 
-    // AMD RDNA2 integrated GPUs (e.g. Radeon 610M) lack hardware WMMA and crash in driver
-    // when compiling/running VK_KHR_cooperative_matrix shaders; use tiled fallback there.
-    if (info.has_coop_matrix && !(info.vendor_id == 0x1002 && info.device_type == "integrated")) {
+    // This Radeon 610M driver advertises CoopMat but crashes during pipeline creation.
+    const bool broken_coop = driver.driverID == VK_DRIVER_ID_AMD_PROPRIETARY && p.deviceID == 0x164e;
+    if (broken_coop) info.has_coop_matrix = false;
+    if (info.has_coop_matrix) {
         auto fn = reinterpret_cast<PFN_vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR>(
             vkGetInstanceProcAddr(instance, "vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR"));
         if (fn) {
@@ -232,7 +236,7 @@ Tensor VkArena::alloc_tensor(const std::vector<int64_t>& shape, DType dt, const 
     Tensor t = Tensor::from_shape(shape, dt, Backend::Vulkan);
     t.name = name;
     t.vk_buffer = reinterpret_cast<uint64_t>(alloc_.buffer);
-    t.vk_offset = alloc(std::max<VkDeviceSize>(t.nbytes(), 16));
+    t.vk_offset = alloc(std::max<VkDeviceSize>((t.nbytes() + 3) & ~VkDeviceSize{3}, 16));
     return t;
 }
 
@@ -324,6 +328,7 @@ void VkContext::create_instance_and_device(uint32_t device_index) {
         }
     }
     if (!found_qf) throw std::runtime_error("No Vulkan compute queue family found");
+    timestamp_bits_ = qfs[queue_family_].timestampValidBits;
 
     float prio = 1.0f;
     VkDeviceQueueCreateInfo qci{};
@@ -386,17 +391,6 @@ VkContext::VkContext(uint32_t device_index, size_t weight_arena_mb, size_t scrat
     cpci.queueFamilyIndex = queue_family_;
     FUSIONRT_VK_CHECK(vkCreateCommandPool(device_, &cpci, nullptr, &cmd_pool_));
 
-    VkDescriptorPoolSize pool_size{};
-    pool_size.type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-    pool_size.descriptorCount = 4096;
-    VkDescriptorPoolCreateInfo dpci{};
-    dpci.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
-    dpci.flags = VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT;
-    dpci.maxSets = 1024;
-    dpci.poolSizeCount = 1;
-    dpci.pPoolSizes = &pool_size;
-    FUSIONRT_VK_CHECK(vkCreateDescriptorPool(device_, &dpci, nullptr, &desc_pool_));
-
     VkQueryPoolCreateInfo qpci{};
     qpci.sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO;
     qpci.queryType = VK_QUERY_TYPE_TIMESTAMP;
@@ -414,22 +408,53 @@ VkContext::VkContext(uint32_t device_index, size_t weight_arena_mb, size_t scrat
     if (weight_arena_mb)
         weight_arena_.init(device_, phys_, weight_arena_mb * 1024ULL * 1024ULL,
                            buf_usage, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, info_.min_storage_offset_align);
-    scratch_arena_.init(device_, phys_, scratch_arena_mb * 1024ULL * 1024ULL,
-                        buf_usage, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, info_.min_storage_offset_align);
-    staging_arena_.init(device_, phys_, 64ULL * 1024ULL * 1024ULL,
+    if (scratch_arena_mb)
+        scratch_arena_.init(device_, phys_, scratch_arena_mb * 1024ULL * 1024ULL,
+                            buf_usage, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, info_.min_storage_offset_align);
+    staging_arena_.init(device_, phys_, 8ULL * 1024ULL * 1024ULL,
                         VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
                         VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
                         info_.min_storage_offset_align);
 
-    l2_flush_bytes_ = 64ULL * 1024ULL * 1024ULL;
-    l2_flush_buf_ = create_vk_buffer(device_, phys_, l2_flush_bytes_,
-                                     VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
-                                     VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, false);
+
+}
+
+void VkContext::set_kv_dtype(std::optional<DType> dtype) {
+    if (dtype && *dtype != DType::F32 && *dtype != DType::F16 && *dtype != DType::Q8_0)
+        throw std::invalid_argument("Vulkan --kv-dtype accepts auto, f32, f16 or q8_0");
+    kv_dtype_ = dtype;
+}
+
+void VkContext::set_prefill_batch(int rows) {
+    if (rows < 1 || rows > 512) throw std::invalid_argument("--ubatch must be between 1 and 512");
+    prefill_batch_ = rows;
+}
+
+VkDeviceSize VkContext::available_device_bytes(uint32_t memory_type) const {
+    VkPhysicalDeviceMemoryBudgetPropertiesEXT budget{};
+    budget.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_BUDGET_PROPERTIES_EXT;
+    VkPhysicalDeviceMemoryProperties2 memory{};
+    memory.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_PROPERTIES_2;
+    if (has_device_ext(phys_, VK_EXT_MEMORY_BUDGET_EXTENSION_NAME)) memory.pNext = &budget;
+    vkGetPhysicalDeviceMemoryProperties2(phys_, &memory);
+    const auto heap = memory.memoryProperties.memoryTypes[memory_type].heapIndex;
+    const auto reserved = [heap](const VkBufferAllocation& a) {
+        return a.heap_index == heap ? a.allocation_size : VkDeviceSize{0};
+    };
+    const auto known_usage = reserved(weight_arena_.alloc_) + reserved(scratch_arena_.alloc_) +
+                             reserved(staging_arena_.alloc_) + reserved(l2_flush_buf_);
+    auto limit = memory.memoryProperties.memoryHeaps[heap].size;
+    if (profile_.vram_total_mb > 0) {
+        const double profile_bytes = profile_.vram_total_mb * (1024 * 1024);
+        if (profile_bytes < static_cast<double>(limit)) limit = static_cast<VkDeviceSize>(profile_bytes);
+    }
+    if (budget.heapBudget[heap]) limit = std::min(limit, budget.heapBudget[heap]);
+    return wddm_model_available(limit, std::max(known_usage, budget.heapUsage[heap]), 0);
 }
 
 void VkContext::reserve_model_memory(VkDeviceSize weight_bytes, VkDeviceSize context_bytes) {
     const auto bytes = weight_bytes + context_bytes;
-    const auto alignment = std::max<VkDeviceSize>(256, info_.min_storage_offset_align);
+    const auto alignment = info_.min_storage_offset_align;
     const auto used = (weight_arena_.used() + alignment - 1) & ~(alignment - 1);
     const auto unused = weight_arena_.capacity() - std::min(used, weight_arena_.capacity());
     if (bytes <= unused) return;
@@ -440,31 +465,36 @@ void VkContext::reserve_model_memory(VkDeviceSize weight_bytes, VkDeviceSize con
             std::to_string(available) + " device bytes are available");
     };
     if (used) throw failure(unused);
-    VkPhysicalDeviceMemoryBudgetPropertiesEXT budget{};
-    budget.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_BUDGET_PROPERTIES_EXT;
-    VkPhysicalDeviceMemoryProperties2 memory{};
-    memory.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_PROPERTIES_2;
-    const bool has_budget = has_device_ext(phys_, VK_EXT_MEMORY_BUDGET_EXTENSION_NAME);
-    if (has_budget) memory.pNext = &budget;
     VkDeviceSize available = 0;
-    auto check_heap = [&](uint32_t memory_type, VkDeviceSize required) {
-        vkGetPhysicalDeviceMemoryProperties2(phys_, &memory);
-        const auto heap = memory.memoryProperties.memoryTypes[memory_type].heapIndex;
-        const auto& scratch = scratch_arena_.alloc_;
-        const auto reserved = (scratch.heap_index == heap ? scratch.allocation_size : 0) +
-                              (l2_flush_buf_.heap_index == heap ? l2_flush_buf_.allocation_size : 0);
-        available = vulkan_detail::available_heap_bytes(memory.memoryProperties, has_budget ? &budget : nullptr,
-                                                         memory_type, reserved);
-        if (required > available)
-            throw std::runtime_error("Vulkan allocation requires " + std::to_string(required) +
-                " bytes after buffer alignment on device heap " + std::to_string(heap));
-    };
     try {
-        const auto usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT |
-                           VK_BUFFER_USAGE_TRANSFER_DST_BIT;
-        weight_arena_.init(device_, phys_, bytes, usage, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, alignment, check_heap);
+        constexpr auto usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT |
+                               VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+        weight_arena_.init(device_, phys_, bytes, usage, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, alignment,
+                           [&](uint32_t type, VkDeviceSize required) {
+            available = available_device_bytes(type);
+            if (required > available) throw failure(available);
+        });
     } catch (const std::runtime_error& e) {
-        throw std::runtime_error(std::string(failure(available).what()) + ". " + e.what());
+        if (available >= bytes) throw std::runtime_error(std::string(failure(available).what()) + ". " + e.what());
+        throw failure(available);
+    }
+}
+
+bool VkContext::try_reserve_scratch_memory(VkDeviceSize bytes) {
+    const auto alignment = info_.min_storage_offset_align;
+    const auto used = (scratch_arena_.used() + alignment - 1) & ~(alignment - 1);
+    if (bytes <= scratch_arena_.capacity() - std::min(used, scratch_arena_.capacity())) return true;
+    if (used) return false;
+    constexpr auto usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT |
+                           VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+    try {
+        scratch_arena_.init(device_, phys_, bytes, usage, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, alignment,
+                            [&](uint32_t type, VkDeviceSize required) {
+            if (required > available_device_bytes(type)) throw std::runtime_error("Vulkan scratch exceeds the device budget");
+        });
+        return true;
+    } catch (const std::runtime_error&) {
+        return false;
     }
 }
 
@@ -523,11 +553,23 @@ void VkContext::submit_and_wait(VkCommandBuffer cmd) {
 void VkContext::copy_buffer(VkBuffer src, VkDeviceSize src_off, VkBuffer dst, VkDeviceSize dst_off, VkDeviceSize bytes) {
     VkCommandBuffer cmd = begin_one_time_commands();
 
+    VkMemoryBarrier barrier{};
+    barrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+    barrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
+    barrier.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
+    constexpr auto compute_and_transfer = VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT;
+    vkCmdPipelineBarrier(cmd, compute_and_transfer, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                         0, 1, &barrier, 0, nullptr, 0, nullptr);
+
     VkBufferCopy region{};
     region.srcOffset = src_off;
     region.dstOffset = dst_off;
     region.size = bytes;
     vkCmdCopyBuffer(cmd, src, dst, 1, &region);
+    barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                         0, 1, &barrier, 0, nullptr, 0, nullptr);
 
     submit_and_wait(cmd);
     vkFreeCommandBuffers(device_, cmd_pool_, 1, &cmd);
@@ -542,10 +584,13 @@ Tensor VkContext::upload(const HostTensor& ht, bool persistent) {
     for (size_t off = 0; off < nbytes; off += static_cast<size_t>(chunk_cap)) {
         size_t chunk = std::min<size_t>(nbytes - off, static_cast<size_t>(chunk_cap));
         staging_arena_.reset();
-        VkDeviceSize st_off = staging_arena_.alloc(chunk);
-        std::memcpy(static_cast<uint8_t*>(staging_arena_.mapped()) + st_off, ht.bytes().data() + off, chunk);
+        const auto padded = (chunk + 3) & ~size_t{3};
+        const auto st_off = staging_arena_.alloc(padded);
+        auto* stage = static_cast<uint8_t*>(staging_arena_.mapped()) + st_off;
+        std::memcpy(stage, ht.bytes().data() + off, chunk);
+        std::memset(stage + chunk, 0, padded - chunk);
         copy_buffer(staging_arena_.buffer(), st_off,
-                    reinterpret_cast<VkBuffer>(dst.vk_buffer), dst.vk_offset + off, chunk);
+                    reinterpret_cast<VkBuffer>(dst.vk_buffer), dst.vk_offset + off, padded);
     }
     return dst;
 }
@@ -579,7 +624,7 @@ void VkContext::zero_buffers(std::span<const Tensor> tensors) {
     vkCmdPipelineBarrier(cmd, compute_and_transfer, VK_PIPELINE_STAGE_TRANSFER_BIT,
                          0, 1, &barrier, 0, nullptr, 0, nullptr);
     for (const auto& tensor : tensors) {
-        const auto bytes = tensor.nbytes();
+        const auto bytes = (tensor.nbytes() + 3) & ~VkDeviceSize{3};
         if (bytes) vkCmdFillBuffer(cmd, reinterpret_cast<VkBuffer>(tensor.vk_buffer), tensor.vk_offset, bytes, 0);
     }
     barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
@@ -671,102 +716,13 @@ const VkPipelineEntry& VkContext::get_pipeline(const std::string& shader_name, u
     return inserted->second;
 }
 
-double VkContext::dispatch_single(const VkBatchDispatch& d, bool measure_timestamp) {
-    return dispatch_batched({d}, measure_timestamp);
-}
-
-double VkContext::dispatch_batched(const std::vector<VkBatchDispatch>& dispatches, bool measure_timestamp) {
-    if (dispatches.empty()) return 0.0;
-
-    std::vector<VkDescriptorSet> dsets;
-    dsets.reserve(dispatches.size());
-
-    for (const auto& d : dispatches) {
-        const auto& pipe = get_pipeline(d.shader_name, static_cast<uint32_t>(d.buffers.size()), d.push_size);
-        VkDescriptorSetAllocateInfo dsai{};
-        dsai.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
-        dsai.descriptorPool = desc_pool_;
-        dsai.descriptorSetCount = 1;
-        dsai.pSetLayouts = &pipe.desc_layout;
-        VkDescriptorSet ds = VK_NULL_HANDLE;
-        FUSIONRT_VK_CHECK(vkAllocateDescriptorSets(device_, &dsai, &ds));
-
-        std::vector<VkDescriptorBufferInfo> dbis(d.buffers.size());
-        std::vector<VkWriteDescriptorSet> writes(d.buffers.size());
-        for (size_t i = 0; i < d.buffers.size(); ++i) {
-            dbis[i].buffer = reinterpret_cast<VkBuffer>(d.buffers[i].vk_buffer);
-            dbis[i].offset = d.buffers[i].vk_offset;
-            dbis[i].range = std::max<VkDeviceSize>(d.buffers[i].nbytes(), 16);
-
-            writes[i] = VkWriteDescriptorSet{};
-            writes[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-            writes[i].dstSet = ds;
-            writes[i].dstBinding = static_cast<uint32_t>(i);
-            writes[i].descriptorCount = 1;
-            writes[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-            writes[i].pBufferInfo = &dbis[i];
-        }
-        vkUpdateDescriptorSets(device_, static_cast<uint32_t>(writes.size()), writes.data(), 0, nullptr);
-        dsets.push_back(ds);
-    }
-
-    VkCommandBuffer cmd = begin_one_time_commands();
-
-    if (measure_timestamp) {
-        vkCmdResetQueryPool(cmd, query_pool_, 0, 2);
-        vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, query_pool_, 0);
-    }
-
-    for (size_t i = 0; i < dispatches.size(); ++i) {
-        const auto& d = dispatches[i];
-        const auto& pipe = get_pipeline(d.shader_name, static_cast<uint32_t>(d.buffers.size()), d.push_size);
-        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipe.pipeline);
-        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipe.pipe_layout, 0, 1, &dsets[i], 0, nullptr);
-        if (d.push_size > 0 && d.push_data != nullptr) {
-            vkCmdPushConstants(cmd, pipe.pipe_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, d.push_size, d.push_data);
-        }
-        vkCmdDispatch(cmd, d.gx, d.gy, d.gz);
-
-        if (i + 1 < dispatches.size()) {
-            VkMemoryBarrier bar{};
-            bar.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
-            bar.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
-            bar.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
-            vkCmdPipelineBarrier(cmd,
-                                 VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-                                 VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-                                 0, 1, &bar, 0, nullptr, 0, nullptr);
-        }
-    }
-
-    if (measure_timestamp) {
-        vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, query_pool_, 1);
-    }
-
-    submit_and_wait(cmd);
-
-    double gpu_ms = 0.0;
-    if (measure_timestamp) {
-        uint64_t ts[2]{0, 0};
-        FUSIONRT_VK_CHECK(vkGetQueryPoolResults(device_, query_pool_, 0, 2, sizeof(ts), ts,
-                                                sizeof(uint64_t), VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT));
-        gpu_ms = static_cast<double>(ts[1] - ts[0]) * static_cast<double>(info_.timestamp_period_ns) * 1e-6;
-    }
-
-    vkFreeCommandBuffers(device_, cmd_pool_, 1, &cmd);
-    vkFreeDescriptorSets(device_, desc_pool_, static_cast<uint32_t>(dsets.size()), dsets.data());
-    return gpu_ms;
-}
-
-double VkContext::dispatch_unbatched(const std::vector<VkBatchDispatch>& dispatches, bool measure_timestamp) {
-    double total_ms = 0.0;
-    for (const auto& d : dispatches) {
-        total_ms += dispatch_batched({d}, measure_timestamp);
-    }
-    return total_ms;
-}
-
 void VkContext::flush_l2() {
+    if (!l2_flush_buf_.buffer) {
+        l2_flush_bytes_ = 64ULL * 1024ULL * 1024ULL;
+        l2_flush_buf_ = create_vk_buffer(device_, phys_, l2_flush_bytes_,
+                                         VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                                         VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, false);
+    }
     VkCommandBuffer cmd = begin_one_time_commands();
     vkCmdFillBuffer(cmd, l2_flush_buf_.buffer, 0, l2_flush_bytes_, 0x5A5A5A5Au);
     submit_and_wait(cmd);

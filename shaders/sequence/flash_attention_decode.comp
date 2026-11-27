@@ -1,0 +1,147 @@
+#version 450
+#extension GL_EXT_control_flow_attributes : require
+#extension GL_KHR_shader_subgroup_basic : require
+
+layout(local_size_x = 64) in;
+
+layout(std430, binding = 0) readonly buffer Q { float q[]; };
+layout(std430, binding = 1) readonly buffer KCache { uint k_cache[]; };
+layout(std430, binding = 2) readonly buffer VCache { uint v_cache[]; };
+layout(std430, binding = 3) writeonly buffer O { float o[]; };
+
+layout(push_constant) uniform Push {
+    int num_q_heads;
+    int num_kv_heads;
+    int head_dim;
+    int kv_len;
+    int kv_dtype;
+    int window;
+    float scale;
+} pc;
+
+const int F32 = 0;
+const int F16 = 1;
+const int Q8_0 = 3;
+const int LANES = 64;
+const int MAX_HEAD_DIM = 512;
+const int VALUES_PER_LANE = MAX_HEAD_DIM / LANES;
+
+shared float query[MAX_HEAD_DIM];
+shared float partial[LANES];
+shared float tile_weights[LANES];
+shared float previous_weight;
+shared float mass;
+shared bool group_dot;
+
+uint cache_word(uint i, bool value) {
+    return value ? v_cache[i] : k_cache[i];
+}
+
+uint head_bytes(uint dim, int format) {
+    if (format == F32) return 4u * dim;
+    if (format == F16) return 2u * dim;
+    return (dim / 32u) * 34u;
+}
+
+float cache_element(uint base, uint d, bool value, int format) {
+    if (format == F32) return uintBitsToFloat(cache_word((base >> 2) + d, value));
+    if (format == F16) {
+        uint halfword = (base >> 1) + d;
+        return unpackHalf2x16(cache_word(halfword >> 1, value))[halfword & 1u];
+    }
+
+    uint block = base + (d / 32u) * 34u;
+    float scale = unpackHalf2x16(cache_word(block >> 2, value))[(block >> 1) & 1u];
+    uint b = block + 2u + d % 32u;
+    int quant = bitfieldExtract(int(cache_word(b >> 2, value)), int((b & 3u) * 8u), 8);
+    return float(quant) * scale;
+}
+
+void attend(int qh, int lane, int format, int dot_lanes) {
+    int kvh = qh / (pc.num_q_heads / pc.num_kv_heads);
+    uint bytes = head_bytes(uint(pc.head_dim), format);
+    uint kv_stride = uint(pc.num_kv_heads) * bytes;
+    uint kv_offset = uint(kvh) * bytes;
+    uint q_base = uint(qh) * uint(pc.head_dim);
+    int first = pc.window > 0 ? max(0, pc.kv_len - pc.window) : 0;
+
+    int count = (pc.head_dim + LANES - 1 - lane) / LANES;
+    for (int d = lane; d < pc.head_dim; d += LANES) query[d] = q[q_base + d] * pc.scale;
+    if (lane == 0) mass = 0.0;
+    barrier();
+
+    float acc[VALUES_PER_LANE];
+    [[unroll]] for (int i = 0; i < VALUES_PER_LANE; ++i) acc[i] = 0.0;
+    float row_max = uintBitsToFloat(0xff800000u);
+    int key_lane = lane / dot_lanes;
+    int dim_lane = lane % dot_lanes;
+    int tile_size = LANES / dot_lanes;
+    for (int tile = first; tile < pc.kv_len; tile += tile_size) {
+        int keys = min(tile_size, pc.kv_len - tile);
+        uint base = uint(tile) * kv_stride + kv_offset;
+
+        // Score several keys in parallel, with adjacent lanes reading adjacent components.
+        float score = 0.0;
+        if (key_lane < keys) {
+            uint key = base + uint(key_lane) * kv_stride;
+            for (int d = dim_lane; d < pc.head_dim; d += dot_lanes) {
+                score += query[d] * cache_element(key, uint(d), false, format);
+            }
+        }
+        partial[lane] = score;
+        barrier();
+        for (int stride = dot_lanes / 2; stride > 0; stride >>= 1) {
+            if (dim_lane < stride) partial[lane] += partial[lane + stride];
+            barrier();
+        }
+
+        if (lane == 0) {
+            float new_max = row_max;
+            for (int k = 0; k < keys; ++k) new_max = max(new_max, partial[k * dot_lanes]);
+            previous_weight = mass > 0.0 ? exp(row_max - new_max) : 0.0;
+            mass *= previous_weight;
+            for (int k = 0; k < keys; ++k) {
+                float weight = exp(partial[k * dot_lanes] - new_max);
+                tile_weights[k] = weight;
+                mass += weight;
+            }
+            row_max = new_max;
+        }
+        barrier();
+
+        // Merge the tile's weighted values on the same scale as its mass.
+        [[unroll]] for (int i = 0; i < VALUES_PER_LANE; ++i) {
+            if (i < count) {
+                uint d = uint(lane + i * LANES);
+                float result = previous_weight * acc[i];
+                for (int k = 0; k < keys; ++k) {
+                    result += tile_weights[k] * cache_element(base + uint(k) * kv_stride, d, true, format);
+                }
+                acc[i] = result;
+            }
+        }
+    }
+
+    float inv_mass = mass > 0.0 ? 1.0 / mass : 0.0;
+    [[unroll]] for (int i = 0; i < VALUES_PER_LANE; ++i) {
+        if (i < count) o[q_base + uint(lane + i * LANES)] = acc[i] * inv_mass;
+    }
+}
+
+void attend_format(int qh, int lane, int dot_lanes) {
+    if (pc.kv_dtype == F32) attend(qh, lane, F32, dot_lanes);
+    else if (pc.kv_dtype == F16) attend(qh, lane, F16, dot_lanes);
+    else attend(qh, lane, Q8_0, dot_lanes);
+}
+
+void main() {
+    int qh = int(gl_WorkGroupID.x);
+    int lane = int(gl_LocalInvocationID.x);
+    if (qh >= pc.num_q_heads) return;
+
+    // Wider subgroups benefit from coalescing key reads. Reductions use workgroup lanes in both cases.
+    if (lane == 0) group_dot = gl_SubgroupSize >= 64u;
+    barrier();
+    if (group_dot) attend_format(qh, lane, 8);
+    else attend_format(qh, lane, 1);
+}

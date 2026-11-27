@@ -1,16 +1,20 @@
 #pragma once
 
+#include "fusionrt/device_profile.h"
 #include "fusionrt/tensor.h"
 #include <vulkan/vulkan.h>
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <optional>
 #include <span>
 #include <string>
 #include <unordered_map>
 #include <vector>
 
 namespace fusionrt {
+
+struct OpTrace;
 
 struct VkCoopMatConfig {
     bool supported = false;
@@ -95,6 +99,7 @@ struct VkBatchDispatch {
     std::vector<Tensor> buffers;
     const void* push_data = nullptr;
     uint32_t push_size = 0;
+    std::vector<VkBufferCopy> copies;  // Relative to buffers[0] and buffers[1].
 };
 
 class VkContext {
@@ -108,8 +113,20 @@ public:
     VkDevice device() const { return device_; }
     VkQueue queue() const { return queue_; }
 
+    bool supports_coopmat() const { return info_.coop_mat.supported && info_.has_fp16_int8; }
+    uint32_t subgroup_size() const { return info_.subgroup_size; }
+    void set_device_profile(const DeviceProfile& profile) { profile_ = profile; }
+    const DeviceProfile& device_profile() const { return profile_; }
+    void set_kv_dtype(std::optional<DType> dtype);
+    std::optional<DType> kv_dtype() const { return kv_dtype_; }
+    void set_prefill_batch(int rows);
+    int prefill_batch() const { return prefill_batch_; }
+    void set_op_trace(OpTrace* trace) { op_trace_ = trace; }
+    OpTrace* op_trace() const { return op_trace_; }
+
     VkArena& weight_arena() { return weight_arena_; }
     void reserve_model_memory(VkDeviceSize weight_bytes, VkDeviceSize context_bytes);
+    bool try_reserve_scratch_memory(VkDeviceSize bytes);
     VkArena& scratch_arena() { return scratch_arena_; }
 
     Tensor upload(const HostTensor& ht, bool persistent = true);
@@ -138,6 +155,7 @@ public:
     static std::string find_shader_path(const std::string& shader_name);
 
 private:
+    VkDeviceSize available_device_bytes(uint32_t memory_type) const;
     void create_instance_and_device(uint32_t device_index);
     VkCommandBuffer begin_one_time_commands();
     void submit_and_wait(VkCommandBuffer cmd);
@@ -151,10 +169,16 @@ private:
 
     VkCommandPool cmd_pool_ = VK_NULL_HANDLE;
     VkDescriptorPool desc_pool_ = VK_NULL_HANDLE;
+    uint32_t descriptor_capacity_ = 0, descriptor_set_capacity_ = 0;
+    uint32_t timestamp_bits_ = 0;
     VkQueryPool query_pool_ = VK_NULL_HANDLE;
     VkFence fence_ = VK_NULL_HANDLE;
 
     VkDeviceInfo info_;
+    DeviceProfile profile_;
+    std::optional<DType> kv_dtype_;
+    int prefill_batch_ = 512;
+    OpTrace* op_trace_ = nullptr;
     VkArena weight_arena_;
     VkArena scratch_arena_;
     VkArena staging_arena_;

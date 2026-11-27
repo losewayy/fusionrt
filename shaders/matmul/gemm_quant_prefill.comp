@@ -1,0 +1,61 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+
+// Portable 32x32 output tile. Dispatch (ceil(N / 32), ceil(M / 32), 1).
+layout(local_size_x = 16, local_size_y = 16) in;
+
+layout(std430, binding = 0) readonly buffer X { float x[]; };
+layout(std430, binding = 1) readonly buffer W { uint w[]; };
+layout(std430, binding = 2) writeonly buffer Y { float y[]; };
+
+layout(push_constant) uniform Push { int M; int N; int K; int dtype; } pc;
+
+#include "../epilogue/codec_common.glsl"
+
+const uint TILE_M = 32u;
+const uint TILE_N = 32u;
+const uint TILE_K = 32u;
+
+shared float tile_x[TILE_M][TILE_K];
+shared float tile_w[TILE_K][TILE_N + 1u];
+
+void main() {
+    load_codec_grid(pc.dtype);
+
+    uint lane_m = 2u * gl_LocalInvocationID.y;
+    uint lane_n = 2u * gl_LocalInvocationID.x;
+    uint m = gl_WorkGroupID.y * TILE_M + lane_m;
+    uint n = gl_WorkGroupID.x * TILE_N + lane_n;
+    uint N = uint(pc.N), M = uint(pc.M), K = uint(pc.K);
+    uint stride = row_bytes_for_dtype(pc.dtype, pc.K);
+    uvec2 block = weight_block_layout(pc.dtype);
+    vec2 sum0 = vec2(0.0);
+    vec2 sum1 = vec2(0.0);
+
+    for (uint base_k = 0u; base_k < K; base_k += TILE_K) {
+        uint k = base_k + lane_n;
+        uint wn = gl_WorkGroupID.x * TILE_N + lane_m;
+        for (uint i = 0u; i < 2u; ++i) {
+            for (uint j = 0u; j < 2u; ++j) {
+                tile_x[lane_m + i][lane_n + j] =
+                    m + i < M && k + j < K ? x[(m + i) * K + k + j] : 0.0;
+                tile_w[lane_n + j][lane_m + i] =
+                    wn + i < N && k + j < K && stride != 0u
+                    ? dequantize_weight(pc.dtype, (wn + i) * stride, k + j, block) : 0.0;
+            }
+        }
+        barrier();
+
+        for (uint i = 0u; i < TILE_K; ++i) {
+            vec2 weight = vec2(tile_w[i][lane_n], tile_w[i][lane_n + 1u]);
+            sum0 = fma(vec2(tile_x[lane_m][i]), weight, sum0);
+            sum1 = fma(vec2(tile_x[lane_m + 1u][i]), weight, sum1);
+        }
+        barrier();
+    }
+
+    if (m < M && n < N) y[m * N + n] = sum0.x;
+    if (m < M && n + 1u < N) y[m * N + n + 1u] = sum0.y;
+    if (m + 1u < M && n < N) y[(m + 1u) * N + n] = sum1.x;
+    if (m + 1u < M && n + 1u < N) y[(m + 1u) * N + n + 1u] = sum1.y;
+}
