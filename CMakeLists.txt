@@ -96,6 +96,12 @@ endif()
 
 if(FUSIONRT_ENABLE_CUDA)
     list(APPEND FUSIONRT_SOURCES
+        src/models/cuda_dispatch.cpp
+        src/models/cuda_loader.cpp
+        src/models/cuda_session.cpp
+        src/models/cuda_ir.cpp
+        src/models/cuda_executor.cpp
+        src/models/cuda_generate.cpp
         src/cuda/cuda_backend.cpp
         src/cuda/cuda_common.cuh
         src/cuda/matmul/weight_tiles.cuh
@@ -104,7 +110,9 @@ if(FUSIONRT_ENABLE_CUDA)
         src/cuda/sequence/flash_attention.cu
         src/cuda/sequence/mla.cu
         src/cuda/sequence/linear_recurrence.cu
-        src/cuda/epilogue/boundary_ops.cu
+        src/cuda/epilogue/elementwise_ops.cu
+        src/cuda/epilogue/hadamard_ops.cu
+        src/cuda/epilogue/codec_moe_ops.cu
         src/server/http_server.cpp
     )
 endif()
@@ -180,7 +188,14 @@ endif()
 
 if(FUSIONRT_BUILD_TESTS)
     enable_testing()
-    add_executable(fusionrt_tests tests/test_main.cpp)
+    add_executable(fusionrt_tests
+        tests/test_main.cpp
+        tests/test_quant_codecs.cpp
+        tests/test_kernels_cuda.cpp
+        tests/test_models_moe.cpp
+        tests/test_model_state.cpp
+        tests/test_spec_and_protocols.cpp
+    )
     target_include_directories(fusionrt_tests PRIVATE src/server)
     target_link_libraries(fusionrt_tests PRIVATE fusionrt_core)
     if(FUSIONRT_ENABLE_VULKAN)

@@ -7,6 +7,7 @@
 #include <stdexcept>
 
 #ifdef FUSIONRT_ENABLE_CUDA
+#include "cuda_dispatch.h"
 #include "model_loader.h"
 #include "fusionrt/cuda_kernels.h"
 #endif

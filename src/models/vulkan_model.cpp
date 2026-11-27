@@ -1,3 +1,4 @@
+#include "fusionrt/models.h"
 #include "model_loader.h"
 
 #ifdef FUSIONRT_ENABLE_VULKAN

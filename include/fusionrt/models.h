@@ -1,157 +1,17 @@
 #pragma once
 
-#include "fusionrt/tensor.h"
-#include "fusionrt/graph_ir.h"
-#include "fusionrt/device_profile.h"
+#include "fusionrt/model_types.h"
 #include "fusionrt/sampler.h"
-#ifdef FUSIONRT_ENABLE_CUDA
-#include "fusionrt/cuda_backend.h"
-#endif
-#ifdef FUSIONRT_ENABLE_VULKAN
-#include "fusionrt/vulkan_backend.h"
-#endif
-#include <array>
-#include <cstdint>
-#include <functional>
-#include <map>
-#include <memory>
-#include <stdexcept>
-#include <string>
-#include <vector>
 
 namespace fusionrt {
 
-struct MlaConfig {
-    int query_rank = 0;
-    int latent_rank = 0;
-    int rope_dims = 0;
-    int value_dim = 0;
-    int leading_dense_layers = 0;
-    float attention_scale = 0.0f;
-    float rope_amplitude = 1.0f;
-
-    int latent_width() const { return latent_rank + rope_dims; }
-};
-
-struct DenseGQAConfig {
-    int hidden_size = 512;
-    int num_attention_heads = 8;
-    int num_key_value_heads = 2;
-    int head_dim = 64;
-    int intermediate_size = 1536;
-    int max_seq_len = 4096;
-    float rms_norm_eps = 1e-6f;
-    float rope_theta = 1000000.0f;
-    float partial_rotary_factor = 1.0f;  // 1.0 = full RoPE; <1.0 = partial RoPE
-    bool qk_norm = true;                 // Qwen3/Gemma3 style Q/K RMSNorm before RoPE
-    bool rope_neox = true;               // NeoX split-half RoPE vs interleaved
-    bool gated_q_attn = false;           // Qwen3.5 full-attn joint [Q, gate] projection
-    MlaConfig mla;
-    DType weight_dtype = DType::F32;     // F32, F16, BF16, Q8_0, or Q4_0
-};
-
-struct GatedDeltaNetConfig {
-    int hidden_size = 512;
-    int num_k_heads = 4;
-    int num_v_heads = 8;
-    int head_k_dim = 64;
-    int head_v_dim = 64;
-    int conv_kernel_size = 4;
-    int intermediate_size = 1536;
-    float rms_norm_eps = 1e-6f;
-    DType weight_dtype = DType::F32;
-    bool tiled_value_heads = false;
-};
-
-struct MoEConfig {
-    int hidden_size = 512;
-    int intermediate_size = 512;
-    int num_experts = 8;
-    int top_k = 2;
-    bool norm_topk_prob = true;
-    bool sigmoid_router = false;
-    float expert_weights_scale = 1.0f;
-    int expert_groups = 1;
-    int expert_groups_used = 1;
-    int gpu_resident_experts = 8;
-    float rms_norm_eps = 1e-6f;
-    bool has_shared_expert = true;
-    int shared_intermediate_size = 512;
-    DType weight_dtype = DType::F32;
-};
-
-struct HybridModelConfig {
-    std::string arch = "dense";  // "dense", "hybrid", "moe"
-    int vocab_size = 512;
-    int num_layers = 4;
-    DenseGQAConfig dense;
-    GatedDeltaNetConfig gdn;
-    MoEConfig moe;
-    std::vector<int> gpu_experts;  // Per transformer layer, zero where there are no routed experts.
-    std::string model_architecture;
-    float embed_scale = 1.0f;
-    float final_logit_softcapping = 0.0f;
-};
-
-inline std::invalid_argument prompt_context_error(size_t tokens, int context) {
-    return std::invalid_argument("Prompt (" + std::to_string(tokens) + " tokens) exceeds model context (" +
-                                 std::to_string(context) + ")");
-}
-
-inline void validate_token_id(int32_t id, size_t position, int vocab_size) {
-    if (id < 0 || id >= vocab_size)
-        throw std::invalid_argument("Token ID " + std::to_string(id) + " at position " + std::to_string(position) +
-                                    " is outside vocabulary size " + std::to_string(vocab_size));
-}
-
-inline void validate_token_ids(std::span<const int32_t> ids, size_t start, int vocab_size) {
-    for (size_t i = 0; i < ids.size(); ++i) validate_token_id(ids[i], start + i, vocab_size);
-}
-
-struct GenerationStats {
-    int prompt_tokens = 0;
-    int generated_tokens = 0;
-    double prefill_ms = 0.0;
-    double decode_ms = 0.0;
-    double prefill_tok_per_s = 0.0;
-    double decode_tok_per_s = 0.0;
-    int prefilled_tokens = 0;
-    int spec_proposed = 0;
-    int spec_accepted = 0;
-    bool used_cuda_graph = false;
-    std::array<int, 7> mtp_proposed_by_depth{}, mtp_accepted_by_depth{};
-    std::array<int, 7> mtp_checked_by_depth{};
-    int mtp_cutoffs = 0;
-    int mtp_verify_graph_steps = 0, mtp_draft_graph_steps = 0;
-    int mtp_reused_kv_rows = 0, mtp_rewound_kv_rows = 0;
-};
-
-struct OpTiming {
-    std::string name;
-    std::string kind;
-    int64_t calls = 0;
-    double total_ms = 0.0;
-    int64_t bytes = 0;
-    int64_t flops = 0;
-};
-
-struct OpTrace {
-    std::string mode;
-    std::vector<OpTiming> ops;
-    void write(const std::string& path, const std::string& model) const;
-};
-
-struct LayerTrace {
-    std::vector<std::vector<float>> outputs;
-    void write(const std::string& path, const std::string& model) const;
-};
+#ifdef FUSIONRT_ENABLE_CUDA
+class CudaModelWeights;
+class CudaSessionManager;
+class CudaExecutor;
+#endif
 
 class FusionModel;
-
-struct InputEmbedding {
-    int start = 0;  // Offset into prompt token IDs.
-    Tensor rows;
-};
 
 struct GenerationOptions {
     SamplingParams sampling;
@@ -169,161 +29,6 @@ struct GenerationOptions {
     bool warn_on_graph_fallback = false;
 };
 
-struct ModelMemory {
-    size_t static_scratch_bytes = 0;
-    size_t kv_bytes = 0;
-    int kv_pages = 0;
-    size_t kv_reserved_bytes = 0;
-    size_t host_kv_bytes = 0;
-    int host_kv_pages = 0;
-    size_t ssm_bytes = 0;
-    size_t persistent_bytes = 0;
-    std::map<DType, size_t> weight_bytes;
-};
-
-#ifdef FUSIONRT_ENABLE_CUDA
-struct CudaDenseGQALayer {
-    DenseGQAConfig cfg;
-    int moe_index = -1;
-    int kv_source_layer = -1;
-    int sliding_window = 0;
-    float attention_scale = 0.0f;  // 0 selects 1 / sqrt(head_dim).
-    float output_scale = 1.0f;
-    bool v_norm = false;
-    bool geglu = false;
-    Tensor attn_post_norm_w, ffn_post_norm_w, dense_post_norm_w, routed_post_norm_w;
-    Tensor attn_norm_w;     // [hidden]
-    Tensor q_proj;          // [q_dim, hidden]
-    Tensor k_proj;          // [kv_dim, hidden]
-    Tensor v_proj;          // [kv_dim, hidden]
-    std::array<Tensor, 3> projection_packs;
-    Tensor q_bias, k_bias, v_bias;
-    Tensor mla_q_a, mla_q_a_norm, mla_kv_a, mla_kv_a_norm, mla_k_b, mla_v_b;
-    Tensor q_norm_w;        // [head_dim] (optional)
-    Tensor k_norm_w;        // [head_dim] (optional)
-    Tensor rope_factors;    // [rotary_dims / 2] (optional)
-    Tensor o_proj;          // [hidden, q_dim]
-    Tensor mlp_norm_w;      // [hidden]
-    Tensor gate_up_proj;    // [2*inter, hidden]
-    Tensor gate_proj, up_proj;  // Separate when the gate and up weights use different formats.
-    Tensor down_proj;       // [hidden, inter]
-    Tensor ple_gate, ple_projection, ple_post_norm;
-
-
-};
-
-struct CudaGatedDeltaNetLayer {
-    GatedDeltaNetConfig cfg;
-    int moe_index = -1;
-    Tensor attn_norm_w;     // [hidden]
-    Tensor qkv_proj;        // [conv_dim, hidden]
-    Tensor z_proj;          // [nv*dv, hidden]
-    Tensor a_proj;          // [nv, hidden]
-    Tensor b_proj;          // [nv, hidden]
-    std::array<Tensor, 4> projection_packs;
-    Tensor conv_w;          // [conv_dim, 4]
-    Tensor conv_bias;       // [conv_dim] (optional)
-    Tensor A_log;           // [nv]
-    Tensor dt_bias;         // [nv]
-    Tensor norm_w;          // [dv]
-    Tensor o_proj;          // [hidden, nv*dv]
-    Tensor mlp_norm_w;      // [hidden]
-    Tensor gate_up_proj;    // [2*inter, hidden]
-    Tensor gate_proj, up_proj;
-    Tensor down_proj;       // [hidden, inter]
-};
-
-struct CudaGdnState {
-    Tensor convolution, recurrence;
-};
-
-struct CudaSparseMoELayer {
-    MoEConfig cfg;
-    int model_layer_index = -1;
-    Tensor norm_w;                // [hidden]
-    Tensor router_w;              // [num_experts, hidden]
-    Tensor router_bias;           // Optional correction for expert selection.
-    Tensor router_scale, shared_gate_w, gate_scale, up_scale, down_scale;
-    HostTensor cpu_gate_scale, cpu_up_scale;
-    bool geglu = false;
-    Tensor gpu_gate_up_w;         // [gpu_resident_experts, (2*)inter, hidden]
-    Tensor gpu_up_w;              // Separate up projection for unpacked gate/up weights.
-    Tensor gpu_down_w;            // [gpu_resident_experts, hidden, inter]
-    Tensor borrowed_gate_up_w, borrowed_up_w, borrowed_down_w;
-    HostTensor cpu_gate_up_w;     // [offloaded, (2*)inter, hidden]
-    HostTensor cpu_up_w;
-    HostTensor cpu_down_w;        // [offloaded, hidden, inter]
-    Tensor shared_gate_up_w;      // [2*shared_inter, hidden]
-    Tensor shared_down_w;         // [hidden, shared_inter]
-
-    void forward_cuda(CudaContext& ctx, Tensor& x_in_out, bool use_fused = true, int moe_index = -1) const {
-        forward_prefill_cuda(ctx, x_in_out, 1, use_fused, moe_index);
-    }
-    void forward_prefill_cuda(CudaContext& ctx, Tensor& x_in_out, int M, bool use_fused = true,
-                              int moe_index = -1, int route_pos = -1) const;
-};
-#endif
-
-#ifdef FUSIONRT_ENABLE_VULKAN
-struct VkDenseGQALayer {
-    DenseGQAConfig cfg;
-    int moe_index = -1;
-    int kv_source_layer = -1;
-    int sliding_window = 0;
-    float attention_scale = 0.0f;  // 0 selects 1 / sqrt(head_dim).
-    float output_scale = 1.0f;
-    bool v_norm = false;
-    bool geglu = false;
-    Tensor attn_post_norm_w, ffn_post_norm_w;
-    Tensor attn_norm_w;
-    Tensor q_proj;
-    Tensor k_proj;
-    Tensor v_proj;
-    Tensor qkv_proj_fused;
-    Tensor q_bias, k_bias, v_bias;
-    Tensor q_norm_w;
-    Tensor k_norm_w;
-    Tensor o_proj;
-    Tensor mlp_norm_w;
-    Tensor gate_up_proj;
-    Tensor down_proj;
-    Tensor k_cache;
-    Tensor v_cache;
-};
-
-struct VkGatedDeltaNetLayer {
-    GatedDeltaNetConfig cfg;
-    int moe_index = -1;
-    Tensor attn_norm_w;
-    Tensor qkv_proj;
-    Tensor z_proj;
-    Tensor a_proj;
-    Tensor b_proj;
-    Tensor conv_w;
-    Tensor conv_bias;
-    Tensor A_log;
-    Tensor dt_bias;
-    Tensor norm_w;
-    Tensor o_proj;
-    Tensor mlp_norm_w;
-    Tensor gate_up_proj;
-    Tensor down_proj;
-    Tensor conv_state;
-    Tensor ssm_state;
-};
-
-struct VkSparseMoELayer {
-    MoEConfig cfg;
-    Tensor shared_gate_w;
-    Tensor norm_w;
-    Tensor router_w;
-    Tensor gpu_gate_up_w;
-    Tensor gpu_down_w;
-    Tensor shared_gate_up_w;
-    Tensor shared_down_w;
-};
-#endif
-
 class FusionModel {
 public:
     explicit FusionModel(HybridModelConfig cfg);
@@ -331,17 +36,15 @@ public:
     const HybridModelConfig& config() const { return cfg_; }
 
 #ifdef FUSIONRT_ENABLE_CUDA
+    ~FusionModel();
     void set_num_slots(int n);
-    int num_slots() const { return static_cast<int>(cuda_slots_.size()); }
-    void set_kv_vram_budget_bytes(size_t bytes) {
-        cuda_kv_pool_.set_kv_vram_budget_bytes(bytes);
-        requested_kv_budget_ = bytes;
-    }
+    int num_slots() const;
+    void set_kv_vram_budget_bytes(size_t bytes);
     void set_kv_commitment_tokens(int tokens);
-    void enable_native_mtp(bool enabled) { load_mtp_ = enabled; }
-    bool has_native_mtp() const { return mtp_.projection.data != nullptr; }
+    void enable_native_mtp(bool enabled);
+    bool has_native_mtp() const;
     void validate_cuda_kv_capacity(int tokens) const;
-    void set_kv_host_budget_bytes(size_t bytes) { cuda_kv_pool_.set_kv_host_budget_bytes(bytes); }
+    void set_kv_host_budget_bytes(size_t bytes);
     void set_moe_gpu_experts(int count);
     void init_synthetic(CudaContext& ctx, uint64_t seed = 42);
     bool load_gguf(CudaContext& ctx, const std::string& path, std::string* err = nullptr,
@@ -364,19 +67,19 @@ public:
     std::vector<GenerationStats> bench_model_cuda(CudaContext& ctx, int pp, int tg, int reps, bool use_graph,
                                                   OpTrace* trace = nullptr, int decode_prefix = 0);
     void set_device_profile(CudaContext& ctx, const DeviceProfile& profile);
-    bool recommended_cuda_graph() const { return recommend_cuda_graph_; }
+    bool recommended_cuda_graph() const;
     ModelMemory cuda_cache_memory() const;
     int cuda_max_active_tokens() const;
-    DType cuda_kv_dtype() const { return cuda_kv_dtype_; }
+    DType cuda_kv_dtype() const;
     ModelMemory inspect_cuda(CudaContext& ctx);
     int prefill_batch_limit(CudaContext& ctx, bool verify = false) const;
 
-    const std::vector<CudaDenseGQALayer>& dense_layers() const { return dense_layers_; }
-    const std::vector<CudaGatedDeltaNetLayer>& gdn_layers() const { return gdn_layers_; }
-    const std::vector<CudaSparseMoELayer>& moe_layers() const { return moe_layers_; }
-    size_t cuda_borrowed_expert_bytes() const { return expert_slab_bytes_; }
-    const MiniGraph& raw_ir_graph() const { return raw_ir_graph_; }
-    const MiniGraph& fused_ir_graph() const { return fused_ir_graph_; }
+    const std::vector<CudaDenseGQALayer>& dense_layers() const;
+    const std::vector<CudaGatedDeltaNetLayer>& gdn_layers() const;
+    const std::vector<CudaSparseMoELayer>& moe_layers() const;
+    size_t cuda_borrowed_expert_bytes() const;
+    const MiniGraph& raw_ir_graph() const;
+    const MiniGraph& fused_ir_graph() const;
     void rebuild_cuda_ir();
 #endif
 
@@ -399,96 +102,10 @@ private:
     std::vector<size_t> layer_indices_;
 
 #ifdef FUSIONRT_ENABLE_CUDA
-    CudaArena gguf_weights_;
-    Tensor tok_embeddings_;
-    Tensor final_norm_w_;
-    Tensor lm_head_w_;
-    GemmaLayerInputWeights<Tensor> gemma_inputs_;
-    struct CudaWorkspace {
-        Tensor hidden, logits, token_ids, position, kv_length;
-        CudaGraphExec decode_graph;
-        bool graph_captured = false;
-        bool graph_fused = true;
-        bool graph_has_argmax = false;
-        int graph_split_bucket = 0;
-    } cuda_workspace_;
-
-    struct GdnSnapshot {
-        std::unique_ptr<uint8_t, decltype(&cudaFree)> data{nullptr, cudaFree};
-        bool has_logits = false;
-    };
-    struct GdnCheckpoint {
-        int tokens;
-        std::shared_ptr<const GdnSnapshot> snapshot;
-    };
-    struct CudaSession {
-        CudaArena storage;
-        std::vector<CudaKvView> kv;
-        CudaKvPool::Table pages;
-        std::vector<CudaGdnState> gdn;
-        void* gdn_data = nullptr;
-        size_t ssm_bytes = 0;
-        std::vector<GdnCheckpoint> checkpoints;
-        // Checkpoints belong to exact prefixes of this token history.
-        std::vector<int32_t> cached_tokens;
-        bool cached_fused = true;
-        uint64_t last_used = 0;
-    };
-    CudaKvPool cuda_kv_pool_;
-    std::vector<std::unique_ptr<CudaSession>> cuda_slots_{1};
-    DType cuda_kv_dtype_ = DType::F32;
-    size_t active_slot_ = 0;
-    uint64_t slot_clock_ = 0;
-    int moe_gpu_experts_override_ = -1;
-    size_t requested_kv_budget_ = 0;
-    int kv_commitment_tokens_ = 0;
-    bool may_evict_paused_cuda_slots_ = false;
-    CudaContext* owned_gguf_arena_ = nullptr;
-
-    CudaSession& cuda_session() { return *cuda_slots_[active_slot_]; }
-    std::unique_ptr<CudaSession> make_cuda_session() const;
-    void release_cuda_sessions();
-    void clear_cuda_history();
-    void zero_cuda_gdn(CudaContext& ctx);
-    void ensure_cuda_kv(CudaContext& ctx, int first_write, int tokens);
-    void promote_cuda_expert_slabs(CudaContext& ctx, int budgeted_tokens);
+    std::unique_ptr<CudaModelWeights> weights_;
+    std::unique_ptr<CudaSessionManager> sessions_;
+    std::unique_ptr<CudaExecutor> executor_;
     friend struct CudaReviewTestAccess;
-    size_t cuda_kv_page_bytes() const;
-    void reclaim_cuda_expert_slabs(CudaContext& ctx, size_t target_kv_bytes, bool allocation_failed);
-    void save_cuda_checkpoint(CudaContext& ctx, int tokens, bool logits);
-
-    std::vector<CudaDenseGQALayer> dense_layers_;
-    std::vector<CudaGatedDeltaNetLayer> gdn_layers_;
-    std::vector<CudaSparseMoELayer> moe_layers_;
-    struct ExpertSlab {
-        std::unique_ptr<uint8_t, decltype(&cudaFree)> storage{nullptr, cudaFree};
-        size_t bytes = 0;
-    };
-    std::vector<ExpertSlab> expert_slabs_;
-    size_t expert_slab_bytes_ = 0;
-    struct NativeMtp {
-        Tensor projection, embedding, enorm, hnorm, head_norm, head, target_hidden;
-        float projection_scale = 1.f, head_scale = 1.f;
-        MiniGraph graph;
-    } mtp_;
-    bool load_mtp_ = false;
-    bool capture_mtp_hidden_ = false;
-    MiniGraph raw_ir_graph_;
-    MiniGraph fused_ir_graph_;
-    bool recommend_cuda_graph_ = false;
-    void execute_prefill_chunks(CudaContext& ctx, const int32_t* token_ids, int count, int start_pos,
-                                bool use_fused, LayerTrace* layer_trace, OpTrace* op_trace,
-                                bool compute_logits = true, bool save_prefix_checkpoints = false,
-                                std::span<const InputEmbedding> inputs_embeds = {});
-    std::vector<float> prefill_cuda_impl(CudaContext& ctx, const int32_t* token_ids, int count,
-                                         int start_pos, bool use_fused, LayerTrace* layer_trace = nullptr,
-                                         OpTrace* op_trace = nullptr, bool save_prefix_checkpoints = false,
-                                         std::span<const InputEmbedding> inputs_embeds = {});
-    struct VerifyWorkspace;
-    bool verify_cuda(CudaContext& ctx, const std::vector<int32_t>& input, int pos, bool use_fused,
-                     std::vector<float>& logits, std::vector<int32_t>& argmax, bool greedy,
-                     bool retain_last_logits, VerifyWorkspace* capture = nullptr);
-
 #endif
 
 #ifdef FUSIONRT_ENABLE_VULKAN

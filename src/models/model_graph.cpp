@@ -1,10 +1,8 @@
-#include "fusionrt/models.h"
+#include "cuda_weights.h"
 #include <algorithm>
 #include <span>
 
 namespace fusionrt {
-
-FusionModel::FusionModel(HybridModelConfig cfg) : cfg_(std::move(cfg)) {}
 
 #ifdef FUSIONRT_ENABLE_CUDA
 namespace {
@@ -216,7 +214,7 @@ int append_recurrent(MiniGraph& graph, int input, int index, const CudaGatedDelt
 
 }  // namespace
 
-void FusionModel::rebuild_cuda_ir() {
+void CudaModelWeights::rebuild_ir() {
     MiniGraph graph;
     graph.hidden_size = static_cast<int>(lm_head_w_.shape[1]);
     graph.final_logit_softcapping = cfg_.final_logit_softcapping;

@@ -1,6 +1,6 @@
 #pragma once
 
-#include "fusionrt/models.h"
+#include "fusionrt/model_types.h"
 #include <random>
 
 namespace fusionrt::model_io {
@@ -53,8 +53,5 @@ HostTensor concat_rows_same_dtype(const std::vector<HostTensor>& parts);
 HostTensor to_f32_host(const HostTensor&);
 bool parse_gguf_model_raw(const std::string&, int max_seq_override, LoadedModelRaw&, std::string* err);
 bool parse_safetensors_model_raw(const std::string&, int max_seq_override, LoadedModelRaw&, std::string* err);
-#ifdef FUSIONRT_ENABLE_CUDA
-void vision_linear_cuda(CudaContext& ctx, const Tensor& input, const Tensor& weight, Tensor& output, int rows);
-#endif
 
 }  // namespace fusionrt::model_io
