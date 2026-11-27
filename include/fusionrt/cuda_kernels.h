@@ -112,6 +112,8 @@ inline constexpr size_t kArgmaxScratchBytes = kArgmaxParts * (sizeof(float) + si
 // history occupies out_idx[1..history_size], indexed by the current position.
 void argmax_f32(const float* x, int n, int32_t* out_idx, cudaStream_t stream,
                  void* scratch = nullptr, int* pos = nullptr, int* kv_len = nullptr, int history_size = 0);
+void argmax_probability_f32(const float* x, int n, const int32_t* idx, float* probability,
+                            float* scratch, cudaStream_t stream);
 
 // GPU embedding lookup supporting F32, F16, BF16, Q8_0, Q4_0 tables -> F32 [M, hidden]
 void blockwise_hadamard_f32(const float* x, const int8_t* signs, float* out, int rows, int cols,
@@ -122,8 +124,14 @@ void fused_rmsnorm_hadamard_f32(const float* x, const float* weight, const int8_
 
 void codec_gemv_f32(const float* x, const void* weight, DType dtype, float* out,
                      int rows, int out_cols, int in_cols, cudaStream_t stream);
+constexpr size_t codec_verify_scratch_bytes(int rows, int cols) {
+    if (rows < 2 || rows > 8) return 0;
+    const int padded = rows == 2 ? 2 : rows <= 4 ? 4 : 8;
+    return static_cast<size_t>(cols / 32) * 9 * padded * sizeof(int32_t);
+}
 void codec_gemv_q8_1(const void* x, const void* weight, DType dtype, float* out,
-                      int M, int N, int K, cudaStream_t stream);
+                     int M, int N, int K, cudaStream_t stream, int* verification_scratch,
+                     const float* quantize_rows = nullptr);
 void codec_mmq_q8_1(const void* x, const void* weight, DType dtype, float* out,
                      int M, int N, int K, cudaStream_t stream);
 void codec_dequant_tile_f16(const void* weight, DType dtype, uint16_t* out,
@@ -239,7 +247,8 @@ void batched_qk_norm_rope_kv_append_f32(
     int M, int num_q_heads, int num_kv_heads, int head_dim, int rot_dim,
     int start_pos, int max_seq, float theta, float eps, bool neox, cudaStream_t stream,
     int q_row_stride = 0, int k_row_stride = 0, int v_row_stride = 0,
-    const float* rotary_factors = nullptr, DType kv_dtype = DType::F32, CudaKvView cache = {}, bool v_norm = false);
+    const float* rotary_factors = nullptr, DType kv_dtype = DType::F32, CudaKvView cache = {}, bool v_norm = false,
+    const int* start_dev = nullptr);
 
 // Fusion 4: Fused W4/Q8 Dequantize-GEMV/GEMM (supports arbitrary M >= 1)
 void fused_gemv_q8_0(const float* x, const void* w_q8, float* y,

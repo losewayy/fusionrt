@@ -119,6 +119,11 @@ struct GenerationStats {
     int spec_proposed = 0;
     int spec_accepted = 0;
     bool used_cuda_graph = false;
+    std::array<int, 7> mtp_proposed_by_depth{}, mtp_accepted_by_depth{};
+    std::array<int, 7> mtp_checked_by_depth{};
+    int mtp_cutoffs = 0;
+    int mtp_verify_graph_steps = 0, mtp_draft_graph_steps = 0;
+    int mtp_reused_kv_rows = 0, mtp_rewound_kv_rows = 0;
 };
 
 struct OpTiming {
@@ -159,6 +164,7 @@ struct GenerationOptions {
     bool spec_mtp = false;
     FusionModel* draft_model = nullptr;
     int draft_tokens = 4;
+    float spec_p_min = 0.1f;
     std::span<const InputEmbedding> inputs_embeds;
     bool warn_on_graph_fallback = false;
 };
@@ -478,9 +484,10 @@ private:
                                          int start_pos, bool use_fused, LayerTrace* layer_trace = nullptr,
                                          OpTrace* op_trace = nullptr, bool save_prefix_checkpoints = false,
                                          std::span<const InputEmbedding> inputs_embeds = {});
-    void verify_cuda(CudaContext& ctx, const std::vector<int32_t>& input, int pos, bool use_fused,
+    struct VerifyWorkspace;
+    bool verify_cuda(CudaContext& ctx, const std::vector<int32_t>& input, int pos, bool use_fused,
                      std::vector<float>& logits, std::vector<int32_t>& argmax, bool greedy,
-                     bool retain_last_logits);
+                     bool retain_last_logits, VerifyWorkspace* capture = nullptr);
 
 #endif
 

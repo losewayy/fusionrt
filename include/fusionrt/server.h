@@ -12,6 +12,7 @@ struct ServeSpeculation {
     FusionModel* draft = nullptr;
     int draft_tokens = 4;
     bool mtp = false;
+    float p_min = 0.1f;
 
     GenerationOptions for_inputs(std::span<const InputEmbedding> embeds) const {
         GenerationOptions options;
@@ -21,6 +22,7 @@ struct ServeSpeculation {
             options.spec_mtp = mtp;
             options.draft_model = draft;
             options.draft_tokens = draft_tokens;
+            options.spec_p_min = p_min;
         }
         return options;
     }

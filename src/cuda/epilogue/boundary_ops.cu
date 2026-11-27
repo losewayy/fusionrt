@@ -333,7 +333,7 @@ __global__ void k_qk_norm_rope_kv_append(
     int h = blockIdx.x;
     int tid = threadIdx.x;
     const int m = blockIdx.y;
-    int pos = pos_dev ? *pos_dev : pos_host + m;
+    int pos = (pos_dev ? *pos_dev : pos_host) + m;
     bool is_q = (h < num_q_heads);
     int kh = is_q ? h : (h - num_q_heads);
     if (!is_q && kh >= num_kv_heads) return;
@@ -558,6 +558,110 @@ __global__ void k_codec_gemv_q8_1(const BlockQ8_1* __restrict__ x, const uint8_t
     }
     const float result = warp_reduce_sum(sum);
     if (lane == 0) out[static_cast<int64_t>(blockIdx.y) * n + col] = result;
+}
+
+// Interleave matching Q8 words from the same group so GEMV can load all
+// activation rows for one packed weight with a vector read.
+template<int Rows>
+__global__ void k_pack_verify_activations(const BlockQ8_1* x, int* y, int m, int groups) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= groups * 9 * Rows) return;
+    const int row = i % Rows, word = i / Rows % 9, group = i / (Rows * 9);
+    if (row >= m) {
+        y[i] = 0;
+    } else {
+        const auto& src = x[static_cast<int64_t>(row) * groups + group];
+        y[i] = word < 8 ? src.qs[word] : __float_as_int(src.d);
+    }
+}
+
+template<int Rows>
+__global__ void k_quantize_verify_activations(const float* x, int* y, int m, int k) {
+    constexpr int warps = 4;
+    __shared__ BlockQ8_1 blocks[warps];
+    const int lane = threadIdx.x % 32, warp = threadIdx.x / 32;
+    const int group = blockIdx.x * warps + warp;
+    if (group >= k / 32) return;
+    const int row = blockIdx.y;
+    auto& block = blocks[warp];
+    const float value = row < m ? x[static_cast<int64_t>(row) * k + group * 32 + lane] : 0.f;
+    store_q8_1(value, &block);
+    __syncwarp();
+    if (lane < 9) y[(group * 9 + lane) * Rows + row] = lane < 8 ? block.qs[lane] : __float_as_int(block.d);
+}
+
+template<int Rows>
+__device__ __forceinline__ void load_verify_words(const int* p, int (&values)[Rows]) {
+    if constexpr (Rows == 2) {
+        const auto v = __ldg(reinterpret_cast<const int2*>(p));
+        values[0] = v.x;
+        values[1] = v.y;
+    } else {
+        #pragma unroll
+        for (int i = 0; i < Rows; i += 4) {
+            const auto v = __ldg(reinterpret_cast<const int4*>(p + i));
+            values[i + 0] = v.x;
+            values[i + 1] = v.y;
+            values[i + 2] = v.z;
+            values[i + 3] = v.w;
+        }
+    }
+}
+
+template<class Codec, int Rows>
+__global__ void k_codec_verify_q8_1(const int* __restrict__ x, const uint8_t* __restrict__ w,
+                                   float* __restrict__ out, int m, int n, int k) {
+    constexpr int groups = Codec::kBlockSize / 32;
+    constexpr int lanes = Codec::kInt8BlockLanes;
+    const int col = blockIdx.x * (blockDim.x / 32) + threadIdx.x / 32;
+    if (col >= n) return;
+    const int lane = threadIdx.x % 32, word = lane % lanes;
+    const int blocks = k / Codec::kBlockSize;
+    const auto* b = w + static_cast<int64_t>(col) * blocks * Codec::kBlockBytes;
+    float sums[Rows] = {};
+    for (int block = lane / lanes; block < blocks; block += 32 / lanes) {
+        const auto* packed = b + block * Codec::kBlockBytes;
+        if constexpr (Codec::kHasWarpInt8Block) {
+            const auto basis = Codec::load_int8_block(packed, word);
+            float inner[Rows] = {};
+            #pragma unroll
+            for (int sub = 0; sub < groups; ++sub) {
+                const int lo = static_cast<int>(basis.word(sub, word));
+                const int hi = static_cast<int>(basis.word(sub, word + 4));
+                const int* a = x + (block * groups + sub) * 9 * Rows;
+                int alo[Rows], ahi[Rows], scale[Rows];
+                load_verify_words(a + word * Rows, alo);
+                load_verify_words(a + (word + 4) * Rows, ahi);
+                load_verify_words(a + 8 * Rows, scale);
+                #pragma unroll
+                for (int row = 0; row < Rows; ++row) {
+                    const int dot = __dp4a(hi, ahi[row], __dp4a(lo, alo[row], 0));
+                    inner[row] = fmaf(__int_as_float(scale[row]), dot, inner[row]);
+                }
+            }
+            const float scale = basis.scale();
+            #pragma unroll
+            for (int row = 0; row < Rows; ++row) sums[row] = fmaf(scale, inner[row], sums[row]);
+        } else {
+            #pragma unroll
+            for (int sub = 0; sub < groups; ++sub) {
+                const int q = static_cast<int>(Codec::int8_word(packed, sub, word));
+                const float scale = Codec::int8_scale(packed, sub);
+                const int* a = x + (block * groups + sub) * 9 * Rows;
+                int aq[Rows], ascale[Rows];
+                load_verify_words(a + word * Rows, aq);
+                load_verify_words(a + 8 * Rows, ascale);
+                #pragma unroll
+                for (int row = 0; row < Rows; ++row)
+                    sums[row] = fmaf(scale * __int_as_float(ascale[row]), __dp4a(q, aq[row], 0), sums[row]);
+            }
+        }
+    }
+    #pragma unroll
+    for (int row = 0; row < Rows; ++row) {
+        const float value = warp_reduce_sum(sums[row]);
+        if (lane == 0 && row < m) out[static_cast<int64_t>(row) * n + col] = value;
+    }
 }
 
 template<class Codec, bool Embedding>
@@ -1082,6 +1186,31 @@ void argmax_f32(const float* x, int n, int32_t* out_idx, cudaStream_t stream,
     }
 }
 
+__global__ void k_argmax_mass(const float* x, int n, const int32_t* idx, float* parts) {
+    __shared__ float reduce[32];
+    const int best = *idx;
+    const float mx = best >= 0 ? x[best] : -INFINITY;
+    float mass = 0.f;
+    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n; i += gridDim.x * blockDim.x) {
+        const float v = x[i];
+        if (best >= 0 && !isnan(v)) mass += isinf(mx) ? float(v == mx) : expf(v - mx);
+    }
+    const float sum = block_reduce_sum(mass, reduce);
+    if (threadIdx.x == 0) parts[blockIdx.x] = sum;
+}
+
+__global__ void k_argmax_probability(const float* parts, float* probability) {
+    __shared__ float reduce[32];
+    const float total = block_reduce_sum(parts[threadIdx.x], reduce);
+    if (threadIdx.x == 0) *probability = total > 0.f ? 1.f / total : 0.f;
+}
+
+void argmax_probability_f32(const float* x, int n, const int32_t* idx, float* probability,
+                            float* scratch, cudaStream_t stream) {
+    k_argmax_mass<<<kArgmaxParts, 128, 0, stream>>>(x, n, idx, scratch);
+    k_argmax_probability<<<1, kArgmaxParts, 0, stream>>>(scratch, probability);
+}
+
 void add_rmsnorm_f32(const float* a, const float* b, const float* norm_w,
                      float* res_out, float* norm_out, int rows, int cols, float eps, cudaStream_t stream) {
     int threads = std::min(1024, std::max(32, ((cols + 31) / 32) * 32));
@@ -1208,15 +1337,39 @@ void codec_dequant_tile_f16(const void* weight, DType dtype, uint16_t* out,
 }
 
 void codec_gemv_q8_1(const void* x, const void* weight, DType dtype, float* out,
-                      int M, int N, int K, cudaStream_t stream) {
+                      int M, int N, int K, cudaStream_t stream, int* verification_scratch,
+                      const float* quantize_rows) {
     if (M <= 0 || N <= 0 || K <= 0) return;
     visit_weight_codec(dtype, [&]<class Codec>() {
         if constexpr (Codec::kHasInt8Sub32) {
             if (K % Codec::kBlockSize) throw std::invalid_argument("Invalid WeightCodec GEMV column count");
             constexpr int warps = 4;
-            const dim3 grid((N + warps - 1) / warps, M);
-            k_codec_gemv_q8_1<Codec><<<grid, warps * 32, 0, stream>>>(
-                static_cast<const BlockQ8_1*>(x), static_cast<const uint8_t*>(weight), out, N, K);
+            const auto* qx = static_cast<const BlockQ8_1*>(x);
+            const auto* w = static_cast<const uint8_t*>(weight);
+            const int blocks = (N + warps - 1) / warps;
+            if (M >= 2 && M <= 8) {
+                if (!verification_scratch) throw std::invalid_argument("Multi-row WeightCodec GEMV requires scratch");
+                auto launch = [&]<int Rows>() {
+                    constexpr int threads = 128;
+                    const int elements = K / 32 * 9 * Rows;
+                    if (quantize_rows) {
+                        const dim3 grid((K + threads - 1) / threads, Rows);
+                        k_quantize_verify_activations<Rows><<<grid, threads, 0, stream>>>(
+                            quantize_rows, verification_scratch, M, K);
+                    } else {
+                        k_pack_verify_activations<Rows><<<(elements + threads - 1) / threads, threads, 0, stream>>>(
+                            qx, verification_scratch, M, K / 32);
+                    }
+                    k_codec_verify_q8_1<Codec, Rows><<<blocks, warps * 32, 0, stream>>>(
+                        verification_scratch, w, out, M, N, K);
+                };
+                if (M == 2) launch.template operator()<2>();
+                else if (M <= 4) launch.template operator()<4>();
+                else launch.template operator()<8>();
+                return;
+            }
+            const dim3 grid(blocks, M);
+            k_codec_gemv_q8_1<Codec><<<grid, warps * 32, 0, stream>>>(qx, w, out, N, K);
         } else throw std::invalid_argument("WeightCodec has no INT8 GEMV basis");
     });
 }
@@ -1265,7 +1418,8 @@ void batched_qk_norm_rope_kv_append_f32(
     void* k_cache, void* v_cache,
     int M, int num_q_heads, int num_kv_heads, int head_dim, int rot_dim,
     int start_pos, int /*max_seq*/, float theta, float eps, bool neox, cudaStream_t stream,
-    int q_row_stride, int k_row_stride, int v_row_stride, const float* rotary_factors, DType kv_dtype, CudaKvView cache, bool v_norm)
+    int q_row_stride, int k_row_stride, int v_row_stride, const float* rotary_factors, DType kv_dtype,
+    CudaKvView cache, bool v_norm, const int* start_dev)
 {
     int total_heads = num_q_heads + num_kv_heads;
     int threads = std::min(256, std::max(32, ((head_dim + 31) / 32) * 32));
@@ -1278,7 +1432,7 @@ void batched_qk_norm_rope_kv_append_f32(
         auto run = [&]<bool ValueNorm>() {
             k_qk_norm_rope_kv_append<Cache, ValueNorm><<<grid, threads, smem_bytes, stream>>>(
                 q, k, v, q_norm_w, k_norm_w, rotary_factors, static_cast<Cache*>(k_cache), static_cast<Cache*>(v_cache),
-                num_q_heads, num_kv_heads, head_dim, rot_dim, nullptr, start_pos, theta, eps, neox, qs, ks, vs, cache);
+                num_q_heads, num_kv_heads, head_dim, rot_dim, start_dev, start_pos, theta, eps, neox, qs, ks, vs, cache);
         };
         if (v_norm) run.template operator()<true>();
         else run.template operator()<false>();

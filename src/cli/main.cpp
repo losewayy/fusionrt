@@ -45,14 +45,14 @@ void print_usage() {
               << "               [--temp 0] [--top-k 40] [--top-p 0.95] [--min-p 0.05] [--repeat-penalty 1] [--seed 42]\n"
               << "               [--profile <json>] [--profile-ops <json>] [--trace-layers <json>]\n"
               << "               [--slots <n>] [--warmup <n>] [--trace-moe] [--trace-moe-routes <jsonl>] [--cpu-moe-f32]\n"
-              << "               [--json-grammar] [--spec-ngram <k> | --draft-model <gguf> | --spec-mtp] [--draft-tokens 4]\n"
+              << "               [--json-grammar] [--spec-ngram <k> | --draft-model <gguf> | --spec-mtp] [--draft-tokens 4] [--spec-p-min 0.1]\n"
               << "               [--mmproj <gguf> --image <path> ...] (use <image> to place images in the prompt)\n"
               << "               --steps defaults to 512 with --model and 16 for synthetic models.\n"
               << "  fusionrt inspect --model <path> [--max-seq 4096] [--device-memory]\n"
               << "  fusionrt chat --model <path> [--system <text>] [--temp 0.7] [--max-tokens 512]\n"
               << "  fusionrt serve --model <path> [--mmproj <gguf>] [--image <preset> ...]\n"
               << "                 [--host 127.0.0.1] [--port 8080] [--max-seq 4096] [--slots 1] [--profile <json>]\n"
-              << "                 [--spec-ngram <k> | --draft-model <gguf> | --spec-mtp] [--draft-tokens 4] [--trace-moe-routes <jsonl>]\n"
+              << "                 [--spec-ngram <k> | --draft-model <gguf> | --spec-mtp] [--draft-tokens 4] [--spec-p-min 0.1] [--trace-moe-routes <jsonl>]\n"
               << "  fusionrt bench-model --model <path> [--pp 128] [--tg 64] [--decode-prefix 0] [--ubatch 512] [--reps 5] [--graph] [--profile-ops <json>]\n"
               << "  CUDA run, chat, serve, inspect and bench-model accept --kv-dtype {auto|f32|f16|q8_0}.\n"
               << "  CUDA --threads <n> controls CPU execution (0: auto). --cpu-affinity spread pins workers.\n"
@@ -521,7 +521,7 @@ int cmd_daily(const std::string& cmd, int argc, char** argv) {
     if (!route_trace_path.empty()) route_trace = std::make_unique<MoeRouteTrace>(route_trace_path);
     ctx.moe_route_trace = route_trace.get();
     serve_http(ctx, model, tokenizer, model_filename(path), host, port, graph, vision.get(), preset_images,
-               {speculative.ngram, draft.get(), speculative.draft_tokens, speculative.mtp});
+               {speculative.ngram, draft.get(), speculative.draft_tokens, speculative.mtp, speculative.p_min});
     return 0;
 #endif
 }
@@ -772,6 +772,7 @@ int cmd_run(int argc, char** argv) {
         options.json_constraint = constraint ? &*constraint : nullptr;
         options.spec_ngram = speculative.ngram;
         options.spec_mtp = speculative.mtp;
+        options.spec_p_min = speculative.p_min;
         options.draft_model = draft.get();
         options.draft_tokens = speculative.draft_tokens;
         options.inputs_embeds = prepared.inputs_embeds;
@@ -847,6 +848,14 @@ int cmd_run(int argc, char** argv) {
             const double rate = st.spec_proposed ? static_cast<double>(st.spec_accepted) / st.spec_proposed : 0.0;
             std::cout << " spec_proposed=" << st.spec_proposed << " spec_accepted=" << st.spec_accepted
                       << " accept_rate=" << rate;
+            if (speculative.mtp) {
+                std::cout << " mtp_cutoffs=" << st.mtp_cutoffs << " mtp_kv_reused=" << st.mtp_reused_kv_rows
+                          << " mtp_kv_rewound=" << st.mtp_rewound_kv_rows
+                          << " mtp_graph_verify=" << st.mtp_verify_graph_steps << " mtp_graph_draft=" << st.mtp_draft_graph_steps;
+                for (size_t i = 0; i < st.mtp_proposed_by_depth.size() && st.mtp_proposed_by_depth[i]; ++i)
+                    std::cout << " mtp_depth" << i + 1 << '=' << st.mtp_accepted_by_depth[i]
+                              << '/' << st.mtp_checked_by_depth[i] << '/' << st.mtp_proposed_by_depth[i];
+            }
         }
         std::cout << '\n';
         std::cout << "output_ids:";

@@ -360,7 +360,7 @@ void test_cuda_codec_int8(CudaContext& ctx) {
             rounded[i] = b.d * reinterpret_cast<const int8_t*>(b.qs)[i % 32];
         }
         double format_gemv = 0.0, format_mmq = 0.0;
-        for (const int rows : {1, 4, 16, 37, 128, 256}) {
+        for (const int rows : {1, 2, 3, 4, 8, 16, 37, 128, 256}) {
             const auto saved = arena.mark();
             auto out = arena.alloc_tensor({rows, N}, DType::F32);
             auto linear = [&] { model_io::vision_linear_cuda(ctx, x, w, out, rows); };
@@ -373,6 +373,16 @@ void test_cuda_codec_int8(CudaContext& ctx) {
             const size_t count = static_cast<size_t>(rows) * N;
             if (!std::equal(eager.data<float>(), eager.data<float>() + count, replay.data<float>()))
                 throw std::runtime_error(std::string(dtype_name(f.type)) + " INT8 graph differs from eager");
+            if (rows > 1 && rows <= 8) {
+                auto single = arena.alloc_tensor({1, N}, DType::F32);
+                for (int row = 0; row < rows; ++row) {
+                    const auto x_row = x.slice_dim0(row, 1);
+                    model_io::vision_linear_cuda(ctx, x_row, w, single, 1);
+                    const auto ref = ctx.download(single);
+                    require_codec_close(f.type, "single-pass GEMV versus single row",
+                        {eager.data<float>() + row * N, N}, {ref.data<float>(), N});
+                }
+            }
             std::vector<float> ref(count), int_ref(count);
             for (int m = 0; m < rows; ++m) for (int n = 0; n < N; ++n) {
                 const auto* weights = w32.data<float>() + n * K;
@@ -386,7 +396,7 @@ void test_cuda_codec_int8(CudaContext& ctx) {
                                          std::to_string(error) + " at M=" + std::to_string(rows));
             require_codec_close(f.type, "INT8 vs dequantized Q8_1 reference", actual, int_ref);
             max_integer = std::max(max_integer, codec_rel_l2(actual, int_ref));
-            auto& max_error = rows <= 4 ? format_gemv : format_mmq;
+            auto& max_error = rows <= 8 ? format_gemv : format_mmq;
             max_error = std::max(max_error, error);
             arena.reset(saved);
         }
@@ -830,13 +840,23 @@ void test_cuda_frontier(CudaContext& ctx) {
     GenerationOptions mtp;
     mtp.spec_mtp = true;
     mtp.draft_tokens = 3;
+    mtp.spec_p_min = 0.f;
     GenerationStats stats;
     const auto normal = model.generate_cuda(ctx, prompt, 16);
     const auto speculative = model.generate_cuda(ctx, prompt, 16, true, true, &stats, false, 0, -1, mtp);
-    if (normal != speculative || stats.spec_proposed == 0 || stats.spec_accepted == 0)
+    if (normal != speculative || stats.spec_proposed == 0 || stats.spec_accepted == 0 ||
+        !stats.used_cuda_graph || stats.mtp_verify_graph_steps == 0 || stats.mtp_draft_graph_steps == 0 ||
+        stats.mtp_reused_kv_rows == 0 || stats.mtp_rewound_kv_rows == 0)
         throw std::runtime_error("Qwen integrated MTP verification or acceptance");
     std::cout << "  [PASS] Qwen native MTP exact greedy IDs, accepted " << stats.spec_accepted
               << '/' << stats.spec_proposed << '\n';
+    mtp.spec_p_min = 1.f;
+    const auto cut_off = model.generate_cuda(ctx, prompt, 16, true, true, &stats, false, 0, -1, mtp);
+    if (cut_off != normal || stats.spec_proposed != 0 || stats.mtp_cutoffs == 0 ||
+        stats.mtp_verify_graph_steps == 0 || stats.mtp_draft_graph_steps == 0)
+        throw std::runtime_error("Native MTP confidence cutoff must fall back to exact single-row verification");
+    std::cout << "  [PASS] Native MTP cutoff, graph verification and KV reuse preserve exact greedy IDs\n";
+    mtp.spec_p_min = 0.f;
 
     auto conflicting_head = model_io::make_zeros_f32({f.vocab, f.hidden});
     // Rows 1 and 2 have opposite logits. The trunk's greedy choice is 0.

@@ -163,12 +163,19 @@ static void codec_linear(CudaContext& ctx, const float* x, const float* norm, co
     auto& arena = ctx.scratch_arena();
     const size_t mark = arena.mark();
     if (has_weight_codec_int8(w.dtype)) {
-        void* q8 = arena.alloc(static_cast<size_t>(M) * row_nbytes(DType::Q8_1, K));
-        cuda_ops::quantize_x_q8_1(x, nullptr, norm, nullptr, q8, M, K, eps, ctx.stream());
-        if (use_codec_mmq(ctx, M, allow_prefill)) {
+        const bool mmq = use_codec_mmq(ctx, M, allow_prefill);
+        const size_t bytes = mmq ? 0 : cuda_ops::codec_verify_scratch_bytes(M, K);
+        const auto* quantize_rows = bytes && !norm ? x : nullptr;
+        void* q8 = nullptr;
+        if (!quantize_rows) {
+            q8 = arena.alloc(static_cast<size_t>(M) * row_nbytes(DType::Q8_1, K));
+            cuda_ops::quantize_x_q8_1(x, nullptr, norm, nullptr, q8, M, K, eps, ctx.stream());
+        }
+        if (mmq) {
             cuda_ops::codec_mmq_q8_1(q8, w.ptr(), w.dtype, y, M, N, K, ctx.stream());
         } else {
-            cuda_ops::codec_gemv_q8_1(q8, w.ptr(), w.dtype, y, M, N, K, ctx.stream());
+            auto* scratch = bytes ? static_cast<int*>(arena.alloc(bytes)) : nullptr;
+            cuda_ops::codec_gemv_q8_1(q8, w.ptr(), w.dtype, y, M, N, K, ctx.stream(), scratch, quantize_rows);
         }
         arena.reset(mark);
         return;
@@ -1748,6 +1755,84 @@ struct CudaIRSegment {
     Tensor* boundary = nullptr;
 };
 
+struct GdnReplay {
+    std::vector<Tensor> projections;
+
+    explicit GdnReplay(CudaContext& ctx, const std::vector<CudaGatedDeltaNetLayer>& layers, int rows) {
+        for (const auto& layer : layers) {
+            const auto& c = layer.cfg;
+            const int qkv = 2 * c.num_k_heads * c.head_k_dim + c.num_v_heads * c.head_v_dim;
+            projections.push_back(cuda_scratch(ctx, {rows, qkv + c.num_v_heads * (c.head_v_dim + 2)}));
+        }
+    }
+
+    void save(CudaContext& ctx, int layer, int rows, std::array<const float*, 4> inputs,
+              std::array<int, 4> widths, std::array<int, 4> strides) {
+        const auto& storage = projections[layer];
+        auto* dst = storage.ptr<float>();
+        for (size_t i = 0; i < widths.size(); ++i) {
+            FUSIONRT_CUDA_CHECK(cudaMemcpy2DAsync(dst, storage.shape[1] * sizeof(float), inputs[i],
+                strides[i] * sizeof(float), widths[i] * sizeof(float), rows, cudaMemcpyDeviceToDevice, ctx.stream()));
+            dst += widths[i];
+        }
+    }
+
+    static void steps(CudaContext& ctx, const CudaGatedDeltaNetLayer& layer, const CudaGdnState& state,
+                      std::array<const float*, 4> inputs, std::array<int, 4> strides, float* out,
+                      int rows, float eps, bool use_fused) {
+        const auto& c = layer.cfg;
+        const int nk = c.num_k_heads, nv = c.num_v_heads, dk = c.head_k_dim, dv = c.head_v_dim;
+        const int v_dim = nv * dv, qkv = 2 * nk * dk + v_dim;
+        const float scale = 1.f / std::sqrt(static_cast<float>(dk));
+        const auto mark = ctx.scratch_arena().mark();
+        Tensor scratch, scratch_out;
+        if (use_fused && dv >= 64 && (dk == 64 || dk == 128))
+            scratch = cuda_scratch(ctx, {qkv + v_dim + 2 * nv});
+        else if (!use_fused) {
+            scratch = cuda_scratch(ctx, {qkv});
+            scratch_out = cuda_scratch(ctx, {v_dim});
+        }
+        for (int m = 0; m < rows; ++m) {
+            const auto* q = inputs[0] + static_cast<size_t>(m) * strides[0];
+            const auto* z = inputs[1] + static_cast<size_t>(m) * strides[1];
+            const auto* a = inputs[2] + static_cast<size_t>(m) * strides[2];
+            const auto* b = inputs[3] + static_cast<size_t>(m) * strides[3];
+            float* y = out + static_cast<size_t>(m) * v_dim;
+            if (use_fused) {
+                cuda_ops::fused_gated_deltanet_step_f32(q, z, a, b, layer.conv_w.ptr<float>(),
+                    layer.conv_bias.ptr<float>(), layer.A_log.ptr<float>(), layer.dt_bias.ptr<float>(),
+                    layer.norm_w.ptr<float>(), state.convolution.ptr<float>(), state.recurrence.ptr<float>(),
+                    y, nk, nv, dk, dv, eps, scale, ctx.stream(), scratch.ptr<float>(),
+                    c.tiled_value_heads, c.conv_kernel_size);
+            } else {
+                cuda_ops::unfused_gated_deltanet_step_f32(q, z, a, b, layer.conv_w.ptr<float>(),
+                    layer.conv_bias.ptr<float>(), layer.A_log.ptr<float>(), layer.dt_bias.ptr<float>(),
+                    layer.norm_w.ptr<float>(), state.convolution.ptr<float>(), state.recurrence.ptr<float>(),
+                    y, scratch.ptr<float>(), scratch_out.ptr<float>(), nk, nv, dk, dv, eps, scale, ctx.stream(),
+                    c.tiled_value_heads, c.conv_kernel_size);
+            }
+        }
+        ctx.scratch_arena().reset(mark);
+    }
+
+    void restore(CudaContext& ctx, const std::vector<CudaGatedDeltaNetLayer>& layers,
+                 const std::vector<CudaGdnState>& states, int rows, bool use_fused) const {
+        const auto mark = ctx.scratch_arena().mark();
+        for (size_t i = 0; i < layers.size(); ++i) {
+            const auto& layer = layers[i];
+            const auto& c = layer.cfg;
+            const int v_dim = c.num_v_heads * c.head_v_dim;
+            const int qkv = 2 * c.num_k_heads * c.head_k_dim + v_dim;
+            const auto* src = projections[i].ptr<float>();
+            const int stride = static_cast<int>(projections[i].shape[1]);
+            auto out = cuda_scratch(ctx, {rows, v_dim});
+            steps(ctx, layer, states[i], {src, src + qkv, src + qkv + v_dim, src + qkv + v_dim + c.num_v_heads},
+                  {stride, stride, stride, stride}, out.ptr<float>(), rows, c.rms_norm_eps, use_fused);
+            ctx.scratch_arena().reset(mark);
+        }
+    }
+};
+
 template<bool Observe = false>
 static void execute_ir_graph_cuda(
     const MiniGraph& g, CudaIRWorkspace& ws, CudaContext& ctx,
@@ -1760,7 +1845,7 @@ static void execute_ir_graph_cuda(
     const std::vector<CudaSparseMoELayer>& moe_layers,
     bool use_fused, OpTrace* op_trace = nullptr, CudaOpTimer* timer = nullptr,
     LayerTrace* layer_trace = nullptr, bool compute_logits = true, bool all_logits = false,
-    const CudaIRSegment* segment = nullptr, float* nextn_out = nullptr) {
+    const CudaIRSegment* segment = nullptr, float* nextn_out = nullptr, GdnReplay* replay = nullptr) {
     size_t mark = ctx.scratch_arena().mark();
     int H = g.hidden_size;
     const int first_node = segment ? segment->first : 0;
@@ -1872,7 +1957,13 @@ static void execute_ir_graph_cuda(
                     const bool packed = bufs[node.inputs[0]].dtype == DType::Q8_1;
                     auto project = [&](const Tensor& w, float* out, int cols) {
                         if (!packed) {
-                            dispatch_linear(ctx, in_p, w, out, rows, cols, node.input_cols, use_fused, all_logits);
+                            if (pos_dev && rows > 1 && w.dtype == DType::F32) {
+                                for (int r = 0; r < rows; ++r)
+                                    dispatch_linear(ctx, in_p + static_cast<size_t>(r) * node.input_cols, w,
+                                        out + static_cast<size_t>(r) * cols, 1, cols, node.input_cols, use_fused, true);
+                            } else {
+                                dispatch_linear(ctx, in_p, w, out, rows, cols, node.input_cols, use_fused, all_logits);
+                            }
                         } else if (rows == 1) {
                             decode_gemv(w.dtype)(in_p, w.ptr(), out, cols, node.input_cols,
                                                   ctx.stream(), ctx.preferred_gemv_geometry());
@@ -2021,8 +2112,25 @@ static void execute_ir_graph_cuda(
                             nullptr, nullptr,
                             rows, nq, project_kv_heads, hd, cfg.rotary_dims, start_pos, cfg.max_context,
                             cfg.rope_theta, node.norm_eps, cfg.rope_neox, ctx.stream(), q_stride, k_stride, v_stride,
-                            rotary, state.dtype, state, L.v_norm);
-                        if ((hd == 64 || hd == 128 || hd == 256) && start_pos + rows >= 512) {
+                            rotary, state.dtype, state, L.v_norm, pos_dev);
+                        if (pos_dev) {
+                            // Verification uses the decode reduction for every row, with weights already projected in batch.
+                            const int split_heads = g.decode_split_kv_heads ? g.decode_split_kv_heads : nkv;
+                            const auto mark = ctx.scratch_arena().mark();
+                            for (int i = 0; i < rows; ++i) {
+                                const int splits = select_decode_splits(ctx.cost_hardware(), start_pos + i + 1,
+                                                                         split_heads, kMaxDecodeSplits);
+                                auto part_out = cuda_scratch(ctx, {nq, splits, hd});
+                                auto part_ml = cuda_scratch(ctx, {nq, splits, 2});
+                                cuda_ops::gqa_splitk_decode_f32(q_p + static_cast<size_t>(i) * q_stride,
+                                    nullptr, nullptr, attn_out.ptr<float>() + static_cast<size_t>(i) * q_dim,
+                                    part_out.ptr<float>(), part_ml.ptr<float>(), nq, nkv, hd, kv_len_dev + i,
+                                    start_pos + i + 1, cfg.max_context, scale, splits, ctx.stream(), true, state.dtype,
+                                    nullptr, gate_p ? gate_p + static_cast<size_t>(i) * q_dim : nullptr,
+                                    state, L.sliding_window);
+                                ctx.scratch_arena().reset(mark);
+                            }
+                        } else if ((hd == 64 || hd == 128 || hd == 256) && start_pos + rows >= 512) {
                             cuda_ops::gqa_prefill_online_f32(q_p, q_stride, state, attn_out.ptr<float>(),
                                 rows, nq, nkv, hd, start_pos, scale, ctx.stream(), L.sliding_window);
                         } else {
@@ -2053,7 +2161,14 @@ static void execute_ir_graph_cuda(
                     const float* a_p = bufs[node.inputs[2]].ptr<float>() + node.input_offsets[2];
                     const float* b_p = bufs[node.inputs[3]].ptr<float>() + node.input_offsets[3];
                     Tensor& gdn_out = get_out_buf(node.out, v_dim, rows);
-                    if (rows == 1) {
+                    if (replay && rows > 1) {
+                        const std::array<int, 4> strides{g.values[node.inputs[0]].cols, g.values[node.inputs[1]].cols,
+                            g.values[node.inputs[2]].cols, g.values[node.inputs[3]].cols};
+                        const std::array<const float*, 4> projections{qkv_p, z_p, a_p, b_p};
+                        replay->save(ctx, node.layer_index, rows, projections, {conv_dim, v_dim, nv, nv}, strides);
+                        GdnReplay::steps(ctx, L, state, projections, strides, gdn_out.ptr<float>(),
+                                         rows, node.norm_eps, use_fused);
+                    } else if (rows == 1) {
                         if (use_fused) {
                             float* scratch = nullptr;
                             if (dv >= 64 && (dk == 64 || dk == 128)) {
@@ -2747,9 +2862,38 @@ std::vector<float> FusionModel::prefill_cuda_impl(CudaContext& ctx, const int32_
     return {logits.data<float>(), logits.data<float>() + cfg_.vocab_size};
 }
 
-void FusionModel::verify_cuda(CudaContext& ctx, const std::vector<int32_t>& input, int pos, bool use_fused,
+// Graphs are request-local. The device position, page-table addresses and scratch
+// layout stay valid across replays; admission and host copies stay outside capture.
+struct FusionModel::VerifyWorkspace {
+    struct Entry {
+        CudaGraphExec graph;
+        uint64_t bucket = 0;
+        bool failed = false;
+    };
+    std::array<Entry, 9> graphs;
+    std::optional<GdnReplay> replay;
+    bool enabled = false;
+};
+
+static bool launch_spec_graph(cudaStream_t stream, auto& entry, uint64_t bucket, const auto& body) {
+    if (entry.failed) return false;
+    if (!entry.graph.valid() || entry.bucket != bucket) {
+        try {
+            entry.graph.capture(stream, body);
+            entry.bucket = bucket;
+        } catch (const std::exception& e) {
+            entry.failed = true;
+            std::clog << "Speculative CUDA Graph capture failed, using eager: " << e.what() << '\n';
+            return false;
+        }
+    }
+    entry.graph.launch(stream);
+    return true;
+}
+
+bool FusionModel::verify_cuda(CudaContext& ctx, const std::vector<int32_t>& input, int pos, bool use_fused,
                                std::vector<float>& logits, std::vector<int32_t>& argmax, bool greedy,
-                               bool retain_last_logits) {
+                               bool retain_last_logits, VerifyWorkspace* capture) {
     auto& arena = ctx.scratch_arena();
     struct RestoreArena {
         CudaArena& arena;
@@ -2759,38 +2903,68 @@ void FusionModel::verify_cuda(CudaContext& ctx, const std::vector<int32_t>& inpu
     const int rows = static_cast<int>(input.size());
     const int vocab = cfg_.vocab_size;
     validate_token_ids(input, pos, vocab);
-    const int hidden_size = static_cast<int>(tok_embeddings_.shape[1]);
+    const int H = static_cast<int>(tok_embeddings_.shape[1]);
     ensure_cuda_kv(ctx, pos, pos + rows);
     Tensor ids = cuda_scratch(ctx, {rows}, DType::I32);
-    Tensor hidden = cuda_scratch(ctx, {rows, hidden_size});
+    Tensor hidden = cuda_scratch(ctx, {rows, H});
     Tensor batch_logits = cuda_scratch(ctx, {rows, vocab});
+    Tensor positions, nextn;
+    std::array<int, 9> base{};
+    if (capture) {
+        positions = cuda_scratch(ctx, {rows + 1}, DType::I32);
+        nextn = cuda_scratch(ctx, {rows, H});
+        std::iota(base.begin(), base.begin() + rows + 1, pos);
+        FUSIONRT_CUDA_CHECK(cudaMemcpyAsync(positions.ptr(), base.data(), positions.nbytes(),
+                                            cudaMemcpyHostToDevice, ctx.stream()));
+    }
     FUSIONRT_CUDA_CHECK(cudaMemcpyAsync(ids.ptr(), input.data(), rows * sizeof(int32_t),
                                         cudaMemcpyHostToDevice, ctx.stream()));
-    embed_tokens(ctx, tok_embeddings_, ids, hidden, rows, hidden_size, cfg_.embed_scale);
     const auto& ir = use_fused ? fused_ir_graph_ : raw_ir_graph_;
     CudaIRWorkspace ws(ir);
-    // Match the decode path's quantized activations even for short verification batches.
+    // Keep the target's Q8 activation path, even for short verification batches.
     struct RestoreCrossover {
         CudaContext& ctx;
         int rows;
         ~RestoreCrossover() { ctx.set_mmq_crossover_m(rows); }
     } crossover{ctx, ctx.mmq_crossover_m()};
     ctx.set_mmq_crossover_m(2);
-    execute_ir_graph_cuda(ir, ws, ctx, hidden, ids, batch_logits, rows, pos, pos, nullptr, nullptr,
-                          dense_layers_, gdn_layers_, cuda_session().kv, cuda_session().gdn, moe_layers_,
-                          use_fused, nullptr, nullptr, nullptr, true, true, nullptr,
-                          capture_mtp_hidden_ ? mtp_.target_hidden.ptr<float>() + static_cast<size_t>(pos) * hidden_size : nullptr);
+    const auto body_mark = arena.mark();
+    const auto body = [&] {
+        embed_tokens(ctx, tok_embeddings_, ids, hidden, rows, H, cfg_.embed_scale);
+        auto* position = positions.ptr<int>();
+        execute_ir_graph_cuda(ir, ws, ctx, hidden, ids, batch_logits, rows, pos, pos,
+            position, position ? position + 1 : nullptr, dense_layers_, gdn_layers_, cuda_session().kv,
+            cuda_session().gdn, moe_layers_, use_fused, nullptr, nullptr, nullptr, true, true, nullptr,
+            nextn.ptr<float>(), capture && capture->replay ? &*capture->replay : nullptr);
+        if (greedy) for (int row = 0; row < rows; ++row) {
+            Tensor row_logits = batch_logits.slice_dim0(row, 1);
+            Tensor row_id = ids.slice_dim0(row, 1);
+            decode_argmax(ctx, row_logits, row_id, vocab);
+        }
+    };
+    bool used_graph = false;
+    if (capture && capture->enabled) {
+        uint64_t bucket = 0;
+        for (int i = 0; i < rows; ++i) {
+            bucket = bucket * (kMaxDecodeSplits + 1) + select_decode_splits(ctx.cost_hardware(),
+                pos + i + 1, cfg_.dense.num_key_value_heads, kMaxDecodeSplits);
+        }
+        used_graph = launch_spec_graph(ctx.stream(), capture->graphs[rows], bucket, body);
+    }
+    if (!used_graph) {
+        arena.reset(body_mark);
+        body();
+    }
+    if (capture) {
+        FUSIONRT_CUDA_CHECK(cudaMemcpyAsync(mtp_.target_hidden.ptr<float>() + static_cast<size_t>(pos) * H,
+            nextn.ptr(), nextn.nbytes(), cudaMemcpyDeviceToDevice, ctx.stream()));
+    }
     if (retain_last_logits) {
         FUSIONRT_CUDA_CHECK(cudaMemcpyAsync(cuda_workspace_.logits.ptr(), batch_logits.slice_dim0(rows - 1, 1).ptr(),
                                             vocab * sizeof(float), cudaMemcpyDeviceToDevice, ctx.stream()));
     }
     if (greedy) {
         argmax.resize(rows);
-        for (int row = 0; row < rows; ++row) {
-            Tensor row_logits = batch_logits.slice_dim0(row, 1);
-            Tensor row_id = ids.slice_dim0(row, 1);
-            decode_argmax(ctx, row_logits, row_id, vocab);
-        }
         FUSIONRT_CUDA_CHECK(cudaMemcpyAsync(argmax.data(), ids.ptr(), rows * sizeof(int32_t),
                                             cudaMemcpyDeviceToHost, ctx.stream()));
     } else {
@@ -2801,6 +2975,7 @@ void FusionModel::verify_cuda(CudaContext& ctx, const std::vector<int32_t>& inpu
     ctx.synchronize();
     if (greedy && std::find(argmax.begin(), argmax.end(), -1) != argmax.end())
         throw std::runtime_error("Sampling found no selectable logits during speculative verification");
+    return used_graph;
 }
 
 static void lookup_draft(const std::vector<int32_t>& history, int limit, std::vector<int32_t>& input) {
@@ -2849,6 +3024,8 @@ std::vector<int32_t> FusionModel::generate_cuda(CudaContext& ctx, const std::vec
     if (json && json->vocab_size() != static_cast<size_t>(cfg_.vocab_size))
         throw std::invalid_argument("JSON constraint vocabulary does not match model");
     const bool native_mtp = options.spec_mtp;
+    if (native_mtp && (!std::isfinite(options.spec_p_min) || options.spec_p_min < 0.f || options.spec_p_min > 1.f))
+        throw std::invalid_argument("MTP draft probability cutoff must be in [0, 1]");
     const int modes = (options.spec_ngram > 0) + (draft != nullptr) + native_mtp;
     if (options.spec_ngram < 0 || options.draft_tokens <= 0 || modes > 1) {
         throw std::invalid_argument("Choose one speculative decoding mode with a positive token limit");
@@ -2875,7 +3052,7 @@ std::vector<int32_t> FusionModel::generate_cuda(CudaContext& ctx, const std::vec
     validate_cuda_kv_capacity(start_pos + prompt_len + max_new_tokens);
     if (json && max_new_tokens == 0) throw std::invalid_argument("JSON generation needs room for output tokens");
     const int batch_limit = modes > 0 && max_new_tokens > 1
-        ? prefill_batch_limit(ctx, true) : 1;
+        ? std::min(prefill_batch_limit(ctx, true), native_mtp ? 8 : cfg_.dense.max_seq_len) : 1;
     const bool speculative = batch_limit >= 2;
     if (speculative && options.op_trace) {
         throw std::invalid_argument("Operation profiling is unavailable during speculative decoding");
@@ -2899,8 +3076,8 @@ std::vector<int32_t> FusionModel::generate_cuda(CudaContext& ctx, const std::vec
         if (options.op_trace) fallback = "operation tracing is enabled";
         else if (route_trace) fallback = "MoE route tracing is enabled";
         else if (json) fallback = "JSON grammar is enabled";
-        else if (stochastic) fallback = "temperature is greater than zero";
-        else if (options.sampling.repeat_penalty != 1.0f) fallback = "repeat_penalty is not 1";
+        else if (stochastic && !native_mtp) fallback = "temperature is greater than zero";
+        else if (options.sampling.repeat_penalty != 1.0f && !native_mtp) fallback = "repeat_penalty is not 1";
         else if (!can_use_cuda_graph(moe_layers_) &&
                  (!options.warn_on_graph_fallback ||
                   !moe_graph_prefix(use_fused ? fused_ir_graph_ : raw_ir_graph_, moe_layers_)))
@@ -2958,6 +3135,7 @@ std::vector<int32_t> FusionModel::generate_cuda(CudaContext& ctx, const std::vec
     int pos = start_pos + prompt_len;
     int gen_count = 0;
     int spec_proposed = 0, spec_accepted = 0;
+    GenerationStats mtp_stats;
     const MiniGraph& ir = use_fused ? fused_ir_graph_ : raw_ir_graph_;
     CudaIRWorkspace ws(ir);
     std::unique_ptr<CudaOpTimer> timer;
@@ -3015,6 +3193,18 @@ std::vector<int32_t> FusionModel::generate_cuda(CudaContext& ctx, const std::vec
         }
     } else {
         auto& target_slot = cuda_session();
+        auto& spec_arena = ctx.scratch_arena();
+        struct RestoreArena {
+            CudaArena& arena;
+            size_t mark;
+            ~RestoreArena() { arena.reset(mark); }
+        } restore{spec_arena, spec_arena.mark()};
+        VerifyWorkspace verify;
+        verify.enabled = native_mtp && use_graph && can_use_cuda_graph(moe_layers_) && !prof_acc().enabled;
+        const bool profile_verify = native_mtp && std::getenv("FUSIONRT_MTP_PROFILE");
+        std::array<int, 9> verify_calls{};
+        std::array<double, 9> verify_ms{};
+        if (native_mtp && target_slot.ssm_bytes) verify.replay.emplace(ctx, gdn_layers_, batch_limit);
         CudaSession* draft_slot = draft_pos > 0 ? &draft->cuda_session() : nullptr;
         const size_t draft_ssm = draft_slot ? draft_slot->ssm_bytes : 0;
         CudaArena snapshots;
@@ -3050,36 +3240,67 @@ std::vector<int32_t> FusionModel::generate_cuda(CudaContext& ctx, const std::vec
         std::vector<Sampler::Distribution> draft_probs;
         int mtp_pos = 0;
         std::optional<CudaIRWorkspace> mtp_ws;
-        if (native_mtp) mtp_ws.emplace(mtp_.graph);
+        VerifyWorkspace::Entry mtp_graph;
         const int H = cfg_.dense.hidden_size;
-        auto mtp_step = [&](int position, int32_t token, const float* seed, Tensor* next, bool predict) {
-            auto& arena = ctx.scratch_arena();
-            const auto mark = arena.mark();
-            Tensor ids = cuda_scratch(ctx, {1}, DType::I32);
-            auto emb = cuda_scratch(ctx, {1, H});
-            auto concat = cuda_scratch(ctx, {1, 2 * H});
-            auto projected = cuda_scratch(ctx, {1, H});
-            FUSIONRT_CUDA_CHECK(cudaMemcpyAsync(ids.ptr(), &token, sizeof(token), cudaMemcpyHostToDevice, ctx.stream()));
-            embed_tokens(ctx, mtp_.embedding, ids, emb, 1, H, 1.f);
-            cuda_ops::rmsnorm_f32(emb.ptr<float>(), mtp_.enorm.ptr<float>(), concat.ptr<float>(),
-                                  1, H, cfg_.dense.rms_norm_eps, ctx.stream());
-            auto* normalized_seed = concat.ptr<float>() + H;
-            if (seed) {
-                cuda_ops::rmsnorm_f32(seed, mtp_.hnorm.ptr<float>(), normalized_seed,
-                                      1, H, cfg_.dense.rms_norm_eps, ctx.stream());
-            } else {
-                FUSIONRT_CUDA_CHECK(cudaMemsetAsync(normalized_seed, 0, H * sizeof(float), ctx.stream()));
+        Tensor mtp_args, mtp_seed, mtp_hidden, mtp_probability, mtp_mass;
+        if (native_mtp) {
+            mtp_ws.emplace(mtp_.graph);
+            mtp_args = cuda_scratch(ctx, {3}, DType::I32);
+            mtp_seed = cuda_scratch(ctx, {1, H});
+            mtp_hidden = cuda_scratch(ctx, {1, H});
+            if (options.spec_p_min > 0.f) {
+                mtp_probability = cuda_scratch(ctx, {1});
+                mtp_mass = cuda_scratch(ctx, {cuda_ops::kArgmaxParts});
             }
-            dispatch_linear(ctx, concat.ptr<float>(), mtp_.projection, projected.ptr<float>(), 1, H, H * 2, use_fused);
-            if (mtp_.projection_scale != 1.f)
-                cuda_ops::scale_f32(projected.ptr<float>(), H, mtp_.projection_scale, ctx.stream());
-            execute_ir_graph_cuda(mtp_.graph, *mtp_ws, ctx, projected, ids, cuda_workspace_.logits,
-                1, position, position, nullptr, nullptr, dense_layers_, gdn_layers_,
-                cuda_session().kv, cuda_session().gdn, moe_layers_, use_fused,
-                nullptr, nullptr, nullptr, predict, false, nullptr, next ? next->ptr<float>() : nullptr);
-            if (predict && mtp_.head_scale != 1.f)
-                cuda_ops::scale_f32(cuda_workspace_.logits.ptr<float>(), cfg_.vocab_size, mtp_.head_scale, ctx.stream());
-            arena.reset(mark);
+        }
+        auto mtp_step = [&](int position, int32_t token, const float* seed, bool predict) {
+            const auto mark = spec_arena.mark();
+            const int32_t args[] = {token, position, position + 1};
+            auto* dev = mtp_args.ptr<int32_t>();
+            FUSIONRT_CUDA_CHECK(cudaMemcpyAsync(dev, args, sizeof(args), cudaMemcpyHostToDevice, ctx.stream()));
+            if (predict && seed != mtp_seed.ptr<float>())
+                FUSIONRT_CUDA_CHECK(cudaMemcpyAsync(mtp_seed.ptr(), seed, H * sizeof(float),
+                                                    cudaMemcpyDeviceToDevice, ctx.stream()));
+            auto ids = mtp_args.slice_dim0(0, 1);
+            auto body = [&] {
+                auto emb = cuda_scratch(ctx, {1, H});
+                auto concat = cuda_scratch(ctx, {1, 2 * H});
+                auto projected = cuda_scratch(ctx, {1, H});
+                embed_tokens(ctx, mtp_.embedding, ids, emb, 1, H, 1.f);
+                cuda_ops::rmsnorm_f32(emb.ptr<float>(), mtp_.enorm.ptr<float>(), concat.ptr<float>(),
+                                      1, H, cfg_.dense.rms_norm_eps, ctx.stream());
+                auto* normalized_seed = concat.ptr<float>() + H;
+                if (seed) {
+                    cuda_ops::rmsnorm_f32(predict ? mtp_seed.ptr<float>() : seed, mtp_.hnorm.ptr<float>(), normalized_seed,
+                                          1, H, cfg_.dense.rms_norm_eps, ctx.stream());
+                } else {
+                    FUSIONRT_CUDA_CHECK(cudaMemsetAsync(normalized_seed, 0, H * sizeof(float), ctx.stream()));
+                }
+                dispatch_linear(ctx, concat.ptr<float>(), mtp_.projection, projected.ptr<float>(), 1, H, H * 2, use_fused);
+                if (mtp_.projection_scale != 1.f)
+                    cuda_ops::scale_f32(projected.ptr<float>(), H, mtp_.projection_scale, ctx.stream());
+                execute_ir_graph_cuda(mtp_.graph, *mtp_ws, ctx, projected, ids, cuda_workspace_.logits,
+                    1, position, position, dev + 1, dev + 2, dense_layers_, gdn_layers_, cuda_session().kv,
+                    cuda_session().gdn, moe_layers_, use_fused, nullptr, nullptr, nullptr, predict, false,
+                    nullptr, predict ? mtp_hidden.ptr<float>() : nullptr);
+                if (predict) {
+                    if (mtp_.head_scale != 1.f)
+                        cuda_ops::scale_f32(cuda_workspace_.logits.ptr<float>(), cfg_.vocab_size, mtp_.head_scale, ctx.stream());
+                    decode_argmax(ctx, cuda_workspace_.logits, ids, cfg_.vocab_size);
+                    if (mtp_probability.data)
+                        cuda_ops::argmax_probability_f32(cuda_workspace_.logits.ptr<float>(), cfg_.vocab_size, dev,
+                            mtp_probability.ptr<float>(), mtp_mass.ptr<float>(), ctx.stream());
+                }
+            };
+            const int bucket = select_decode_splits(ctx.cost_hardware(), position + 1,
+                dense_layers_.back().cfg.num_key_value_heads, kMaxDecodeSplits);
+            if (predict && verify.enabled && launch_spec_graph(ctx.stream(), mtp_graph, bucket, body)) {
+                ++mtp_stats.mtp_draft_graph_steps;
+            } else {
+                spec_arena.reset(mark);
+                body();
+            }
+            spec_arena.reset(mark);
         };
         int ngram_depth = 1, ngram_misses = 0, ngram_pause = 0;
         bool pending_on_device = greedy, reset_decode_position = true;
@@ -3130,24 +3351,42 @@ std::vector<int32_t> FusionModel::generate_cuda(CudaContext& ctx, const std::vec
                 const auto* tape = mtp_.target_hidden.ptr<float>();
                 while (mtp_pos < start) {
                     mtp_step(mtp_pos, tokens[mtp_pos], mtp_pos ? tape + static_cast<size_t>(mtp_pos - 1) * H : nullptr,
-                             nullptr, false);
+                             false);
                     ++mtp_pos;
                 }
-                auto& arena = ctx.scratch_arena();
-                const auto mark = arena.mark();
-                auto next_hidden = cuda_scratch(ctx, {1, H});
                 const auto* seed = tape + static_cast<size_t>(start - 1) * H;
                 for (int i = 0; i < limit; ++i) {
-                    mtp_step(start + i, input.back(), seed, &next_hidden, true);
-                    input.push_back(sample_gpu());
-                    seed = next_hidden.ptr<float>();
+                    mtp_step(start + i, input.back(), seed, true);
+                    if (i == 0) {
+                        // The pending token was seeded with the verified trunk row.
+                        mtp_pos = start + 1;
+                        ++mtp_stats.mtp_reused_kv_rows;
+                    } else {
+                        // Later rows used draft hidden states. Refresh them from verified seeds before reuse.
+                        ++mtp_stats.mtp_rewound_kv_rows;
+                    }
+                    int32_t proposal = -1;
+                    float confidence = 1.f;
+                    FUSIONRT_CUDA_CHECK(cudaMemcpyAsync(&proposal, mtp_args.ptr(), sizeof(proposal),
+                        cudaMemcpyDeviceToHost, ctx.stream()));
+                    if (mtp_probability.data)
+                        FUSIONRT_CUDA_CHECK(cudaMemcpyAsync(&confidence, mtp_probability.ptr(), sizeof(confidence),
+                            cudaMemcpyDeviceToHost, ctx.stream()));
+                    ctx.synchronize();
+                    if (proposal < 0) throw std::runtime_error("MTP draft found no selectable logits");
+                    if (confidence < options.spec_p_min) {
+                        ++mtp_stats.mtp_cutoffs;
+                        break;
+                    }
+                    input.push_back(proposal);
+                    ++mtp_stats.mtp_proposed_by_depth[i];
+                    seed = mtp_hidden.ptr<float>();
                 }
-                arena.reset(mark);
             } else if (ngram_probe && limit > 0) {
                 lookup_draft(tokens, limit, input);
             }
             const int proposed = static_cast<int>(input.size()) - 1;
-            if (proposed == 0) {
+            if (proposed == 0 && !native_mtp) {
                 if (ngram_probe && limit > 0 && ++ngram_misses >= 3) {
                     ngram_pause = 8;
                     ngram_misses = 0;
@@ -3169,8 +3408,19 @@ std::vector<int32_t> FusionModel::generate_cuda(CudaContext& ctx, const std::vec
             }
 
             spec_proposed += proposed;
-            copy_state(target_snapshot, target_slot.gdn_data, target_slot.ssm_bytes);
-            verify_cuda(ctx, input, start, use_fused, rows, row_ids, greedy, reuse && target_snapshot);
+            if (proposed > 0) copy_state(target_snapshot, target_slot.gdn_data, target_slot.ssm_bytes);
+            const auto verify_start = profile_verify ? std::chrono::steady_clock::now() :
+                                                      std::chrono::steady_clock::time_point{};
+            if (verify_cuda(ctx, input, start, use_fused, rows, row_ids, greedy, reuse && target_snapshot,
+                            native_mtp ? &verify : nullptr)) {
+                used_cuda_graph = true;
+                ++mtp_stats.mtp_verify_graph_steps;
+            }
+            if (profile_verify) {
+                ++verify_calls[proposed + 1];
+                verify_ms[proposed + 1] += std::chrono::duration<double, std::milli>(
+                    std::chrono::steady_clock::now() - verify_start).count();
+            }
             pending_on_device = false;
             reset_decode_position = true;
             int accepted_count = 0;
@@ -3191,6 +3441,10 @@ std::vector<int32_t> FusionModel::generate_cuda(CudaContext& ctx, const std::vec
                 const bool accepted = !bonus && next_tok == input[i + 1];
                 spec_accepted += accepted;
                 accepted_count += accepted;
+                if (native_mtp && !bonus) {
+                    ++mtp_stats.mtp_checked_by_depth[i];
+                    mtp_stats.mtp_accepted_by_depth[i] += accepted;
+                }
                 running = emit(next_tok);
                 if (!accepted || !running) break;
             }
@@ -3211,8 +3465,11 @@ std::vector<int32_t> FusionModel::generate_cuda(CudaContext& ctx, const std::vec
                 cuda_kv_pool_.truncate(target_slot.pages, kept);
                 if (target_snapshot) {
                     copy_state(target_slot.gdn_data, target_snapshot, target_slot.ssm_bytes);
-                    pos = start;
-                    execute_prefill_chunks(ctx, input.data(), kept - start, start, use_fused, nullptr, nullptr, reuse);
+                    if (verify.replay) {
+                        verify.replay->restore(ctx, gdn_layers_, target_slot.gdn, kept - start, use_fused);
+                    } else {
+                        execute_prefill_chunks(ctx, input.data(), kept - start, start, use_fused, nullptr, nullptr, reuse);
+                    }
                 }
                 pos = kept;
             }
@@ -3226,6 +3483,10 @@ std::vector<int32_t> FusionModel::generate_cuda(CudaContext& ctx, const std::vec
             }
         }
         ctx.synchronize();
+        if (profile_verify) for (size_t m = 1; m < verify_calls.size(); ++m) {
+            if (verify_calls[m]) std::clog << "MTP verify M=" << m << " calls=" << verify_calls[m]
+                << " mean_ms=" << verify_ms[m] / verify_calls[m] << '\n';
+        }
     }
     if (reuse) {
         // The most recently sampled token has not been forwarded into KV/SSM state.
@@ -3244,6 +3505,14 @@ std::vector<int32_t> FusionModel::generate_cuda(CudaContext& ctx, const std::vec
         stats->prefilled_tokens = prefilled;
         stats->spec_proposed = spec_proposed;
         stats->spec_accepted = spec_accepted;
+        stats->mtp_proposed_by_depth = mtp_stats.mtp_proposed_by_depth;
+        stats->mtp_accepted_by_depth = mtp_stats.mtp_accepted_by_depth;
+        stats->mtp_checked_by_depth = mtp_stats.mtp_checked_by_depth;
+        stats->mtp_cutoffs = mtp_stats.mtp_cutoffs;
+        stats->mtp_draft_graph_steps = mtp_stats.mtp_draft_graph_steps;
+        stats->mtp_verify_graph_steps = mtp_stats.mtp_verify_graph_steps;
+        stats->mtp_reused_kv_rows = mtp_stats.mtp_reused_kv_rows;
+        stats->mtp_rewound_kv_rows = mtp_stats.mtp_rewound_kv_rows;
         stats->used_cuda_graph = used_cuda_graph;
         stats->prefill_ms = prefill_ms;
         stats->decode_ms = decode_ms;

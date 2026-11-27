@@ -1,6 +1,7 @@
 #pragma once
 
 #include <charconv>
+#include <cmath>
 #include <filesystem>
 #include <stdexcept>
 #include <string>
@@ -24,6 +25,8 @@ struct SpeculativeArgs {
     int draft_tokens = 4;
     bool draft_tokens_set = false;
     bool mtp = false;
+    float p_min = 0.1f;
+    bool p_min_set = false;
 
     bool parse(std::string_view option, std::string_view value) {
         if (option == "--spec-ngram") ngram = parse_integer(option, value);
@@ -31,6 +34,12 @@ struct SpeculativeArgs {
         else if (option == "--draft-tokens") {
             draft_tokens = parse_integer(option, value);
             draft_tokens_set = true;
+        } else if (option == "--spec-p-min") {
+            const auto* end = value.data() + value.size();
+            const auto result = std::from_chars(value.data(), end, p_min);
+            if (result.ec != std::errc{} || result.ptr != end || !std::isfinite(p_min) || p_min < 0 || p_min > 1)
+                throw std::invalid_argument("--spec-p-min must be a number in [0, 1]");
+            p_min_set = true;
         } else return false;
         return true;
     }
@@ -38,6 +47,7 @@ struct SpeculativeArgs {
     bool enabled() const { return ngram > 0 || !draft_path.empty() || mtp; }
 
     void validate(bool has_target) const {
+        if (p_min_set && !mtp) throw std::invalid_argument("--spec-p-min requires --spec-mtp");
         if (ngram < 0 || draft_tokens <= 0 || (draft_tokens_set && draft_path.empty() && !mtp))
             throw std::invalid_argument("Expected --spec-ngram >= 0 and --draft-tokens > 0 with --draft-model or --spec-mtp");
         if (mtp && (!has_target || ngram > 0 || !draft_path.empty()))
