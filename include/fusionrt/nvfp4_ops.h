@@ -10,7 +10,8 @@ bool nvfp4_device_supported(int device = 0);
 
 // cols is the number of unpacked elements and must be divisible by 16.
 // One UE4M3 byte per 16 elements, padded to 128 rows and four scale columns
-// and stored in cuBLASLt VEC16_UE4M3 tile order.
+// and stored in cuBLASLt VEC16_UE4M3 tile order. Scale bytes are unsigned:
+// bit 7 is ignored when decoding the scale.
 size_t nvfp4_swizzled_scale_bytes(int rows, int cols);
 
 // All pointers refer to contiguous device buffers on the current device.
@@ -40,6 +41,8 @@ size_t nvfp4_linear_workspace_bytes(int M, int N, int K);
 // w_global_scale and positive x_global_scale are finite multipliers.
 // A finite x_global_scale <= 0 selects amax-based scaling on stream.
 // Empty output dimensions are a no-op. Nonempty calls require K % 16 == 0.
+// Run a nonempty nvfp4_linear call on the current device before capturing
+// this operation in a CUDA Graph, so the device's cuBLASLt handle is initialized.
 void nvfp4_linear(const void* x, DType x_dtype, const uint8_t* w_qdata,
                   const uint8_t* w_scales_swizzled, float w_global_scale, float x_global_scale,
                   const void* bias, DType bias_dtype, void* y, DType y_dtype,

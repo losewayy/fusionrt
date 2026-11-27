@@ -12,6 +12,12 @@ __device__ __forceinline__ float4 load_f32x4(const float* p) {
     else return {p[0], p[1], p[2], p[3]};
 }
 
+template<bool Aligned>
+__device__ __forceinline__ float2 load_f32x2(const float* p) {
+    if constexpr (Aligned) return __ldg(reinterpret_cast<const float2*>(p));
+    else return {p[0], p[1]};
+}
+
 bool aligned_rows(const float* a, const float* b, const void* c, int stride) {
     // All rows can use a vector load only when both the bases and the row stride align.
     return stride % 4 == 0 &&
@@ -144,7 +150,7 @@ __global__ void k_fused_rmsnorm_linear_f32(const float* __restrict__ x,
     }
 }
 
-template <int WARPS_PER_BLOCK, bool HAS_NORM>
+template <int WARPS_PER_BLOCK, bool HAS_NORM, bool AlignedX = true>
 __global__ void k_quant_gemv_q8_0(const float* __restrict__ x,
                                   const float* __restrict__ norm_w,
                                   const BlockQ8_0* __restrict__ w,
@@ -202,7 +208,7 @@ __global__ void k_quant_gemv_q8_0(const float* __restrict__ x,
             q0 *= nw4.x; q1 *= nw4.y; q2 *= nw4.z; q3 *= nw4.w;
         }
         for (int m = 0; m < M; ++m) {
-            float4 x4 = __ldg(reinterpret_cast<const float4*>(x + static_cast<int64_t>(m) * K + k_off));
+            float4 x4 = load_f32x4<AlignedX>(x + static_cast<int64_t>(m) * K + k_off);
             acc[m] += q0 * x4.x + q1 * x4.y + q2 * x4.z + q3 * x4.w;
         }
     }
@@ -213,7 +219,7 @@ __global__ void k_quant_gemv_q8_0(const float* __restrict__ x,
     }
 }
 
-template <int WARPS_PER_BLOCK, bool HAS_NORM>
+template <int WARPS_PER_BLOCK, bool HAS_NORM, bool AlignedX = true>
 __global__ void k_quant_gemv_q4_0(const float* __restrict__ x,
                                   const float* __restrict__ norm_w,
                                   const BlockQ4_0* __restrict__ w,
@@ -275,8 +281,8 @@ __global__ void k_quant_gemv_q4_0(const float* __restrict__ x,
         }
         for (int m = 0; m < M; ++m) {
             const float* xm = x + static_cast<int64_t>(m) * K;
-            float2 xl = __ldg(reinterpret_cast<const float2*>(xm + k_lo));
-            float2 xh = __ldg(reinterpret_cast<const float2*>(xm + k_hi));
+            float2 xl = load_f32x2<AlignedX>(xm + k_lo);
+            float2 xh = load_f32x2<AlignedX>(xm + k_hi);
             acc[m] += q0 * xl.x + q1 * xl.y + q2 * xh.x + q3 * xh.y;
         }
     }
@@ -287,7 +293,7 @@ __global__ void k_quant_gemv_q4_0(const float* __restrict__ x,
     }
 }
 
-template <int WARPS_PER_BLOCK, bool HAS_NORM>
+template <int WARPS_PER_BLOCK, bool HAS_NORM, bool AlignedX = true>
 __global__ void k_quant_gemv_q4_1(const float* __restrict__ x,
                                   const float* __restrict__ norm_w,
                                   const BlockQ4_1* __restrict__ w,
@@ -349,8 +355,8 @@ __global__ void k_quant_gemv_q4_1(const float* __restrict__ x,
         }
         for (int m = 0; m < M; ++m) {
             const float* xm = x + static_cast<int64_t>(m) * K;
-            float2 xl = __ldg(reinterpret_cast<const float2*>(xm + k_lo));
-            float2 xh = __ldg(reinterpret_cast<const float2*>(xm + k_hi));
+            float2 xl = load_f32x2<AlignedX>(xm + k_lo);
+            float2 xh = load_f32x2<AlignedX>(xm + k_hi);
             acc[m] += q0 * xl.x + q1 * xl.y + q2 * xh.x + q3 * xh.y;
         }
     }
@@ -1358,12 +1364,16 @@ void fused_gemv_q8_0(const float* x, const void* w_q8, float* y,
     }
     constexpr int WARPS = 8;
     int blocks = (N + WARPS - 1) / WARPS;
-    for (int m0 = 0; m0 < M; m0 += 8) {
-        int mc = std::min(8, M - m0);
-        k_quant_gemv_q8_0<WARPS, false><<<blocks, WARPS * 32, 0, stream>>>(
-            x + static_cast<int64_t>(m0) * K, nullptr, static_cast<const BlockQ8_0*>(w_q8),
-            y + static_cast<int64_t>(m0) * N, mc, N, K, 0.0f);
-    }
+    auto launch = [&]<bool Aligned>() {
+        for (int m0 = 0; m0 < M; m0 += 8) {
+            int mc = std::min(8, M - m0);
+            k_quant_gemv_q8_0<WARPS, false, Aligned><<<blocks, WARPS * 32, 0, stream>>>(
+                x + static_cast<int64_t>(m0) * K, nullptr, static_cast<const BlockQ8_0*>(w_q8),
+                y + static_cast<int64_t>(m0) * N, mc, N, K, 0.0f);
+        }
+    };
+    if (aligned_rows(x, nullptr, nullptr, K)) launch.template operator()<true>();
+    else launch.template operator()<false>();
 }
 
 void fused_gemv_q4_0(const float* x, const void* w_q4, float* y,
@@ -1374,12 +1384,16 @@ void fused_gemv_q4_0(const float* x, const void* w_q4, float* y,
     }
     constexpr int WARPS = 8;
     int blocks = (N + WARPS - 1) / WARPS;
-    for (int m0 = 0; m0 < M; m0 += 8) {
-        int mc = std::min(8, M - m0);
-        k_quant_gemv_q4_0<WARPS, false><<<blocks, WARPS * 32, 0, stream>>>(
-            x + static_cast<int64_t>(m0) * K, nullptr, static_cast<const BlockQ4_0*>(w_q4),
-            y + static_cast<int64_t>(m0) * N, mc, N, K, 0.0f);
-    }
+    auto launch = [&]<bool Aligned>() {
+        for (int m0 = 0; m0 < M; m0 += 8) {
+            int mc = std::min(8, M - m0);
+            k_quant_gemv_q4_0<WARPS, false, Aligned><<<blocks, WARPS * 32, 0, stream>>>(
+                x + static_cast<int64_t>(m0) * K, nullptr, static_cast<const BlockQ4_0*>(w_q4),
+                y + static_cast<int64_t>(m0) * N, mc, N, K, 0.0f);
+        }
+    };
+    if (K % 2 == 0 && reinterpret_cast<uintptr_t>(x) % alignof(float2) == 0) launch.template operator()<true>();
+    else launch.template operator()<false>();
 }
 
 template <int WK>
@@ -1431,12 +1445,16 @@ void fused_gemv_q4_1(const float* x, const void* w_q4_1, float* y,
     }
     constexpr int WARPS = 8;
     int blocks = (N + WARPS - 1) / WARPS;
-    for (int m0 = 0; m0 < M; m0 += 8) {
-        int mc = std::min(8, M - m0);
-        k_quant_gemv_q4_1<WARPS, false><<<blocks, WARPS * 32, 0, stream>>>(
-            x + static_cast<int64_t>(m0) * K, nullptr, static_cast<const BlockQ4_1*>(w_q4_1),
-            y + static_cast<int64_t>(m0) * N, mc, N, K, 0.0f);
-    }
+    auto launch = [&]<bool Aligned>() {
+        for (int m0 = 0; m0 < M; m0 += 8) {
+            int mc = std::min(8, M - m0);
+            k_quant_gemv_q4_1<WARPS, false, Aligned><<<blocks, WARPS * 32, 0, stream>>>(
+                x + static_cast<int64_t>(m0) * K, nullptr, static_cast<const BlockQ4_1*>(w_q4_1),
+                y + static_cast<int64_t>(m0) * N, mc, N, K, 0.0f);
+        }
+    };
+    if (K % 2 == 0 && reinterpret_cast<uintptr_t>(x) % alignof(float2) == 0) launch.template operator()<true>();
+    else launch.template operator()<false>();
 }
 
 void fused_gemv_q4_k(const float* x, const void* w_q4_k, float* y,

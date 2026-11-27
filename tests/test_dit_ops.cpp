@@ -214,7 +214,7 @@ struct Accuracy {
 
 Accuracy accuracy_case(const WeightFixture& weights, const DeviceBuffer& w, DType w_dtype, DType x_dtype,
                        DType y_dtype, DType bias_dtype, int M, int N, int K, cudaStream_t stream,
-                       bool use_bias = true, bool unaligned = false) {
+                       bool use_bias = true, bool unaligned = false, const CostHardware& hw = {}) {
     const size_t x_size = dtype_type_size(x_dtype), y_size = dtype_type_size(y_dtype);
     const size_t bias_size = dtype_type_size(bias_dtype);
     auto x = values(static_cast<size_t>(M) * K, 14);
@@ -232,7 +232,7 @@ Accuracy accuracy_case(const WeightFixture& weights, const DeviceBuffer& w, DTyp
 
     dit_linear_quantized(dx.data(x_offset), x_dtype, w.ptr, w_dtype,
                          use_bias ? db.data(bias_offset) : nullptr, bias_dtype, dy.data(y_offset), y_dtype,
-                         M, N, K, workspace.ptr, bytes, stream);
+                         M, N, K, workspace.ptr, bytes, stream, hw);
     const auto got = download_floats(dy, static_cast<size_t>(M) * N, y_dtype, stream, y_offset);
     Accuracy a;
     double dot = 0, ref_l2 = 0, got_l2 = 0, diff_l2 = 0, ref_max = 0;
@@ -292,6 +292,11 @@ void test_dit_accuracy(cudaStream_t stream) {
                       << " M=17 max_abs=" << a.max_abs << " rel_l2=" << a.rel_l2 << " cos=" << a.cosine << '\n';
         }
         record(accuracy_case(fixture, w, w_dtype, DType::F32, DType::F32, DType::F32, 1, N, K, stream, false));
+        if (w_dtype == DType::Q8_0 || w_dtype == DType::Q4_0 || w_dtype == DType::Q4_1) {
+            record(accuracy_case(fixture, w, w_dtype, DType::F32, DType::F32, DType::F32, 9, N, K,
+                                 stream, false, true));
+            std::cout << "  [PASS] DiT " << dtype_name(w_dtype) << " FP32 GEMV with a one-float input offset\n";
+        }
         record(accuracy_case(fixture, w, w_dtype, DType::BF16, DType::F16, DType::F32, 5, N, K, stream, true, true));
         record(accuracy_case(fixture, w, w_dtype, DType::F16, DType::BF16, DType::BF16, 9, N, K, stream, false));
         if (has_weight_codec_int8(w_dtype))
@@ -358,6 +363,46 @@ void test_dit_helpers(cudaStream_t stream) {
         dit_quantize_x_q8_1(nullptr, DType::F16, nullptr, 1, 33, stream);
     }, "DiT accepted an incomplete Q8_1 block");
     std::cout << "  [PASS] DiT Q8_1 quantization, non-finite inputs, scalar alignment, F32 casting and validation\n";
+}
+
+void test_raw_mmq(cudaStream_t stream) {
+    using Launch = decltype(&mmq_q6_k_q8_1);
+    struct Format {
+        DType dtype;
+        Launch launch;
+    };
+    constexpr Format formats[] = {
+        {DType::Q6_K, mmq_q6_k_q8_1}, {DType::Q6_A, mmq_q6_a_q8_1}, {DType::Q8_A, mmq_q8_a_q8_1},
+    };
+    constexpr int K = 768;
+    const DeviceBuffer x(sizeof(BlockQ8_1) * (K / 32));
+    const DeviceBuffer w(sizeof(BlockQ8_A) * (K / 256));
+    const DeviceBuffer y(2 * sizeof(float));
+    // Favor operand reuse so the exact and partial tiles both take the 128x128 path.
+    const CostHardware hw{.sm_count = 1, .int8_tc_tflops = 1000};
+    for (const auto [dtype, launch] : formats) {
+        require_invalid([&] { launch(x.ptr, w.ptr, y.data<float>(), 1, 1, 32, stream, hw); },
+                        "Raw MMQ accepted K=32");
+        require_invalid([&] { launch(x.data(4), w.ptr, y.data<float>(), 1, 1, K, stream, hw); },
+                        "Raw MMQ accepted a misaligned Q8_1 buffer");
+        require_invalid([&] {
+            launch(x.ptr, w.data(dtype == DType::Q6_K ? 1 : 2), y.data<float>(), 1, 1, K, stream, hw);
+        }, "Raw MMQ accepted a misaligned weight buffer");
+        require_invalid([&] { launch(x.ptr, w.ptr, y.data<float>(1), 1, 1, K, stream, hw); },
+                        "Raw MMQ accepted a misaligned FP32 output");
+        require_invalid([&] { launch(x.ptr, w.ptr, y.data<float>(), 65535 * 128 + 1, 1, K, stream, hw); },
+                        "Raw MMQ accepted a shape exceeding the CUDA grid Y limit");
+        for (const auto [M, N] : {std::array{128, 128}, std::array{255, 253}}) {
+            require(select_mmq_tile(hw, M, N, K, dtype_type_size(dtype), true, true) == MmqTileConfig::M128N128,
+                    "MMQ test shape did not select the 128x128 tile");
+            const auto fixture = make_weight(dtype, N, K);
+            const DeviceBuffer weight(fixture.packed.size());
+            weight.upload(fixture.packed.data(), fixture.packed.size(), stream);
+            accuracy_case(fixture, weight, dtype, DType::F32, DType::F32, DType::F32, M, N, K,
+                          stream, false, false, hw);
+        }
+        std::cout << "  [PASS] Raw MMQ " << dtype_name(dtype) << " validation, full 128x128 tile and dual-axis tail\n";
+    }
 }
 
 void test_dit_tiles(cudaStream_t stream) {
@@ -492,6 +537,7 @@ void run_dit_ops_tests() {
     const Stream stream;
     test_dit_helpers(stream.value);
     test_dit_accuracy(stream.value);
+    test_raw_mmq(stream.value);
     test_dit_tiles(stream.value);
 }
 

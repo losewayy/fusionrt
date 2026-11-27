@@ -78,6 +78,10 @@ bool project_q4_a_and_q8_a(const void* x, const void* q4, const void* q8, float*
 
 void mmq_q4_a_q8_1(const void* x_q8, const void* w, float* y, int M, int N, int K, cudaStream_t stream,
                      const CostHardware& hw = {});
+// Q8_A, Q6_K and Q6_A MMQ require nonnegative M and N. An empty output is a no-op.
+// Nonempty calls require a positive K divisible by 256 and contiguous device
+// buffers aligned to 16 bytes for Q8_1, Q6_A and Q8_A, 2 bytes for Q6_K, and
+// 4 bytes for FP32 output. Invalid inputs or a grid exceeding CUDA limits throw.
 void mmq_q8_a_q8_1(const void* x_q8, const void* w, float* y, int M, int N, int K, cudaStream_t stream,
                      const CostHardware& hw = {});
 void mmq_q6_k_q8_1(const void* x_q8, const void* w, float* y, int M, int N, int K, cudaStream_t stream,

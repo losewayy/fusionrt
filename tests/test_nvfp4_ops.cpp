@@ -238,7 +238,7 @@ void test_small_linear(cudaStream_t stream) {
     }
     for (size_t block = 0; block < linear_scales.size(); ++block) {
         const auto scale = static_cast<uint8_t>(0x30 + block);
-        linear_scales[block] = scale;
+        linear_scales[block] = scale | (block % 2 ? 0x80u : 0u);
         for (size_t i = 0; i < 16; i += 2) {
             const size_t first = (i + block * 3) % 16, second = (first + 7) % 16;
             raw_weights[block * 8 + i / 2] = static_cast<uint8_t>((first << 4) | second);
@@ -249,7 +249,7 @@ void test_small_linear(cudaStream_t stream) {
 
     Buffer<uint16_t> dx(x_count);
     Buffer<uint16_t> db16(s.n);
-    Buffer<float> dy(y_count + 1), db(s.n);
+    Buffer<float> dy(y_count + 1), db(s.n), dw(w.size());
     Buffer<> qw(raw_weights.size()), scales(nvfp4_swizzled_scale_bytes(s.n, s.k));
     Buffer<> scales_linear(linear_scales.size());
     const size_t workspace_bytes = nvfp4_linear_workspace_bytes(s.m, s.n, s.k);
@@ -259,6 +259,9 @@ void test_small_linear(cudaStream_t stream) {
     qw.upload(raw_weights, stream);
     scales_linear.upload(linear_scales, stream);
     nvfp4_swizzle_scales(scales_linear.ptr, scales.ptr, s.n, s.k, stream);
+    nvfp4_dequantize_2d(qw.ptr, scales.ptr, w_global, dw.ptr, DType::F32, s.n, s.k, stream);
+    const auto dequantized = dw.download(w.size(), stream);
+    require(dequantized == w, "NVFP4 dequantization must ignore UE4M3 bit 7");
 
     auto run = [&](float global, size_t bytes) {
         nvfp4_linear(dx.ptr, DType::BF16, qw.ptr, scales.ptr, w_global, global, db.ptr, DType::F32,
@@ -271,13 +274,25 @@ void test_small_linear(cudaStream_t stream) {
         rejected = true;
     }
     require(rejected, "NVFP4 accepted undersized workspace");
+    cudaGraph_t cold_graph = nullptr;
+    bool needs_warmup = false;
+    check(cudaStreamBeginCapture(stream, cudaStreamCaptureModeThreadLocal));
+    try {
+        run(x_global, workspace_bytes);
+    } catch (const std::runtime_error& e) {
+        needs_warmup = std::string_view(e.what()).find("before CUDA Graph capture") != std::string_view::npos;
+    }
+    check(cudaStreamEndCapture(stream, &cold_graph));
+    check(cudaGraphDestroy(cold_graph));
+    require(needs_warmup, "Cold NVFP4 CUDA Graph capture must ask for warmup");
+
     run(x_global, workspace_bytes);
     const auto actual = dy.download(y_count, stream, 1);
     for (int row = 0; row < s.m; ++row) {
         for (int col = 0; col < s.n; ++col) {
             float sum = 0.0f;
-            for (int k = 0; k < s.k; ++k) sum += x[row * s.k + k] * w[col * s.k + k];
-            require(actual[row * s.n + col] == sum + bias[col], "NVFP4 native FP4 dot-product mismatch");
+            for (int k = 0; k < s.k; ++k) sum += x[row * s.k + k] * dequantized[col * s.k + k];
+            require(actual[row * s.n + col] == sum + bias[col], "NVFP4 UE4M3 bit-7 native GEMM parity mismatch");
         }
     }
 
@@ -313,7 +328,7 @@ void test_small_linear(cudaStream_t stream) {
         require(dy.download(y_count, stream) == zero, "NVFP4 narrow bias mismatch");
     }
     require(nvfp4_linear_workspace_bytes(0, 5, 0) == 0, "NVFP4 empty output requires workspace");
-    std::cout << "  [GEMM] exact CPU dot product with checkpoint-layout weights, odd shape, graph replay\n";
+    std::cout << "  [PASS] NVFP4 UE4M3 bit-7 GEMM parity, cold capture rejection and warm graph replay\n";
 }
 
 void test_accuracy(cudaStream_t stream) {

@@ -32,6 +32,8 @@ This is a personal research codebase for exploring custom quantized GPU kernels,
 
 Requires CMake 3.24+ and a C++20 compiler (CUDA and Vulkan are optional; default CUDA arch is `native`, override via `-DCMAKE_CUDA_ARCHITECTURES=...`).
 
+GGUF CUDA kernels require CUDA Toolkit 12.0+ and an `sm_80+` GPU. Optional NVFP4 operators require CUDA Toolkit 12.8+ with FP4-capable cuBLASLt and an `sm_120+` GPU.
+
 ```bash
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j

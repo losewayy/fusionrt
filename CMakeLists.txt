@@ -16,6 +16,13 @@ option(FUSIONRT_ENABLE_CUDA "Enable CUDA backend" ON)
 option(FUSIONRT_ENABLE_VULKAN "Enable Vulkan backend" ON)
 
 if(FUSIONRT_ENABLE_CUDA)
+    foreach(arch IN LISTS CMAKE_CUDA_ARCHITECTURES)
+        if(arch MATCHES "^([0-9]+)(-real|-virtual)?$")
+            if(CMAKE_MATCH_1 LESS 80)
+                message(FATAL_ERROR "FusionRT CUDA MMQ kernels require sm_80+ (requested architecture: ${arch})")
+            endif()
+        endif()
+    endforeach()
     include(CheckLanguage)
     check_language(CUDA)
     if(CMAKE_CUDA_COMPILER)
@@ -23,6 +30,27 @@ if(FUSIONRT_ENABLE_CUDA)
         set(CMAKE_CUDA_STANDARD 20)
         set(CMAKE_CUDA_STANDARD_REQUIRED ON)
         find_package(CUDAToolkit REQUIRED)
+        set(FUSIONRT_HAS_NVFP4 0)
+        if(CUDAToolkit_VERSION VERSION_GREATER_EQUAL "12.8" AND TARGET CUDA::cublasLt)
+            include(CheckSourceCompiles)
+            include(CMakePushCheckState)
+            cmake_push_check_state(RESET)
+            set(CMAKE_REQUIRED_LIBRARIES CUDA::cublasLt)
+            set(CMAKE_REQUIRED_INCLUDES ${CUDAToolkit_INCLUDE_DIRS})
+            check_source_compiles(CUDA [[
+                #include <cuda_fp4.h>
+                #include <cublasLt.h>
+                int main() {
+                    static_cast<void>(CUDA_R_4F_E2M1);
+                    static_cast<void>(CUBLASLT_MATMUL_MATRIX_SCALE_VEC16_UE4M3);
+                    return 0;
+                }
+            ]] FUSIONRT_CUDA_HAS_FP4_HEADERS)
+            cmake_pop_check_state()
+            if(FUSIONRT_CUDA_HAS_FP4_HEADERS)
+                set(FUSIONRT_HAS_NVFP4 1)
+            endif()
+        endif()
     else()
         message(STATUS "CUDA compiler not found; building without CUDA backend")
         set(FUSIONRT_ENABLE_CUDA OFF)
@@ -92,8 +120,12 @@ if(FUSIONRT_ENABLE_CUDA)
         src/cuda/epilogue/hadamard_ops.cu
         src/cuda/epilogue/codec_moe_ops.cu
     )
-    target_compile_definitions(fusionrt_ops PUBLIC FUSIONRT_ENABLE_CUDA=1)
-    target_link_libraries(fusionrt_ops PUBLIC CUDA::cudart CUDA::cuda_driver CUDA::cublas CUDA::cublasLt)
+    target_compile_definitions(fusionrt_ops PUBLIC
+        FUSIONRT_ENABLE_CUDA=1 FUSIONRT_HAS_NVFP4=${FUSIONRT_HAS_NVFP4})
+    target_link_libraries(fusionrt_ops PUBLIC CUDA::cudart CUDA::cuda_driver CUDA::cublas)
+    if(FUSIONRT_HAS_NVFP4)
+        target_link_libraries(fusionrt_ops PUBLIC CUDA::cublasLt)
+    endif()
     if(TARGET CUDA::nvml)
         target_link_libraries(fusionrt_ops PUBLIC CUDA::nvml)
         target_compile_definitions(fusionrt_ops PUBLIC FUSIONRT_HAS_NVML=1)

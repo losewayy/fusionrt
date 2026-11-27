@@ -1,5 +1,9 @@
 #include "fusionrt/nvfp4_ops.h"
 
+#include <stdexcept>
+
+#if !defined(FUSIONRT_HAS_NVFP4) || FUSIONRT_HAS_NVFP4
+
 #include <cublasLt.h>
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
@@ -10,7 +14,6 @@
 #include <cmath>
 #include <limits>
 #include <mutex>
-#include <stdexcept>
 #include <string>
 #include <type_traits>
 #include <unordered_map>
@@ -141,7 +144,7 @@ __device__ size_t scale_offset(size_t row, int block, int padded_cols) {
 
 __device__ float decode_scale(uint8_t value) {
     __nv_fp8_e4m3 scale;
-    scale.__x = value;
+    scale.__x = value & 0x7fu;
     return static_cast<float>(scale);
 }
 
@@ -368,10 +371,16 @@ public:
     cublasLtHandle_t handle{};
 };
 
-cublasLtHandle_t lt_handle_for(int device) {
+cublasLtHandle_t lt_handle_for(int device, cudaStream_t stream) {
     static std::mutex mutex;
     static std::unordered_map<int, LtHandle> handles;
     const std::lock_guard lock(mutex);
+    if (auto it = handles.find(device); it != handles.end()) return it->second.handle;
+
+    cudaStreamCaptureStatus status;
+    check_cuda(cudaStreamIsCapturing(stream, &status), "cudaStreamIsCapturing (NVFP4)");
+    if (status != cudaStreamCaptureStatusNone)
+        throw std::runtime_error("Run nvfp4_linear once before CUDA Graph capture to initialize cuBLASLt");
     return handles.try_emplace(device).first->second.handle;
 }
 
@@ -490,7 +499,7 @@ void nvfp4_linear(const void* x, DType x_dtype, const uint8_t* w_qdata,
     check_cuda(cudaGetDevice(&device), "cudaGetDevice");
     if (!nvfp4_device_supported(device))
         throw std::runtime_error("NVFP4 linear requires an sm_120+ GPU and FP4-capable cuBLASLt");
-    const auto handle = lt_handle_for(device);
+    const auto handle = lt_handle_for(device, stream);
 
     auto* buf = static_cast<uint8_t*>(workspace);
     Scalars* scalars = nullptr;
@@ -551,3 +560,39 @@ void nvfp4_linear(const void* x, DType x_dtype, const uint8_t* w_qdata,
 }
 
 }  // namespace fusionrt::cuda_ops
+
+#else
+
+namespace fusionrt::cuda_ops {
+namespace {
+
+[[noreturn]] void nvfp4_unavailable() {
+    throw std::runtime_error("NVFP4 was built without FP4 support; CUDA Toolkit 12.8+ with FP4-capable cuBLASLt is required");
+}
+
+}  // namespace
+
+bool nvfp4_device_supported(int) { return false; }
+
+size_t nvfp4_swizzled_scale_bytes(int, int) { nvfp4_unavailable(); }
+
+void nvfp4_quantize_2d(const void*, DType, float, uint8_t*, uint8_t*, int, int, cudaStream_t) {
+    nvfp4_unavailable();
+}
+
+void nvfp4_swizzle_scales(const uint8_t*, uint8_t*, int, int, cudaStream_t) { nvfp4_unavailable(); }
+
+void nvfp4_dequantize_2d(const uint8_t*, const uint8_t*, float, void*, DType, int, int, cudaStream_t) {
+    nvfp4_unavailable();
+}
+
+size_t nvfp4_linear_workspace_bytes(int, int, int) { nvfp4_unavailable(); }
+
+void nvfp4_linear(const void*, DType, const uint8_t*, const uint8_t*, float, float, const void*, DType,
+                  void*, DType, int, int, int, void*, size_t, cudaStream_t) {
+    nvfp4_unavailable();
+}
+
+}  // namespace fusionrt::cuda_ops
+
+#endif

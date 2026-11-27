@@ -5,11 +5,19 @@
 
 #include <algorithm>
 #include <iterator>
+#include <limits>
+#include <stdexcept>
 #include <utility>
 
 namespace fusionrt::cuda_ops {
 
 namespace {
+
+dim3 matrix_grid(int M, int N, int tile_m, int tile_n) {
+    const auto rows = cost_detail::ceil_div(M, tile_m);
+    if (rows > 65535) throw std::invalid_argument("Matrix launch exceeds CUDA grid Y limit (65535)");
+    return {static_cast<unsigned>(cost_detail::ceil_div(N, tile_n)), static_cast<unsigned>(rows)};
+}
 
 __global__ void k_linear_gemm_tiled_f32(const float* __restrict__ x, const float* __restrict__ w,
                                         float* __restrict__ y, int M, int N, int K) {
@@ -44,9 +52,9 @@ __global__ void k_gemm_wmma(const float* __restrict__ x,
                             float* __restrict__ y,
                             int M, int N, int K, float eps) {
     // Tile 32(M) x 64(N) x 32(K) using 4 warps (128 threads), 2x2 warp grid of 16x32 each
-    __shared__ half sA[32][40];
-    __shared__ half sB[64][40];
-    __shared__ float sC[4][256];
+    alignas(32) __shared__ half sA[32][40];
+    alignas(32) __shared__ half sB[64][40];
+    alignas(32) __shared__ float sC[4][256];
     __shared__ float red_buf[32];
     __shared__ float inv_rms_sh[32];
 
@@ -233,7 +241,7 @@ __device__ __forceinline__ void load_raw_q6_tile(const BlockQ6_K* w, MmqTile<BN,
     for (int base = 0; base < BN; base += rows_per_pass) {
         const int n = base + row;
         if (BN % rows_per_pass != 0 && n >= BN) break;
-        const auto* src = w + static_cast<int64_t>(min(n0 + n, N - 1)) * stride + kb / 8;
+        const auto* src = w + static_cast<int64_t>(n0 + min(n, N - 1 - n0)) * stride + kb / 8;
         const auto* low = src->ql + part * 64 + half * 16 + word * 4;
         const auto* high = src->qh + part * 32 + half * 16 + word * 4;
         const unsigned ql0 = load_raw_q6_word(low);
@@ -288,7 +296,7 @@ __device__ __forceinline__ void load_mmq_tile(
                 if constexpr (mmq_codec<W>) return W::Codec::kBlockSize;
                 else return 256;
             }();
-            const W& src = w[static_cast<int64_t>(min(n0 + n, N - 1)) * (K / block_elems) + xsub / (block_elems / 32)];
+            const W& src = w[static_cast<int64_t>(n0 + min(n, N - 1 - n0)) * (K / block_elems) + xsub / (block_elems / 32)];
             constexpr int words = mmq_packed_q4<W> ? 4 : 8;
             auto* dst = reinterpret_cast<uint4*>(ws.qs[n] + slot * words);
             if constexpr (mmq_codec<W>) {
@@ -531,7 +539,7 @@ __device__ __forceinline__ void mmq_q8_1_tile(const BlockQ8_1* __restrict__ x, c
         int i0 = m0 + warp_m + mi * 16 + group, i1 = i0 + 8;
         #pragma unroll
         for (int ni = 0; ni < WN; ++ni) {
-            int j0 = n0 + warp_n + ni * 8 + word * 2, j1 = j0 + 1;
+            const int64_t j0 = static_cast<int64_t>(n0) + warp_n + ni * 8 + word * 2, j1 = j0 + 1;
             const auto& f = acc[mi][ni];
             if constexpr (BM == 128 && (split_scale || std::is_same_v<W, BlockQ8_A>)) {
                 if (N % 2 == 0 && reinterpret_cast<uintptr_t>(y) % alignof(float2) == 0) {
@@ -558,9 +566,9 @@ __global__ void k_mmq_q8_1(const BlockQ8_1* x, const W* w, float* y, int M, int 
         constexpr int rows_per_group = 4;
         const int first = mt / rows_per_group * rows_per_group;
         const int rows = min(rows_per_group, static_cast<int>(gridDim.y) - first);
-        const int tile = (mt - first) * gridDim.x + nt;
-        mt = first + tile % rows;
-        nt = tile / rows;
+        const int64_t tile = static_cast<int64_t>(mt - first) * gridDim.x + nt;
+        mt = first + static_cast<int>(tile % rows);
+        nt = static_cast<int>(tile / rows);
     }
     if constexpr (sizeof(Buffers) > 48 * 1024) {
         extern __shared__ __align__(16) unsigned char mmq_smem[];
@@ -593,7 +601,7 @@ __global__ void k_mmq_q4_a_and_q8_a(const BlockQ8_1* x, const BlockQ4_A* w4, con
 template <typename W, int BM, int BN, int WN, int BK = 4, int WM = BM / 16>
 void launch_mmq_tile(const BlockQ8_1* x, const W* w, float* y, int M, int N, int K, cudaStream_t stream) {
     constexpr int threads = (BM / (WM * 16)) * (BN / (WN * 8)) * 32;
-    dim3 grid((N + BN - 1) / BN, (M + BM - 1) / BM);
+    const dim3 grid = matrix_grid(M, N, BM, BN);
     constexpr int bytes = sizeof(MmqBuffers<W, BM, BN, BK>);
     constexpr int dynamic_bytes = bytes > 48 * 1024 ? bytes : 0;
     if constexpr (dynamic_bytes > 0) {
@@ -650,7 +658,19 @@ constexpr auto mmq_tile_menu(std::index_sequence<I...>) {
 template <typename W>
 void launch_mmq(const void* x, const void* w, float* y, int M, int N, int K, cudaStream_t stream,
                 const CostHardware& hw) {
-    if (M <= 0 || N <= 0 || K <= 0) return;
+    if constexpr (mmq_split_scale<W> || std::is_same_v<W, BlockQ8_A>) {
+        if (M < 0 || N < 0) throw std::invalid_argument("Invalid MMQ output dimensions");
+        if (M == 0 || N == 0) return;
+        if (K <= 0 || K % 256 != 0) throw std::invalid_argument("MMQ K must be a positive multiple of 256");
+        constexpr size_t weight_alignment = std::is_same_v<W, BlockQ6_K> ? 2 : 16;
+        if (!x || !w || !y || reinterpret_cast<uintptr_t>(x) % alignof(BlockQ8_1) != 0 ||
+            reinterpret_cast<uintptr_t>(w) % weight_alignment != 0 ||
+            reinterpret_cast<uintptr_t>(y) % alignof(float) != 0) {
+            throw std::invalid_argument("Missing or misaligned MMQ buffer");
+        }
+    } else if (M <= 0 || N <= 0 || K <= 0) {
+        return;
+    }
     auto* qx = static_cast<const BlockQ8_1*>(x);
     auto* qw = static_cast<const W*>(w);
     constexpr auto menu = mmq_tile_menu<W>(std::make_index_sequence<std::size(cost_detail::mmq_tiles)>{});
@@ -790,7 +810,7 @@ namespace matmul {
 void launch_gemm_tiled_f32(const float* x, const float* w, float* y,
                            int M, int N, int K, cudaStream_t stream) {
     dim3 block(16, 16);
-    dim3 grid((N + 15) / 16, (M + 15) / 16);
+    const dim3 grid = matrix_grid(M, N, 16, 16);
     k_linear_gemm_tiled_f32<<<grid, block, 0, stream>>>(x, w, y, M, N, K);
 }
 
@@ -798,7 +818,7 @@ template <int WK, bool HAS_NORM>
 void launch_wmma(const float* x, const float* norm_w, const void* w, float* y,
                  int M, int N, int K, float eps, cudaStream_t stream) {
     dim3 block(128);
-    dim3 grid((N + 63) / 64, (M + 31) / 32);
+    const dim3 grid = matrix_grid(M, N, 32, 64);
     k_gemm_wmma<WK, HAS_NORM><<<grid, block, 0, stream>>>(x, norm_w, w, y, M, N, K, eps);
 }
 
@@ -823,10 +843,13 @@ template void launch_wmma<10, false>(const float*, const float*, const void*, fl
 
 void launch_mmq_q4_a_and_q8_a(const BlockQ8_1* x, const BlockQ4_A* w4, const BlockQ8_A* w8,
                               float* y4, float* y8, int M, int N4, int N8, int K, cudaStream_t stream) {
-    const int q4_tiles = (N4 + 127) / 128;
-    const int q4_blocks = q4_tiles * ((M + 63) / 64);
-    k_mmq_q4_a_and_q8_a<<<q4_blocks + (M + 15) / 16, 256, 0, stream>>>(
-        x, w4, w8, y4, y8, M, N4, N8, K, q4_tiles, q4_blocks);
+    const auto q4_tiles = cost_detail::ceil_div(N4, 128);
+    const auto q4_blocks = q4_tiles * cost_detail::ceil_div(M, 64);
+    const auto blocks = q4_blocks + cost_detail::ceil_div(M, 16);
+    if (blocks > std::numeric_limits<int>::max())
+        throw std::invalid_argument("Fused MMQ exceeds CUDA grid X limit");
+    k_mmq_q4_a_and_q8_a<<<static_cast<unsigned>(blocks), 256, 0, stream>>>(
+        x, w4, w8, y4, y8, M, N4, N8, K, static_cast<int>(q4_tiles), static_cast<int>(q4_blocks));
 }
 
 }  // namespace matmul
