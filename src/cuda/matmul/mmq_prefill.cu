@@ -729,6 +729,7 @@ template void launch_wmma<6, true>(const float*, const float*, const void*, floa
 template void launch_wmma<7, false>(const float*, const float*, const void*, float*, int, int, int, float, cudaStream_t);
 template void launch_wmma<8, false>(const float*, const float*, const void*, float*, int, int, int, float, cudaStream_t);
 template void launch_wmma<9, false>(const float*, const float*, const void*, float*, int, int, int, float, cudaStream_t);
+template void launch_wmma<10, false>(const float*, const float*, const void*, float*, int, int, int, float, cudaStream_t);
 
 void launch_mmq_q4_a_and_q8_a(const BlockQ8_1* x, const BlockQ4_A* w4, const BlockQ8_A* w8,
                               float* y4, float* y8, int M, int N4, int N8, int K, cudaStream_t stream) {
@@ -793,6 +794,9 @@ void dequantize_to_f16(const void* w, DType dt, uint16_t* out_f16, int N, int K,
         int total_b = N * (K >> 5);
         k_dequant_q4_1_to_f16<<<(total_b + 63) / 64, 256, 0, stream>>>(
             static_cast<const BlockQ4_1*>(w), out, total_b);
+    } else if (dt == DType::Q2_K) {
+        const int64_t total = static_cast<int64_t>(N) * K;
+        k_dequant_generic_to_f16<10><<<static_cast<int>((total + 255) / 256), 256, 0, stream>>>(w, out, N, K);
     } else if (dt == DType::Q5_K) {
         int64_t total = static_cast<int64_t>(N) * K;
         k_dequant_generic_to_f16<7><<<static_cast<int>((total + 255) / 256), 256, 0, stream>>>(w, out, N, K);

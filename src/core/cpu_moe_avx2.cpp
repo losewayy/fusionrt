@@ -1,7 +1,7 @@
 #include "cpu_moe.h"
 
 #ifdef __AVX2__
-#include <immintrin.h>
+#include "cpu_moe_x86_k.h"
 #endif
 
 namespace fusionrt {
@@ -118,6 +118,76 @@ float dot_q8_0(const uint8_t* row, const float* input, int cols) {
     return horizontal_sum(sum);
 }
 
+int sum_i32(__m256i sum) {
+    auto lanes = _mm_add_epi32(_mm256_castsi256_si128(sum), _mm256_extracti128_si256(sum, 1));
+    lanes = _mm_hadd_epi32(lanes, lanes);
+    return _mm_cvtsi128_si32(_mm_hadd_epi32(lanes, lanes));
+}
+
+float dot_q2_k_q8(const uint8_t* row, const CpuQ8K* input, int cols) {
+    float value;
+    cpu_moe_x86::dot_k_rows<BlockQ2_K, false, 1>(row, &input, cols, &value);
+    return value;
+}
+
+float dot_q4_k_q8(const uint8_t* row, const CpuQ8K* input, int cols) {
+    const auto* blocks = reinterpret_cast<const BlockQ4_K*>(row);
+    const auto nibble = _mm256_set1_epi8(15);
+    const auto ones = _mm256_set1_epi16(1);
+    float result = 0;
+    for (int i = 0; i < cols / 256; ++i) {
+        const auto& w = blocks[i];
+        const auto& x = input[i];
+        auto sum = _mm256_setzero_si256();
+        int bias = 0;
+        for (int pair = 0; pair < 4; ++pair) {
+            const auto packed = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(w.qs + pair * 32));
+            for (int j = 0; j < 2; ++j) {
+                const int sub = 2 * pair + j;
+                const auto q = _mm256_and_si256(j == 0 ? packed : _mm256_srli_epi16(packed, 4), nibble);
+                const auto a = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(x.values + sub * 32));
+                const unsigned sm = unpack_k_scale_min(w.scales, sub);
+                const auto dot = _mm256_madd_epi16(_mm256_maddubs_epi16(q, a), ones);
+                sum = _mm256_add_epi32(sum, _mm256_mullo_epi32(dot, _mm256_set1_epi32(sm & 63)));
+                bias += static_cast<int>(sm >> 8) * (x.sums[2 * sub] + x.sums[2 * sub + 1]);
+            }
+        }
+        result += x.scale * (fp16_to_fp32(w.d) * sum_i32(sum) - fp16_to_fp32(w.dmin) * bias);
+    }
+    return result;
+}
+
+float dot_q6_k_q8(const uint8_t* row, const CpuQ8K* input, int cols) {
+    const auto* blocks = reinterpret_cast<const BlockQ6_K*>(row);
+    const auto nibble = _mm256_set1_epi8(15), two_bits = _mm256_set1_epi8(3);
+    float result = 0;
+    for (int i = 0; i < cols / 256; ++i) {
+        const auto& w = blocks[i];
+        const auto& x = input[i];
+        auto sum = _mm256_setzero_si256();
+        int bias = 0;
+        for (int half = 0; half < 2; ++half) {
+            const auto high = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(w.qh + half * 32));
+            for (int part = 0; part < 4; ++part) {
+                const auto packed = _mm256_loadu_si256(
+                    reinterpret_cast<const __m256i*>(w.ql + half * 64 + (part % 2) * 32));
+                const auto low = _mm256_and_si256(part < 2 ? packed : _mm256_srli_epi16(packed, 4), nibble);
+                const auto bits = _mm256_and_si256(_mm256_srl_epi16(high, _mm_cvtsi32_si128(part * 2)), two_bits);
+                const auto q = _mm256_or_si256(low, _mm256_slli_epi16(bits, 4));
+                const int sub = half * 8 + part * 2;
+                const auto a = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(x.values + sub * 16));
+                const int lo = w.scales[sub], hi = w.scales[sub + 1];
+                const auto scale = _mm256_set_m128i(_mm_set1_epi16(static_cast<short>(hi)), _mm_set1_epi16(static_cast<short>(lo)));
+                // The unsigned six-bit codes have a zero point of 32.
+                sum = _mm256_add_epi32(sum, _mm256_madd_epi16(_mm256_maddubs_epi16(q, a), scale));
+                bias += lo * x.sums[sub] + hi * x.sums[sub + 1];
+            }
+        }
+        result += (fp16_to_fp32(w.d) * x.scale) * static_cast<float>(sum_i32(sum) - 32 * bias);
+    }
+    return result;
+}
+
 }  // namespace
 #endif
 
@@ -135,6 +205,60 @@ CpuMoeDot cpu_moe_avx2_dot(DType dtype) {
     (void)dtype;
 #endif
     return nullptr;
+}
+
+CpuMoeQ8Dot cpu_moe_avx2_q8_dot(DType dtype) {
+#ifdef __AVX2__
+    if (dtype == DType::Q2_K) return dot_q2_k_q8;
+    if (dtype == DType::Q4_K) return dot_q4_k_q8;
+    if (dtype == DType::Q6_K) return dot_q6_k_q8;
+#else
+    (void)dtype;
+#endif
+    return nullptr;
+}
+
+CpuMoeQ8Rows cpu_moe_avx2_q8_rows(DType dtype) {
+#ifdef __AVX2__
+    if (dtype == DType::Q2_K) return cpu_moe_x86::dot_k_dispatch<BlockQ2_K, false>;
+    if (dtype == DType::Q4_K) return cpu_moe_x86::dot_k_dispatch<BlockQ4_K, false>;
+    if (dtype == DType::Q6_K) return cpu_moe_x86::dot_k_dispatch<BlockQ6_K, false>;
+#else
+    (void)dtype;
+#endif
+    return nullptr;
+}
+
+void cpu_moe_avx2_quantize_q8(const float* input, CpuQ8K* output, int cols) {
+#ifdef __AVX2__
+    const auto sign_clear = _mm256_castsi256_ps(_mm256_set1_epi32(0x7fffffff));
+    const auto bias = _mm_set1_epi8(-128);
+    for (int i = 0; i < cols; i += 256) {
+        auto& block = output[i / 256];
+        auto maxima = _mm256_setzero_ps();
+        for (int j = 0; j < 256; j += 8)
+            maxima = _mm256_max_ps(maxima, _mm256_and_ps(_mm256_loadu_ps(input + i + j), sign_clear));
+        auto peak = _mm_max_ps(_mm256_castps256_ps128(maxima), _mm256_extractf128_ps(maxima, 1));
+        peak = _mm_max_ps(peak, _mm_movehl_ps(peak, peak));
+        peak = _mm_max_ss(peak, _mm_shuffle_ps(peak, peak, _MM_SHUFFLE(0, 0, 0, 1)));
+        const float max = _mm_cvtss_f32(peak);
+        block.scale = max / 127.0f;
+        const auto inv = _mm256_set1_ps(max > 0 ? 127.0f / max : 0.0f);
+        for (int sub = 0; sub < 16; ++sub) {
+            const float* x = input + i + sub * 16;
+            const auto a = _mm256_cvtps_epi32(_mm256_mul_ps(_mm256_loadu_ps(x), inv));
+            const auto b = _mm256_cvtps_epi32(_mm256_mul_ps(_mm256_loadu_ps(x + 8), inv));
+            const auto lo = _mm_packs_epi32(_mm256_castsi256_si128(a), _mm256_extracti128_si256(a, 1));
+            const auto hi = _mm_packs_epi32(_mm256_castsi256_si128(b), _mm256_extracti128_si256(b, 1));
+            const auto packed = _mm_packs_epi16(lo, hi);
+            _mm_storeu_si128(reinterpret_cast<__m128i*>(block.values + sub * 16), packed);
+            const auto sum = _mm_sad_epu8(_mm_xor_si128(packed, bias), _mm_setzero_si128());
+            block.sums[sub] = static_cast<int16_t>(_mm_cvtsi128_si32(sum) + _mm_extract_epi16(sum, 4) - 16 * 128);
+        }
+    }
+#else
+    (void)input; (void)output; (void)cols;
+#endif
 }
 
 }  // namespace fusionrt

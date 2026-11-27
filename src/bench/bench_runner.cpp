@@ -315,10 +315,51 @@ AbTimingResult measure_cuda_ab_interleaved(
 }
 #endif
 
-int run_benchmark_suite(const std::string& suite, const std::string& output_json_path, int vk_device_idx) {
+bool write_benchmark_report(std::ostream& output, const JsonObject& report) {
+    output << JsonValue(report).dump(2) << '\n';
+    return static_cast<bool>(output.flush());
+}
+
+int run_benchmark_suite(const std::string& suite, const std::string& output_json_path, std::optional<int> vk_device) {
+    auto write = [&](const JsonObject& report) {
+        std::ofstream output(output_json_path, std::ios::binary);
+        if (!output) {
+            std::cerr << "Failed to open output path: " << output_json_path << '\n';
+            return false;
+        }
+        const bool flushed = write_benchmark_report(output, report);
+        output.close();
+        if (flushed && output) return true;
+        std::cerr << "Failed to write benchmark report: " << output_json_path << '\n';
+        return false;
+    };
+    bool supported = false;
+#ifdef FUSIONRT_ENABLE_CUDA
+    supported = suite == "all" || suite == "fusions" || suite == "blocks";
+#endif
+#ifdef FUSIONRT_ENABLE_VULKAN
+    supported = supported || suite == "all" || suite == "vulkan";
+#endif
+    std::string reason;
+    if (!supported) reason = "Unknown or unavailable benchmark suite: " + suite;
+    if (vk_device && (suite == "all" || suite == "vulkan")) {
+        size_t devices = 0;
+#ifdef FUSIONRT_ENABLE_VULKAN
+        devices = VkContext::enumerate_devices().size();
+#endif
+        if (*vk_device < 0 || static_cast<size_t>(*vk_device) >= devices)
+            reason = "Unavailable Vulkan device " + std::to_string(*vk_device) + " (" + std::to_string(devices) + " available)";
+    }
+    if (!reason.empty()) {
+        std::cerr << reason << '\n';
+        JsonObject report{{"schema_version", "bench_report.v1"}, {"generated_at", utc_now_iso()}, {"error", reason},
+                          {"benchmarks", JsonArray{}},
+                          {"summary", JsonObject{{"total_cases", 0}, {"passed", 0}, {"failed", 0},
+                                                   {"skipped", 0}, {"overall_status", "fail"}}}};
+        write(report);
+        return 1;
+    }
 #if !defined(FUSIONRT_ENABLE_CUDA) && !defined(FUSIONRT_ENABLE_VULKAN)
-    (void)suite; (void)output_json_path; (void)vk_device_idx;
-    std::cerr << "No GPU backend enabled for benchmarking.\n";
     return 1;
 #else
 #ifdef FUSIONRT_ENABLE_CUDA
@@ -762,6 +803,7 @@ int run_benchmark_suite(const std::string& suite, const std::string& output_json
     // 3. Vulkan Suite (Cooperative Matrix vs Tiled + Single-Command-Buffer Batch)
     // -------------------------------------------------------------------------
     if (run_all || suite == "vulkan") {
+        const int vk_device_idx = vk_device.value_or(0);
         auto vk_devs = VkContext::enumerate_devices();
         if (vk_device_idx >= 0 && vk_device_idx < static_cast<int>(vk_devs.size())) {
             VkContext vk(static_cast<uint32_t>(vk_device_idx), 256, 256);
@@ -1003,15 +1045,11 @@ int run_benchmark_suite(const std::string& suite, const std::string& output_json
     summary["passed"] = JsonValue(passed);
     summary["failed"] = JsonValue(failed);
     summary["skipped"] = JsonValue(0);
-    summary["overall_status"] = JsonValue(failed == 0 ? "pass" : "fail");
+    const bool success = benchmark_passed(entries.size(), failed);
+    summary["overall_status"] = JsonValue(success ? "pass" : "fail");
     root["summary"] = JsonValue(std::move(summary));
 
-    std::ofstream ofs(output_json_path, std::ios::binary);
-    if (!ofs) {
-        std::cerr << "Failed to open output path: " << output_json_path << "\n";
-        return 1;
-    }
-    ofs << JsonValue(std::move(root)).dump(2) << "\n";
+    if (!write(root)) return 1;
 
     std::cout << "Benchmark summary (" << entries.size() << " entries) -> " << output_json_path << "\n";
     for (const auto& e : entries) {
@@ -1023,7 +1061,7 @@ int run_benchmark_suite(const std::string& suite, const std::string& output_json
         if (e.decode_tok_per_s > 0.0) std::cout << " (" << std::setprecision(1) << e.decode_tok_per_s << " tok/s)";
         std::cout << "\n";
     }
-    return 0;
+    return success ? 0 : 1;
 #endif
 }
 

@@ -32,6 +32,7 @@ struct Sampler {
     static Distribution distribution(const float* logits, int vocab_size,
                                      const std::vector<int32_t>& recent_tokens, const SamplingParams& params);
     static int32_t draw(const Distribution& distribution, std::mt19937_64& rng);
+    static int32_t argmax(const float* logits, int vocab_size);
     static int32_t sample(const float* logits, int vocab_size, const std::vector<int32_t>& recent_tokens,
                           const SamplingParams& params, std::mt19937_64& rng);
 };

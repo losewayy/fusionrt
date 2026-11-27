@@ -63,6 +63,7 @@ set(FUSIONRT_SOURCES
     src/server/agent_response.cpp
     src/server/http_request.cpp
     src/core/tensor.cpp
+    src/core/cpu_moe.cpp
     src/core/json.cpp
     src/core/sampler.cpp
     src/core/device_profile.cpp
@@ -80,9 +81,21 @@ set(FUSIONRT_SOURCES
     src/bench/bench_runner.cpp
 )
 
+if((MSVC AND CMAKE_CXX_COMPILER_ARCHITECTURE_ID STREQUAL "x64") OR
+   (NOT MSVC AND CMAKE_SYSTEM_PROCESSOR MATCHES "^(AMD64|amd64|x86_64)$"))
+    list(APPEND FUSIONRT_SOURCES src/core/cpu_moe_avx2.cpp src/core/cpu_moe_avx512.cpp)
+    set_source_files_properties(src/core/cpu_moe.cpp PROPERTIES COMPILE_DEFINITIONS "FUSIONRT_CPU_MOE_AVX2;FUSIONRT_CPU_MOE_AVX512")
+    if(MSVC)
+        set_source_files_properties(src/core/cpu_moe_avx2.cpp PROPERTIES COMPILE_OPTIONS /arch:AVX2)
+        set_source_files_properties(src/core/cpu_moe_avx512.cpp PROPERTIES COMPILE_OPTIONS /arch:AVX512)
+    else()
+        set_source_files_properties(src/core/cpu_moe_avx2.cpp PROPERTIES COMPILE_OPTIONS "-mavx2;-mfma")
+        set_source_files_properties(src/core/cpu_moe_avx512.cpp PROPERTIES COMPILE_OPTIONS "-mavx512f;-mavx512bw;-mavx512vl;-mavx512vnni")
+    endif()
+endif()
+
 if(FUSIONRT_ENABLE_CUDA)
     list(APPEND FUSIONRT_SOURCES
-        src/core/cpu_moe.cpp
         src/cuda/cuda_backend.cpp
         src/cuda/cuda_common.cuh
         src/cuda/matmul/weight_tiles.cuh
@@ -94,16 +107,6 @@ if(FUSIONRT_ENABLE_CUDA)
         src/cuda/epilogue/boundary_ops.cu
         src/server/http_server.cpp
     )
-    if((MSVC AND CMAKE_CXX_COMPILER_ARCHITECTURE_ID STREQUAL "x64") OR
-       (NOT MSVC AND CMAKE_SYSTEM_PROCESSOR MATCHES "^(AMD64|amd64|x86_64)$"))
-        list(APPEND FUSIONRT_SOURCES src/core/cpu_moe_avx2.cpp)
-        set_source_files_properties(src/core/cpu_moe.cpp PROPERTIES COMPILE_DEFINITIONS FUSIONRT_CPU_MOE_AVX2)
-        if(MSVC)
-            set_source_files_properties(src/core/cpu_moe_avx2.cpp PROPERTIES COMPILE_OPTIONS /arch:AVX2)
-        else()
-            set_source_files_properties(src/core/cpu_moe_avx2.cpp PROPERTIES COMPILE_OPTIONS "-mavx2;-mfma")
-        endif()
-    endif()
 endif()
 
 if(FUSIONRT_ENABLE_VULKAN)

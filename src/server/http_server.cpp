@@ -227,7 +227,9 @@ Completion generate(CudaContext& ctx, FusionModel& model, const BpeTokenizer& to
     const auto& stats = completion.stats;
     std::clog << "prompt_tokens=" << stats.prompt_tokens << " prefilled_tokens=" << stats.prefilled_tokens
               << " cached_tokens=" << stats.prompt_tokens - stats.prefilled_tokens
-              << " prefill_ms=" << stats.prefill_ms << std::endl;
+              << " prefill_ms=" << stats.prefill_ms << " decode_ms=" << stats.decode_ms
+              << " decode_tok/s=" << stats.decode_tok_per_s << " spec_proposed=" << stats.spec_proposed
+              << " spec_accepted=" << stats.spec_accepted << std::endl;
     if (connected && !stop.matched && emit(stop.push(utf8.finish())) && !stop.matched) emit(stop.pending);
     if (stop.matched || constraint) completion.finish = agent::Finish::stop;
     return completion;
@@ -246,6 +248,7 @@ void complete(SocketHandle fd, CudaContext& ctx, FusionModel& model, const BpeTo
     };
     auto event = [&](const JsonValue& v) { return send_event(fd, "", v.dump(0)); };
     const int limit = agent::generation_limit(params, context, prompt.size());
+    model.validate_cuda_kv_capacity(static_cast<int>(prompt.size()) + limit);
     if (params.stream && !start_stream(fd)) return;
     std::string result;
     bool connected = true;
@@ -288,6 +291,7 @@ void complete_agent(SocketHandle fd, CudaContext& ctx, FusionModel& model, const
                          protocol == agent::Protocol::responses ? "resp_" : "msg_";
     const auto id = prefix + std::to_string(created) + "-" + std::to_string(request_id);
     const int limit = agent::generation_limit(request.generation, context, prompt.size());
+    model.validate_cuda_kv_capacity(static_cast<int>(prompt.size()) + limit);
     agent::EventSink event;
     if (request.generation.stream) {
         if (!start_stream(fd)) return;
@@ -312,7 +316,9 @@ void complete_agent(SocketHandle fd, CudaContext& ctx, FusionModel& model, const
             !response.result().has_calls() && completion.finish == agent::Finish::stop) {
             throw std::runtime_error("The model ended its turn without producing the requested tool call");
         }
-        response.finish(completion.finish, completion.stats.generated_tokens);
+        const auto reason = completion.finish == agent::Finish::length && parser.truncated_call()
+            ? agent::Finish::truncated_tool_call : completion.finish;
+        response.finish(reason, completion.stats.generated_tokens);
         if (!request.generation.stream) reply(fd, "200 OK", response.body());
     } catch (const std::exception& e) {
         if (!request.generation.stream) throw;
@@ -389,9 +395,22 @@ void serve_http(CudaContext& ctx, FusionModel& model, const BpeTokenizer& tokeni
             if (req->method == "OPTIONS") {
                 send_all(fd, std::string("HTTP/1.1 204 No Content\r\nConnection: close\r\n") + cors + "\r\n");
             } else if (req->method == "GET" && req->path == "/health") {
-                auto health = http::health_body(model_name, cfg, model.num_slots(), model.cuda_cache_memory());
+                auto health = http::health_body(model_name, cfg, model.num_slots(), model.cuda_max_active_tokens(),
+                                                model.cuda_cache_memory());
                 health["vision"] = vision != nullptr;
                 health["speculative"] = speculation.ngram > 0 || speculation.draft != nullptr;
+                health["kv_dtype_requested"] = ctx.requested_kv_dtype() ? dtype_name(*ctx.requested_kv_dtype()) : "auto";
+                health["kv_dtype"] = dtype_name(model.cuda_kv_dtype());
+                health["borrowed_expert_bytes"] = static_cast<int64_t>(model.cuda_borrowed_expert_bytes());
+                int full_gpu = 0, resident = 0, slabs = 0;
+                for (const auto& layer : model.moe_layers()) {
+                    full_gpu += layer.cfg.gpu_resident_experts == layer.cfg.num_experts;
+                    resident += layer.cfg.gpu_resident_experts;
+                    slabs += layer.borrowed_gate_up_w.data != nullptr;
+                }
+                health["full_gpu_expert_layers"] = full_gpu;
+                health["gpu_resident_experts"] = resident;
+                health["borrowed_expert_slabs"] = slabs;
                 reply(fd, "200 OK", health);
             } else if (req->method == "GET" && req->path == "/v1/models") {
                 reply(fd, "200 OK", JsonObject{{"object", "list"}, {"data", JsonArray{JsonObject{
@@ -406,7 +425,7 @@ void serve_http(CudaContext& ctx, FusionModel& model, const BpeTokenizer& tokeni
                 }();
                 if (!parsed.is_object()) throw std::invalid_argument("Expected a JSON object");
                 const auto& obj = parsed.as_object();
-                const int context = cfg.dense.max_seq_len;
+                const int context = std::min(cfg.dense.max_seq_len, model.cuda_max_active_tokens());
                 if (protocol) {
                     const auto input = agent::parse_request(obj, *protocol, vision != nullptr);
                     const auto rendered = agent::render_prompt(input, tokenizer, preset_images);

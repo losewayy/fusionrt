@@ -2,6 +2,7 @@
 
 #ifdef FUSIONRT_ENABLE_CUDA
 #include "../core/cpu_moe.h"
+#include "../core/moe_route_trace.h"
 #include "fusionrt/cuda_kernels.h"
 
 #include <algorithm>
@@ -11,8 +12,8 @@
 #include <cstdlib>
 #include <cstring>
 #include <iostream>
+#include <numeric>
 #include <stdexcept>
-#include <thread>
 #include <tuple>
 #include <unordered_set>
 #ifdef _WIN32
@@ -109,7 +110,7 @@ static bool try_q8_1_linear(CudaContext& ctx, const float* x, const float* res_b
 
 static bool try_cublas_prefill(CudaContext& ctx, const float* x, const float* norm_w, const Tensor& w,
                                float* y, int M, int N, int K, float eps) {
-    if (M < 4 || ctx.cublas() == nullptr || w.dtype == DType::F32 || prefill_mmq(w.dtype)) return false;
+    if (M < 4 || ctx.cublas() == nullptr || w.dtype == DType::F32 || w.dtype == DType::Q2_K || prefill_mmq(w.dtype)) return false;
     if (M < 16 && w.dtype != DType::F16 && w.dtype != DType::BF16 && w.dtype != DType::Q4_1) return false;
     size_t x_bytes = static_cast<size_t>(M) * K * sizeof(uint16_t);
     size_t w_bytes = (w.dtype == DType::F16) ? 0 : (static_cast<size_t>(N) * K * sizeof(uint16_t));
@@ -180,6 +181,8 @@ void dispatch_linear(CudaContext& ctx, const float* x, const Tensor& w, float* y
         }
     } else if (w.dtype == DType::Q4_1) {
         cuda_ops::fused_gemv_q4_1(x, w.ptr(), y, M, N, K, ctx.stream());
+    } else if (w.dtype == DType::Q2_K) {
+        cuda_ops::linear_q2_k_f32(x, w.ptr(), y, M, N, K, ctx.stream(), use_fused && !verify);
     } else if (w.dtype == DType::Q4_KA || w.dtype == DType::Q6_A) {
         cuda_ops::linear_repacked_k_f32(x, w.ptr(), w.dtype, y, M, N, K, ctx.stream());
     } else if (w.dtype == DType::Q4_K) {
@@ -257,101 +260,113 @@ void model_io::vision_linear_cuda(CudaContext& ctx, const Tensor& input, const T
                     static_cast<int>(weight.shape[0]), static_cast<int>(weight.shape[1]), true);
 }
 
-void CudaSparseMoELayer::forward_cuda(CudaContext& ctx, Tensor& x_in_out, bool use_fused) const {
+void CudaSparseMoELayer::forward_prefill_cuda(CudaContext& ctx, Tensor& x_in_out, int M, bool use_fused,
+                                             int moe_index, int route_pos) const {
     auto& arena = ctx.scratch_arena();
     struct ResetMoEScratch {
         CudaArena& arena;
         size_t mark;
         ~ResetMoEScratch() { arena.reset(mark); }
     } reset{arena, arena.mark()};
-    int H = cfg.hidden_size;
-    int I = cfg.intermediate_size;
-    int E = cfg.num_experts;
-    int K = cfg.top_k;
-    int gpu_E = cfg.gpu_resident_experts;
+    const int H = cfg.hidden_size, I = cfg.intermediate_size, E = cfg.num_experts, K = cfg.top_k;
+    const int gpu_E = cfg.gpu_resident_experts;
+    const int borrowed = borrowed_gate_up_w.data ? static_cast<int>(borrowed_gate_up_w.shape[0]) : 0;
+    const int base = gpu_E - borrowed;
+    const auto stream = ctx.stream();
+    auto* timing = ctx.moe_timing && moe_index >= 0 ? &ctx.moe_timing->layer(moe_index) : nullptr;
 
-    Tensor x_norm = cuda_scratch(ctx, {H});
-    cuda_ops::rmsnorm_f32(x_in_out.ptr<float>(), norm_w.ptr<float>(), x_norm.ptr<float>(), 1, H, cfg.rms_norm_eps, ctx.stream());
-
-    Tensor logits = cuda_scratch(ctx, {E});
-    if (use_fused) {
-        cuda_ops::fused_rmsnorm_linear_f32(x_in_out.ptr<float>(), norm_w.ptr<float>(), router_w.ptr<float>(),
-                                           logits.ptr<float>(), 1, E, H, cfg.rms_norm_eps, ctx.stream());
-    } else {
-        cuda_ops::linear_f32(x_norm.ptr<float>(), router_w.ptr<float>(), logits.ptr<float>(), 1, E, H, ctx.stream());
-    }
-
-    Tensor topk_idx = cuda_scratch(ctx, {K}, DType::I32);
-    Tensor topk_w = cuda_scratch(ctx, {K});
+    Tensor x_norm = cuda_scratch(ctx, {M, H});
+    cuda_ops::rmsnorm_f32(x_in_out.ptr<float>(), norm_w.ptr<float>(), x_norm.ptr<float>(), M, H, cfg.rms_norm_eps, stream);
+    Tensor logits = cuda_scratch(ctx, {M, E});
+    cuda_ops::linear_f32(x_norm.ptr<float>(), router_w.ptr<float>(), logits.ptr<float>(), M, E, H, stream);
+    Tensor topk_idx = cuda_scratch(ctx, {M, K}, DType::I32);
+    Tensor topk_w = cuda_scratch(ctx, {M, K});
     cuda_ops::moe_topk_router_f32(logits.ptr<float>(), topk_idx.ptr<int>(), topk_w.ptr<float>(),
-                                  E, K, cfg.norm_topk_prob, ctx.stream(), router_bias.ptr<float>(),
-                                  cfg.sigmoid_router, cfg.expert_weights_scale, cfg.expert_groups, cfg.expert_groups_used);
+        E, K, cfg.norm_topk_prob, stream, router_bias.ptr<float>(), cfg.sigmoid_router,
+        cfg.expert_weights_scale, cfg.expert_groups, cfg.expert_groups_used, M);
 
     float* host_x = nullptr;
     float* host_out = nullptr;
     float* host_weights = nullptr;
     int32_t* host_indices = nullptr;
     if (gpu_E < E) {
-        host_x = ctx.moe_transfer_buffer((2 * H + K) * sizeof(float) + K * sizeof(int32_t));
-        host_out = host_x + H;
-        host_weights = host_out + H;
-        host_indices = reinterpret_cast<int32_t*>(host_weights + K);
-        const auto stream = ctx.stream();
+        host_x = ctx.moe_transfer_buffer(2 * x_norm.nbytes() + topk_w.nbytes() + topk_idx.nbytes());
+        host_out = host_x + static_cast<size_t>(M) * H;
+        host_weights = host_out + static_cast<size_t>(M) * H;
+        host_indices = reinterpret_cast<int32_t*>(host_weights + static_cast<size_t>(M) * K);
         FUSIONRT_CUDA_CHECK(cudaMemcpyAsync(host_x, x_norm.ptr(), x_norm.nbytes(), cudaMemcpyDeviceToHost, stream));
         FUSIONRT_CUDA_CHECK(cudaMemcpyAsync(host_weights, topk_w.ptr(), topk_w.nbytes(), cudaMemcpyDeviceToHost, stream));
         FUSIONRT_CUDA_CHECK(cudaMemcpyAsync(host_indices, topk_idx.ptr(), topk_idx.nbytes(), cudaMemcpyDeviceToHost, stream));
         FUSIONRT_CUDA_CHECK(cudaEventRecord(ctx.moe_input_ready(), stream));
+    } else if (route_pos >= 0) {
+        auto* trace = ctx.moe_route_trace;
+        auto* ids = trace->staging(static_cast<size_t>(M) * K);
+        FUSIONRT_CUDA_CHECK(cudaMemcpyAsync(ids, topk_idx.ptr(), topk_idx.nbytes(), cudaMemcpyDeviceToHost, stream));
+        ctx.synchronize();
+        trace->record(model_layer_index, route_pos, M, K, ids);
     }
 
-    Tensor moe_out = cuda_scratch(ctx, {H});
+    Tensor moe_out = cuda_scratch(ctx, {M, H});
     if (gpu_E > 0) {
         Tensor scratch_inter = cuda_scratch(ctx, {K, I});
-        cuda_ops::moe_indexed_swiglu_gemv(
-            x_norm.ptr<float>(), topk_idx.ptr<int>(), gpu_gate_up_w.ptr(), gpu_gate_up_w.dtype,
-            gpu_up_w.data ? gpu_up_w.ptr() : nullptr, gpu_up_w.dtype, gpu_down_w.ptr(), gpu_down_w.dtype,
-            topk_w.ptr<float>(), moe_out.ptr<float>(), scratch_inter.ptr<float>(), H, I, K, gpu_E, ctx.stream());
+        auto run_hot = [&](const Tensor& gate, const Tensor& up, const Tensor& down, Tensor& out, int first, int count) {
+            for (int row = 0; row < M; ++row) {
+                const auto hidden_offset = static_cast<size_t>(row) * H;
+                const auto route_offset = static_cast<size_t>(row) * K;
+                cuda_ops::moe_indexed_swiglu_gemv(
+                    x_norm.ptr<float>() + hidden_offset, topk_idx.ptr<int>() + route_offset, gate.ptr(), gate.dtype,
+                    up.data ? up.ptr() : nullptr, up.dtype, down.ptr(), down.dtype, topk_w.ptr<float>() + route_offset,
+                    out.ptr<float>() + hidden_offset, scratch_inter.ptr<float>(), H, I, K, count, stream, first);
+            }
+        };
+        if (base) run_hot(gpu_gate_up_w, gpu_up_w, gpu_down_w, moe_out, 0, base);
+        if (borrowed) {
+            const size_t mark = arena.mark();
+            Tensor tail = base ? cuda_scratch(ctx, {M, H}) : moe_out;
+            run_hot(borrowed_gate_up_w, borrowed_up_w, borrowed_down_w, tail, base, borrowed);
+            if (base) cuda_ops::add_residual_f32(moe_out.ptr<float>(), tail.ptr<float>(), moe_out.ptr<float>(), M * H, stream);
+            arena.reset(mark);
+        }
     } else {
-        FUSIONRT_CUDA_CHECK(cudaMemsetAsync(moe_out.ptr(), 0, moe_out.nbytes(), ctx.stream()));
+        FUSIONRT_CUDA_CHECK(cudaMemsetAsync(moe_out.ptr(), 0, moe_out.nbytes(), stream));
     }
 
     if (cfg.has_shared_expert) {
-        Tensor sh_gu = cuda_scratch(ctx, {2 * cfg.shared_intermediate_size});
-        dispatch_linear(ctx, x_norm.ptr<float>(), shared_gate_up_w, sh_gu.ptr<float>(), 1, 2 * cfg.shared_intermediate_size, H, use_fused);
-        Tensor sh_act = cuda_scratch(ctx, {cfg.shared_intermediate_size});
-        cuda_ops::swiglu_interleaved_f32(sh_gu.ptr<float>(), sh_act.ptr<float>(), 1, cfg.shared_intermediate_size, ctx.stream());
-        Tensor sh_down = cuda_scratch(ctx, {H});
-        dispatch_linear(ctx, sh_act.ptr<float>(), shared_down_w, sh_down.ptr<float>(), 1, H, cfg.shared_intermediate_size, use_fused);
-        cuda_ops::add_residual_f32(moe_out.ptr<float>(), sh_down.ptr<float>(), moe_out.ptr<float>(), H, ctx.stream());
+        const int width = cfg.shared_intermediate_size;
+        Tensor sh_gu = cuda_scratch(ctx, {M, 2 * width});
+        dispatch_linear(ctx, x_norm.ptr<float>(), shared_gate_up_w, sh_gu.ptr<float>(), M, 2 * width, H, use_fused);
+        Tensor sh_act = cuda_scratch(ctx, {M, width});
+        cuda_ops::swiglu_interleaved_f32(sh_gu.ptr<float>(), sh_act.ptr<float>(), M, width, stream);
+        Tensor sh_down = cuda_scratch(ctx, {M, H});
+        dispatch_linear(ctx, sh_act.ptr<float>(), shared_down_w, sh_down.ptr<float>(), M, H, width, use_fused);
+        cuda_ops::add_residual_f32(moe_out.ptr<float>(), sh_down.ptr<float>(), moe_out.ptr<float>(), M * H, stream);
     }
 
     if (host_x) {
+        using Clock = std::chrono::steady_clock;
+        if (timing) ctx.moe_timing->begin_gap(*timing, stream);
+        const auto wait_start = timing ? Clock::now() : Clock::time_point{};
         // The event covers only the inputs. Hot and shared experts can run while the CPU works.
         FUSIONRT_CUDA_CHECK(cudaEventSynchronize(ctx.moe_input_ready()));
-        std::fill_n(host_out, H, 0.0f);
-        bool has_cold = false;
-        for (int s = 0; s < K; ++s) {
-            const int expert = host_indices[s];
-            if (expert < gpu_E) continue;
-            has_cold = true;
-            cpu_moe_accumulate(cpu_gate_up_w, cpu_up_w, cpu_down_w, expert - gpu_E,
-                                host_x, host_weights[s], host_out);
+        if (route_pos >= 0) ctx.moe_route_trace->record(model_layer_index, route_pos, M, K, host_indices);
+        const auto compute_start = timing ? Clock::now() : Clock::time_point{};
+        const int cold = cpu_moe_accumulate_layer(&ctx.cpu_workers(), ctx.cpu_moe_workspace(), cpu_gate_up_w,
+            cpu_up_w, cpu_down_w, host_indices, host_weights, gpu_E, base, M, K, host_x, host_out,
+            ctx.cpu_moe_q8() ? CpuMoeMode::Parallel : CpuMoeMode::ParallelF32);
+        if (timing) {
+            ctx.moe_timing->end_gap(*timing, stream);
+            timing->hot += M * K - cold;
+            timing->cold += cold;
+            timing->input_wait_ms += std::chrono::duration<double, std::milli>(compute_start - wait_start).count();
+            timing->cpu_ms += std::chrono::duration<double, std::milli>(Clock::now() - compute_start).count();
         }
-        if (has_cold) {
-            Tensor cold_out = cuda_scratch(ctx, {H});
-            FUSIONRT_CUDA_CHECK(cudaMemcpyAsync(cold_out.ptr(), host_out, cold_out.nbytes(),
-                                                cudaMemcpyHostToDevice, ctx.stream()));
-            cuda_ops::add_residual_f32(moe_out.ptr<float>(), cold_out.ptr<float>(), moe_out.ptr<float>(), H, ctx.stream());
+        if (cold > 0) {
+            Tensor cold_out = cuda_scratch(ctx, {M, H});
+            FUSIONRT_CUDA_CHECK(cudaMemcpyAsync(cold_out.ptr(), host_out, cold_out.nbytes(), cudaMemcpyHostToDevice, stream));
+            cuda_ops::add_residual_f32(moe_out.ptr<float>(), cold_out.ptr<float>(), moe_out.ptr<float>(), M * H, stream);
         }
-    }
-    cuda_ops::add_residual_f32(x_in_out.ptr<float>(), moe_out.ptr<float>(), x_in_out.ptr<float>(), H, ctx.stream());
-}
-
-void CudaSparseMoELayer::forward_prefill_cuda(CudaContext& ctx, Tensor& x_in_out, int M, bool use_fused) const {
-    int H = cfg.hidden_size;
-    for (int m = 0; m < M; ++m) {
-        Tensor row = x_in_out.slice_dim0(m, 1).view({H});
-        forward_cuda(ctx, row, use_fused);
-    }
+    } else if (timing) timing->hot += M * K;
+    cuda_ops::add_residual_f32(x_in_out.ptr<float>(), moe_out.ptr<float>(), x_in_out.ptr<float>(), M * H, stream);
 }
 
 namespace {
@@ -370,28 +385,23 @@ DType cuda_matrix_dtype(const CostHardware& hw, const HostTensor& t, bool is_voc
 }
 
 template<class Src, class Dst>
-void repack_matrix_blocks(const HostTensor& src, HostTensor& dst, void (*repack)(const Src*, Dst*, int64_t)) {
+void repack_matrix_blocks(CpuWorkers& workers, const HostTensor& src, HostTensor& dst,
+                          void (*repack)(const Src*, Dst*, int64_t)) {
     const int64_t block_count = src.desc.numel() / 256;
-    const unsigned workers = static_cast<unsigned>(std::clamp<int64_t>(block_count / (1 << 17), 1, 8));
-    auto convert = [&](unsigned worker) {
-        const auto first = block_count * worker / workers;
-        const auto last = block_count * (worker + 1) / workers;
+    workers.run(block_count, [&](int64_t first, int64_t last) {
         repack(src.data<Src>() + first * (256 / dtype_block_size(src.desc.dtype)),
                dst.data<Dst>() + first, (last - first) * 256);
-    };
-    std::vector<std::jthread> threads;
-    for (unsigned worker = 1; worker < workers; ++worker) threads.emplace_back(convert, worker);
-    convert(0);
+    });
 }
 
-HostTensor repack_matrix_for_cuda(const HostTensor& src, DType dtype) {
+HostTensor repack_matrix_for_cuda(CpuWorkers& workers, const HostTensor& src, DType dtype) {
     auto dst = HostTensor::create({src.desc.shape[0], src.desc.shape[1]}, dtype);
     dst.desc.name = src.desc.name;
     switch (dtype) {
-        case DType::Q4_KA: repack_matrix_blocks(src, dst, repack_q4_k_to_q4_ka); break;
-        case DType::Q6_A: repack_matrix_blocks(src, dst, repack_q6_k_to_q6_a); break;
-        case DType::Q4_A: repack_matrix_blocks(src, dst, repack_q4_0_to_q4_a); break;
-        case DType::Q8_A: repack_matrix_blocks(src, dst, repack_q8_0_to_q8_a); break;
+        case DType::Q4_KA: repack_matrix_blocks(workers, src, dst, repack_q4_k_to_q4_ka); break;
+        case DType::Q6_A: repack_matrix_blocks(workers, src, dst, repack_q6_k_to_q6_a); break;
+        case DType::Q4_A: repack_matrix_blocks(workers, src, dst, repack_q4_0_to_q4_a); break;
+        case DType::Q8_A: repack_matrix_blocks(workers, src, dst, repack_q8_0_to_q8_a); break;
         default: throw std::logic_error("Expected a repacked CUDA matrix format");
     }
     return dst;
@@ -407,7 +417,7 @@ Tensor upload_cuda_weight(CudaContext& ctx, CudaArena& arena, const HostTensor& 
 Tensor upload_cuda_matrix(CudaContext& ctx, CudaArena& arena, const HostTensor& src, bool is_vocab_head = false) {
     const auto dtype = cuda_matrix_dtype(ctx.cost_hardware(), src, is_vocab_head);
     return dtype == src.desc.dtype ? upload_cuda_weight(ctx, arena, src) :
-                                     upload_cuda_weight(ctx, arena, repack_matrix_for_cuda(src, dtype));
+                                     upload_cuda_weight(ctx, arena, repack_matrix_for_cuda(ctx.cpu_workers(), src, dtype));
 }
 
 DType mla_weight_dtype(DType source) {
@@ -563,11 +573,12 @@ void FusionModel::init_synthetic(CudaContext& ctx, uint64_t seed) {
         } else {
             CudaSparseMoELayer L;
             L.cfg = cfg_.moe;
+            L.model_layer_index = l;
             L.cfg.hidden_size = H;
             int I = L.cfg.intermediate_size;
             int E = L.cfg.num_experts;
-            const int gE = std::clamp(moe_gpu_experts_override_ < 0 ? L.cfg.gpu_resident_experts :
-                                      moe_gpu_experts_override_, 0, E);
+            const int configured = cfg_.gpu_experts.empty() ? L.cfg.gpu_resident_experts : cfg_.gpu_experts.at(l);
+            const int gE = std::clamp(moe_gpu_experts_override_ < 0 ? configured : moe_gpu_experts_override_, 0, E);
             int cE = E - gE;
             L.cfg.gpu_resident_experts = gE;
 
@@ -596,7 +607,7 @@ void FusionModel::init_synthetic(CudaContext& ctx, uint64_t seed) {
     rebuild_cuda_ir();
 }
 
-static bool upload_raw_model_to_cuda(CudaContext& ctx, CudaArena& arena, LoadedModelRaw& raw, int resident_experts,
+static bool upload_raw_model_to_cuda(CudaContext& ctx, CudaArena& arena, LoadedModelRaw& raw,
                                      HybridModelConfig& cfg_out,
                                      Tensor& tok_emb, Tensor& final_norm, Tensor& lm_head,
                                      GemmaLayerInputWeights<Tensor>& gemma_inputs,
@@ -638,7 +649,9 @@ static bool upload_raw_model_to_cuda(CudaContext& ctx, CudaArena& arena, LoadedM
         L.cfg = cfg_out.moe;
         L.cfg.has_shared_expert = lr.has_shared;
         L.cfg.num_experts = static_cast<int>(lr.router_w.desc.shape[0]);
-        const int resident = std::min(resident_experts, L.cfg.num_experts);
+        const auto layer_index = static_cast<size_t>(&lr - raw.layers.data());
+        L.model_layer_index = static_cast<int>(layer_index);
+        const int resident = cfg_out.gpu_experts[layer_index];
         L.cfg.gpu_resident_experts = resident;
         L.cfg.intermediate_size = static_cast<int>(lr.experts_down.desc.shape[2]);
         L.norm_w = upload_cuda_weight(ctx, arena, lr.mlp_norm.bytes().empty() ? lr.attn_norm : lr.mlp_norm);
@@ -772,7 +785,8 @@ static bool upload_raw_model_to_cuda(CudaContext& ctx, CudaArena& arena, LoadedM
     return true;
 }
 
-static size_t cuda_model_arena_bytes(const LoadedModelRaw& raw, const CostHardware& hw, int resident_experts) {
+static size_t cuda_model_arena_bytes(const LoadedModelRaw& raw, const CostHardware& hw,
+                                     std::span<const int> placements = {}) {
     size_t bytes = 0;
     auto reserve = [&](size_t n) { bytes += (n + 255) & ~size_t{255}; };
     auto weight = [&](const HostTensor& t, bool is_vocab_head = false) {
@@ -819,7 +833,8 @@ static size_t cuda_model_arena_bytes(const LoadedModelRaw& raw, const CostHardwa
         for (const auto* t : {&l.experts_gate_up, &l.experts_up, &l.experts_down}) {
             if (t->bytes().empty()) continue;
             const auto experts = static_cast<size_t>(t->desc.shape[0]);
-            reserve(t->bytes().size() / experts * std::min(experts, static_cast<size_t>(resident_experts)));
+            const int resident = placements.empty() ? 0 : placements[&l - raw.layers.data()];
+            reserve(t->bytes().size() / experts * resident);
         }
         if (l.kind == 1) weight(l.qkv_proj);
     }
@@ -827,7 +842,7 @@ static size_t cuda_model_arena_bytes(const LoadedModelRaw& raw, const CostHardwa
 }
 
 #ifdef _WIN32
-static size_t wddm_available_vram(int device) {
+static size_t wddm_available_vram(int device, DXGI_QUERY_VIDEO_MEMORY_INFO& memory) {
     constexpr size_t unknown = static_cast<size_t>(-1);
     cudaDeviceProp properties{};
     if (cudaGetDeviceProperties(&properties, device) != cudaSuccess || !properties.luidDeviceNodeMask)
@@ -841,7 +856,6 @@ static size_t wddm_available_vram(int device) {
     const auto found = factory->EnumAdapterByLuid(luid, IID_PPV_ARGS(&adapter));
     factory->Release();
     if (FAILED(found)) return unknown;
-    DXGI_QUERY_VIDEO_MEMORY_INFO memory{};
     const auto queried = adapter->QueryVideoMemoryInfo(std::countr_zero(properties.luidDeviceNodeMask),
         DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &memory);
     adapter->Release();
@@ -850,74 +864,194 @@ static size_t wddm_available_vram(int device) {
 }
 #endif
 
-static int place_cuda_experts(CudaContext& ctx, LoadedModelRaw& raw, int override_count,
-                              size_t kv_budget, int slots, bool owns_arena, size_t reclaim_bytes = 0) {
-    int experts = 0;
-    size_t expert_bytes = 0;
-    for (const auto& layer : raw.layers) {
-        if (layer.router_w.bytes().empty()) continue;
-        const int count = static_cast<int>(layer.router_w.desc.shape[0]);
-        experts = std::max(experts, count);
-        expert_bytes = std::max(expert_bytes, (layer.experts_gate_up.bytes().size() +
-                                layer.experts_up.bytes().size() + layer.experts_down.bytes().size()) / count);
+static size_t place_cuda_experts(CudaContext& ctx, LoadedModelRaw& raw, int override_count,
+                                 size_t requested_kv_bytes, int active_tokens, int slots,
+                                 DType& dtype, bool owns_arena, size_t reclaim_bytes = 0) {
+    const auto& d = raw.cfg.dense;
+    const auto requested_dtype = ctx.requested_kv_dtype();
+    const bool mla = d.mla.latent_rank > 0;
+    if (mla && requested_dtype && *requested_dtype != DType::F32)
+        throw std::invalid_argument("MLA requires F32 latent KV");
+    dtype = mla ? DType::F32 : ctx.kv_dtype();
+    bool q8_compatible = !mla;
+    size_t kv_page_bytes = 0, q8_page_bytes = 0, session_bytes = 0;
+    const auto align = [](size_t bytes) { return (bytes + 255) & ~size_t{255}; };
+    const size_t max_pages = 1 + (d.max_seq_len - 1) / kKvPageTokens;
+    std::vector<MoeLayerCost> costs(raw.layers.size());
+    int expert_layers = 0;
+    for (size_t i = 0; i < raw.layers.size(); ++i) {
+        const auto& layer = raw.layers[i];
+        if (layer.kind == 0 && layer.kv_source_layer < 0) {
+            const int heads = layer.kv_heads > 0 ? layer.kv_heads : d.num_key_value_heads;
+            const int dim = layer.head_dim > 0 ? layer.head_dim : d.head_dim;
+            const auto elements = kKvPageTokens * static_cast<int64_t>(heads) * dim;
+            q8_compatible &= dim % 32 == 0;
+            kv_page_bytes += mla ?
+                kKvPageTokens * static_cast<size_t>(d.mla.latent_width()) * sizeof(float) :
+                2 * row_nbytes(dtype, elements);
+            if (q8_compatible) q8_page_bytes += 2 * row_nbytes(DType::Q8_0, elements);
+            session_bytes += align(max_pages * sizeof(uint8_t*));
+        } else if (layer.kind == 1) {
+            const auto& g = raw.cfg.gdn;
+            session_bytes += align(layer.conv_w.desc.shape[0] * 3 * sizeof(float)) +
+                align(static_cast<size_t>(g.num_v_heads) * g.head_k_dim * g.head_v_dim * sizeof(float));
+        }
+        if (layer.router_w.bytes().empty() || layer.kind == 1) continue;
+        auto& c = costs[i];
+        c.experts = static_cast<int>(layer.router_w.desc.shape[0]);
+        c.top_k = raw.cfg.moe.top_k;
+        c.hidden = raw.cfg.moe.hidden_size;
+        c.expert_tensor_bytes = {layer.experts_gate_up.bytes().size() / c.experts, layer.experts_up.bytes().size() / c.experts,
+                                 layer.experts_down.bytes().size() / c.experts};
+        ++expert_layers;
     }
-    if (experts == 0) return 0;
 
-    int resident = std::min(override_count, experts);
-    if (resident < 0) {
-        size_t free_bytes = 0, total_bytes = 0;
-        FUSIONRT_CUDA_CHECK(cudaMemGetInfo(&free_bytes, &total_bytes));
+    if (active_tokens <= 0) active_tokens = d.max_seq_len;
+    active_tokens = std::min(active_tokens, d.max_seq_len);
+    auto bytes_for = [&](size_t page) {
+        if (!page) return size_t{0};
+        const size_t pages = requested_kv_bytes ? requested_kv_bytes / page : 1 + (active_tokens - 1) / kKvPageTokens;
+        return pages * page;
+    };
+    if (dtype == DType::Q8_0 && !q8_compatible)
+        throw std::invalid_argument("Q8_0 KV requires head dimensions divisible by 32");
+    size_t kv_bytes = bytes_for(kv_page_bytes);
+    session_bytes *= static_cast<size_t>(slots);
+    auto log_kv = [&] {
+        if (kv_page_bytes && !kv_bytes)
+            throw std::invalid_argument("KV budget requires one page of " + std::to_string(kv_page_bytes) +
+                                        " bytes, but configured " + std::to_string(requested_kv_bytes) + " bytes");
+        std::clog << "KV placement kv_dtype_requested=" << (requested_dtype ? dtype_name(*requested_dtype) : "auto")
+              << " kv_dtype=" << dtype_name(dtype)
+              << " committed_bytes=" << kv_bytes
+              << " page_table_and_state_bytes=" << session_bytes << " slots=" << slots
+              << " active_token_capacity=" << (kv_page_bytes == 0 ? static_cast<size_t>(d.max_seq_len) :
+                  std::min(static_cast<size_t>(d.max_seq_len), kv_bytes / kv_page_bytes * kKvPageTokens)) << '\n';
+    };
+
+    raw.cfg.gpu_experts.assign(raw.layers.size(), 0);
+    size_t cuda_free = 0, cuda_total = 0;
+    FUSIONRT_CUDA_CHECK(cudaMemGetInfo(&cuda_free, &cuda_total));
+    size_t available = cuda_free + reclaim_bytes;
 #ifdef _WIN32
-        free_bytes = std::min(free_bytes, wddm_available_vram(ctx.info().device_id));
+    DXGI_QUERY_VIDEO_MEMORY_INFO memory{};
+    const auto wddm_free = wddm_available_vram(ctx.info().device_id, memory);
+    if (wddm_free != static_cast<size_t>(-1))
+        available = std::min(available, wddm_model_available(memory.Budget, memory.CurrentUsage, reclaim_bytes));
 #endif
-        free_bytes += reclaim_bytes;
+    const size_t scratch = ctx.scratch_arena().capacity();
+    const size_t profile_bytes = static_cast<size_t>(std::min(static_cast<double>(cuda_total),
+        ctx.device_profile().vram_total_mb * 1024.0 * 1024.0));
+    const size_t profile_limit = profile_bytes - std::min(profile_bytes, scratch);
+    available = std::min(available, profile_limit);
+    const size_t fixed = cuda_model_arena_bytes(raw, ctx.cost_hardware());
+    const size_t overhead = (owns_arena ? fixed : 0) + session_bytes;
+    size_t arena_limit = std::numeric_limits<size_t>::max();
+    if (!owns_arena) {
         const auto& arena = ctx.weight_arena();
-        const size_t profile_bytes = static_cast<size_t>(std::min(static_cast<double>(total_bytes),
-            ctx.device_profile().vram_total_mb * 1024.0 * 1024.0));
-        const size_t scratch = ctx.scratch_arena().capacity();
-        const auto& cfg = raw.cfg.dense;
-        size_t kv = 0, page_table_bytes = 0;
-        const size_t pages = 1 + (cfg.max_seq_len - 1) / kKvPageTokens;
-        for (const auto& layer : raw.layers) {
-            if (layer.kind != 0 || layer.kv_source_layer >= 0) continue;
-            const int heads = layer.kv_heads > 0 ? layer.kv_heads : cfg.num_key_value_heads;
-            const int dim = layer.head_dim > 0 ? layer.head_dim : cfg.head_dim;
-            kv += pages * (cfg.mla.latent_rank > 0
-                ? kKvPageTokens * static_cast<size_t>(cfg.mla.latent_width()) * sizeof(float)
-                : 2 * row_nbytes(ctx.kv_dtype(), kKvPageTokens * heads * dim));
-            page_table_bytes += (pages * sizeof(uint8_t*) + 255) & ~size_t{255};
+        const size_t remaining = arena.capacity() - arena.used();
+        if (fixed > remaining) throw std::runtime_error("CUDA weight arena cannot fit mandatory model weights");
+        arena_limit = remaining - fixed;
+    }
+    size_t explicit_expert_bytes = 0;
+    if (override_count >= 0) {
+        for (size_t i = 0; i < costs.size(); ++i) {
+            raw.cfg.gpu_experts[i] = std::min(override_count, costs[i].experts);
+            explicit_expert_bytes += costs[i].gpu_bytes(raw.cfg.gpu_experts[i]);
         }
-        kv *= static_cast<size_t>(slots);
-        if (kv_budget > 0) kv = std::min(kv, kv_budget);
-        kv += page_table_bytes * slots;
+    }
+    const size_t fixed_budget = overhead + (owns_arena ? explicit_expert_bytes : 0);
+    const auto q8_bytes = bytes_for(q8_page_bytes);
+    const auto desired_pages = static_cast<size_t>(1 + (active_tokens - 1) / kKvPageTokens);
+    auto fits = [&](size_t bytes) { return fixed_budget <= available && bytes <= available - fixed_budget; };
+    auto select_q8 = [&] {
+        dtype = DType::Q8_0;
+        kv_bytes = q8_bytes;
+        kv_page_bytes = q8_page_bytes;
+    };
+    if (!requested_dtype && q8_compatible && q8_bytes && fits(q8_bytes) &&
+        (!fits(kv_bytes) || !kv_bytes ||
+         (kv_bytes / kv_page_bytes < desired_pages && q8_bytes / q8_page_bytes >= desired_pages))) {
+        select_q8();
+    }
+    double dispatch_us = 0;
+    MoePlacement choice;
+    if (expert_layers && override_count < 0) {
+        auto& pool = ctx.cpu_workers();
+        auto empty = [](int64_t, int64_t) {};
+        pool.run(pool.count(), empty);
+        const auto start = std::chrono::steady_clock::now();
+        constexpr int trials = 32;
+        for (int i = 0; i < trials; ++i) pool.run(pool.count(), empty);
+        dispatch_us = 2.0 * std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - start).count() / trials;
+        if (owns_arena && !requested_dtype && dtype == DType::F16 && q8_compatible && q8_bytes && kv_bytes &&
+            overhead <= available) {
+            auto fit = select_moe_kv_precision(costs, available - overhead, arena_limit,
+                kv_bytes, q8_bytes, ctx.cost_hardware(), dispatch_us);
+            if (fit.dtype == DType::Q8_0) select_q8();
+            choice = std::move(fit.experts);
+        }
+    }
+    log_kv();
+    const size_t mandatory = overhead + kv_bytes;
+    if (mandatory > available) throw std::runtime_error("Model shared weights, KV commitment, and session state need " +
+        std::to_string(mandatory) + " VRAM bytes, but the current budget is " + std::to_string(available));
+    if (!expert_layers) return kv_bytes;
+    const size_t expert_budget = owns_arena ? available - mandatory : arena_limit;
+    if (override_count < 0) {
+        if (choice.gpu_experts.empty())
+            choice = select_moe_placement(costs, expert_budget, ctx.cost_hardware(), dispatch_us);
+        raw.cfg.gpu_experts = std::move(choice.gpu_experts);
+    }
+
+    size_t expert_gpu = 0, expert_cpu = 0;
+    int full_layers = 0, boundary = -1, full_prefix = 0, experts_total = 0, experts_gpu = 0;
+    for (size_t i = 0; i < costs.size(); ++i) {
+        const auto& c = costs[i];
+        if (!c.experts) continue;
+        const int n = raw.cfg.gpu_experts[i];
+        expert_gpu += c.gpu_bytes(n);
+        expert_cpu += static_cast<size_t>(c.experts - n) *
+            std::accumulate(c.expert_tensor_bytes.begin(), c.expert_tensor_bytes.end(), size_t{0});
+        experts_total += c.experts;
+        experts_gpu += n;
+        if (n == c.experts) {
+            ++full_layers;
+            if (boundary < 0) ++full_prefix;
+        } else if (boundary < 0) boundary = static_cast<int>(i);
+    }
+    if (expert_gpu > expert_budget) throw std::invalid_argument("Requested GPU expert placement needs " +
+        std::to_string(expert_gpu) + " bytes, but the expert budget is " + std::to_string(expert_budget));
+    raw.cfg.moe.gpu_resident_experts = *std::max_element(raw.cfg.gpu_experts.begin(), raw.cfg.gpu_experts.end());
+    std::clog << "MoE VRAM snapshot cuda_free_bytes=" << cuda_free << " cuda_total_bytes=" << cuda_total;
 #ifdef _WIN32
-        if (cuda_model_arena_bytes(raw, ctx.cost_hardware(), experts) > free_bytes - std::min(free_bytes, kv)) {
-            // Leave room for graphics and driver allocations when weights must be split.
-            free_bytes -= std::min(free_bytes, size_t{512} * 1024 * 1024);
-        }
+    if (wddm_free != static_cast<size_t>(-1))
+        std::clog << " wddm_budget_bytes=" << memory.Budget << " wddm_current_usage_bytes=" << memory.CurrentUsage
+                  << " wddm_residency_reserve_bytes=" << wddm_residency_reserve(memory.Budget);
 #endif
-        const size_t after_scratch = profile_bytes - std::min(profile_bytes, scratch);
-        const size_t vram = std::min(after_scratch, free_bytes);
-        const size_t available = owns_arena ? vram - std::min(vram, kv) :
-            std::min(after_scratch - std::min(after_scratch, kv), arena.capacity() - arena.used());
-        // The arena estimate includes shared weights and per-tensor alignment.
-        int lo = 0, hi = experts;
-        while (lo < hi) {
-            const int candidate = lo + (hi - lo + 1) / 2;
-            if (cuda_model_arena_bytes(raw, ctx.cost_hardware(), candidate) <= available) lo = candidate;
-            else hi = candidate - 1;
-        }
-        resident = lo;
+    std::clog << " reclaimable_bytes=" << reclaim_bytes << " allocated_scratch_bytes=" << scratch
+              << " effective_budget_bytes=" << available << " shared_bytes=" << fixed
+              << " expert_budget_bytes=" << expert_budget << " expert_gpu_bytes=" << expert_gpu
+              << " expert_cpu_bytes=" << expert_cpu << " margin_bytes=" << expert_budget - expert_gpu << '\n';
+    constexpr const char* names[] = {"uniform", "prefix", "prefix_boundary"};
+    std::clog << "MoE placement gpu_resident_total=" << experts_gpu << " cpu_cold_total=" << experts_total - experts_gpu
+              << " full_gpu_layers=" << full_layers << " full_gpu_prefix=" << full_prefix << " boundary_layer=" << boundary
+              << " threads=" << ctx.cpu_workers().count() << " layout=" << (override_count < 0 ? names[choice.choice] : "explicit");
+    if (override_count < 0) {
+        const auto& hw = ctx.cost_hardware();
+        std::clog << " uniform_us=" << choice.candidate_us[0] << " prefix_us=" << choice.candidate_us[1]
+                  << " prefix_boundary_us=" << choice.candidate_us[2] << " cpu_dispatch_us=" << dispatch_us
+                  << " cpu_gbps=" << hw.cpu_q4_gemv_gbps << " gpu_gbps=" << hw.hbm_bw_gbps;
     }
-    raw.cfg.moe.gpu_resident_experts = std::min(resident, raw.cfg.moe.num_experts);
-    const auto preferred = select_cold_expert_path(ctx.cost_hardware(), expert_bytes);
-    std::clog << "MoE placement gpu_resident=" << resident << " cpu_cold=" << experts - resident;
-    if (resident < experts) {
-        std::clog << " cold_path=cpu_in_place";
-        if (preferred == ColdExpertPath::PcieStream) std::clog << " cost_preference=pcie_stream";
-    }
+    std::clog << " gpu_experts=";
+    for (size_t i = 0; i < raw.cfg.gpu_experts.size(); ++i) std::clog << (i ? "," : "") << raw.cfg.gpu_experts[i];
     std::clog << '\n';
-    return resident;
+    return kv_bytes;
+}
+
+void FusionModel::set_kv_commitment_tokens(int tokens) {
+    if (tokens < 0) throw std::invalid_argument("KV commitment must be nonnegative");
+    kv_commitment_tokens_ = tokens;
 }
 
 void FusionModel::set_moe_gpu_experts(int count) {
@@ -933,21 +1067,22 @@ bool FusionModel::load_gguf(CudaContext& ctx, const std::string& path, std::stri
     if (!own_weights) gguf_weights_.release();
     auto& weights = own_weights ? gguf_weights_ : ctx.weight_arena();
     const bool resize = own_weights || weights.capacity() == 0 || owned_gguf_arena_ == &ctx;
-    const int resident = place_cuda_experts(ctx, raw, moe_gpu_experts_override_,
-                                           cuda_kv_pool_.vram_budget_bytes(), num_slots(), resize,
-                                           resize ? weights.capacity() : 0);
+    const auto kv_budget = place_cuda_experts(ctx, raw, moe_gpu_experts_override_, requested_kv_budget_,
+        kv_commitment_tokens_, num_slots(), cuda_kv_dtype_, resize, resize ? weights.capacity() : 0);
+    cuda_kv_pool_.set_kv_vram_budget_bytes(kv_budget);
+    may_evict_paused_cuda_slots_ = true;
     if (resize) {
-        const size_t bytes = cuda_model_arena_bytes(raw, ctx.cost_hardware(), resident);
+        const size_t bytes = cuda_model_arena_bytes(raw, ctx.cost_hardware(), raw.cfg.gpu_experts);
         if (weights.capacity() != bytes) weights.init(bytes);
         else weights.reset();
         if (!own_weights) owned_gguf_arena_ = &ctx;
     }
-    if (!upload_raw_model_to_cuda(ctx, weights, raw, resident, cfg_, tok_embeddings_, final_norm_w_, lm_head_w_, gemma_inputs_,
+    if (!upload_raw_model_to_cuda(ctx, weights, raw, cfg_, tok_embeddings_, final_norm_w_, lm_head_w_, gemma_inputs_,
                                     cuda_workspace_.hidden, cuda_workspace_.logits, cuda_workspace_.token_ids, cuda_workspace_.position, cuda_workspace_.kv_length,
                                     layer_kinds_, layer_indices_, dense_layers_, gdn_layers_, moe_layers_)) {
         return false;
     }
-    cuda_kv_dtype_ = cfg_.dense.mla.latent_rank > 0 ? DType::F32 : ctx.kv_dtype();
+    if (resize && moe_gpu_experts_override_ < 0 && kv_budget) expert_slabs_.resize(moe_layers_.size());
     cuda_slots_[0] = make_cuda_session();
     rebuild_cuda_ir();
     return true;
@@ -957,14 +1092,24 @@ bool FusionModel::load_safetensors(CudaContext& ctx, const std::string& path, st
     LoadedModelRaw raw;
     if (!parse_safetensors_model_raw(path, max_seq_override, raw, err)) return false;
     release_cuda_sessions();
-    const int resident = place_cuda_experts(ctx, raw, moe_gpu_experts_override_,
-                                           cuda_kv_pool_.vram_budget_bytes(), num_slots(), false);
-    if (!upload_raw_model_to_cuda(ctx, ctx.weight_arena(), raw, resident, cfg_, tok_embeddings_, final_norm_w_, lm_head_w_, gemma_inputs_,
+    auto& weights = ctx.weight_arena();
+    const bool resize = weights.capacity() == 0 || owned_gguf_arena_ == &ctx;
+    const auto kv_budget = place_cuda_experts(ctx, raw, moe_gpu_experts_override_, requested_kv_budget_,
+        kv_commitment_tokens_, num_slots(), cuda_kv_dtype_, resize, resize ? weights.capacity() : 0);
+    cuda_kv_pool_.set_kv_vram_budget_bytes(kv_budget);
+    may_evict_paused_cuda_slots_ = true;
+    if (resize) {
+        const auto bytes = cuda_model_arena_bytes(raw, ctx.cost_hardware(), raw.cfg.gpu_experts);
+        if (weights.capacity() != bytes) weights.init(bytes);
+        else weights.reset();
+        owned_gguf_arena_ = &ctx;
+    }
+    if (!upload_raw_model_to_cuda(ctx, weights, raw, cfg_, tok_embeddings_, final_norm_w_, lm_head_w_, gemma_inputs_,
                                     cuda_workspace_.hidden, cuda_workspace_.logits, cuda_workspace_.token_ids, cuda_workspace_.position, cuda_workspace_.kv_length,
                                     layer_kinds_, layer_indices_, dense_layers_, gdn_layers_, moe_layers_)) {
         return false;
     }
-    cuda_kv_dtype_ = ctx.kv_dtype();
+    if (resize && moe_gpu_experts_override_ < 0 && kv_budget) expert_slabs_.resize(moe_layers_.size());
     cuda_slots_[0] = make_cuda_session();
     rebuild_cuda_ir();
     return true;
@@ -1027,6 +1172,8 @@ void FusionModel::release_cuda_sessions() {
     cuda_workspace_.graph_captured = false;
     for (auto& slot : cuda_slots_) slot.reset();
     cuda_kv_pool_.release();
+    expert_slabs_.clear();
+    expert_slab_bytes_ = 0;
     active_slot_ = 0;
     slot_clock_ = 0;
 }
@@ -1051,11 +1198,145 @@ void FusionModel::reset_kv_and_state(CudaContext& ctx) {
     ctx.synchronize();
 }
 
+size_t FusionModel::cuda_kv_page_bytes() const {
+    size_t page_bytes = 0;
+    for (const auto& layer : cuda_slots_[active_slot_]->kv) page_bytes += layer.page_bytes();
+    return page_bytes;
+}
+
+int FusionModel::cuda_max_active_tokens() const {
+    const int context = cfg_.dense.max_seq_len;
+    const auto budget = cuda_kv_pool_.vram_budget_bytes();
+    const auto page_bytes = cuda_kv_page_bytes();
+    if (!budget || !page_bytes) return context;
+    const auto pages = std::min(budget / page_bytes, static_cast<size_t>(1 + (context - 1) / kKvPageTokens));
+    return static_cast<int>(std::min(pages * kKvPageTokens, static_cast<size_t>(context)));
+}
+
+void FusionModel::validate_cuda_kv_capacity(int tokens) const {
+    const auto budget = cuda_kv_pool_.vram_budget_bytes();
+    if (tokens <= 0 || !budget) return;
+    const auto page_bytes = cuda_kv_page_bytes();
+    const size_t needed = static_cast<size_t>(1 + (tokens - 1) / kKvPageTokens) * page_bytes;
+    if (needed > budget)
+        throw std::invalid_argument("Active KV for " + std::to_string(tokens) + " tokens needs " +
+            std::to_string(needed) + " bytes, exceeding the " + std::to_string(budget) + "-byte KV budget");
+}
+
+void FusionModel::promote_cuda_expert_slabs(CudaContext& ctx, int budgeted_tokens) {
+    if (expert_slabs_.empty()) return;
+    if (cuda_kv_pool_.bytes() < cuda_kv_pool_.reserved_bytes()) {
+        ctx.synchronize();
+        cuda_kv_pool_.release_unused_tail();
+    }
+    size_t per_page = 0;
+    for (const auto& layer : cuda_session().kv) per_page += layer.page_bytes();
+    const auto pages = 1 + (budgeted_tokens - 1) / kKvPageTokens;
+    const auto required = std::max(cuda_kv_pool_.reserved_bytes(), per_page * pages);
+    const auto commitment = cuda_kv_pool_.vram_budget_bytes();
+    if (required >= commitment || expert_slab_bytes_ >= commitment - required) return;
+    size_t available = commitment - required - expert_slab_bytes_;
+    const auto align = [](size_t bytes) { return (bytes + 255) & ~size_t{255}; };
+    int promoted = 0;
+    for (size_t i = 0; i < moe_layers_.size(); ++i) {
+        auto& layer = moe_layers_[i];
+        auto& slab = expert_slabs_[i];
+        const int base = layer.cfg.gpu_resident_experts;
+        const int tail = layer.cfg.num_experts - base;
+        if (tail == 0 || slab.storage) continue;
+        const auto gate = layer.cpu_gate_up_w.bytes().size() / tail;
+        const auto up = layer.cpu_up_w.bytes().size() / tail;
+        const auto down = layer.cpu_down_w.bytes().size() / tail;
+        if (!gate || !down) continue;
+        auto bytes_for = [&](int n) { return align(gate * n) + align(up * n) + align(down * n); };
+        int count = tail;
+        while (count > 0 && bytes_for(count) > available) --count;
+        if (!count) continue;
+        const size_t bytes = bytes_for(count);
+        uint8_t* ptr = nullptr;
+        const auto status = cudaMalloc(&ptr, bytes);
+        if (status == cudaErrorMemoryAllocation) {
+            (void)cudaGetLastError();
+            break;
+        }
+        FUSIONRT_CUDA_CHECK(status);
+        ExpertSlab candidate;
+        candidate.storage.reset(ptr);
+        candidate.bytes = bytes;
+        auto upload = [&](const HostTensor& source, size_t unit, uint8_t*& dest) {
+            if (!unit) return Tensor{};
+            const auto& shape = source.desc.shape;
+            auto tensor = Tensor::make_contiguous({count, shape[1], shape[2]}, source.desc.dtype, Backend::CUDA, dest);
+            FUSIONRT_CUDA_CHECK(cudaMemcpyAsync(dest, source.bytes().data(), unit * count,
+                                                cudaMemcpyHostToDevice, ctx.stream()));
+            dest += align(unit * count);
+            return tensor;
+        };
+        auto g = upload(layer.cpu_gate_up_w, gate, ptr);
+        auto u = upload(layer.cpu_up_w, up, ptr);
+        auto d = upload(layer.cpu_down_w, down, ptr);
+        if (promoted++ == 0) {
+            cuda_workspace_.decode_graph.reset();
+            cuda_workspace_.graph_captured = false;
+        }
+        slab = std::move(candidate);
+        layer.borrowed_gate_up_w = std::move(g);
+        layer.borrowed_up_w = std::move(u);
+        layer.borrowed_down_w = std::move(d);
+        layer.cfg.gpu_resident_experts += count;
+        available -= bytes;
+        expert_slab_bytes_ += bytes;
+    }
+    if (promoted) {
+        int full = 0;
+        for (const auto& layer : moe_layers_) full += layer.cfg.gpu_resident_experts == layer.cfg.num_experts;
+        std::clog << "MoE slabs promoted=" << promoted << " borrowed_bytes=" << expert_slab_bytes_
+                  << " full_gpu_layers=" << full << " kv_reserved_bytes=" << cuda_kv_pool_.reserved_bytes() << '\n';
+    }
+}
+
+void FusionModel::reclaim_cuda_expert_slabs(CudaContext& ctx, size_t target_kv_bytes, bool allocation_failed) {
+    const auto commitment = cuda_kv_pool_.vram_budget_bytes();
+    const size_t allowed = allocation_failed ? 0 : commitment - std::min(commitment, target_kv_bytes);
+    if (expert_slab_bytes_ <= allowed) return;
+    ctx.synchronize();
+    cuda_workspace_.decode_graph.reset();
+    cuda_workspace_.graph_captured = false;
+    int evicted = 0;
+    for (size_t i = expert_slabs_.size(); i > 0 && expert_slab_bytes_ > allowed;) {
+        --i;
+        auto& slab = expert_slabs_[i];
+        if (!slab.storage) continue;
+        auto& layer = moe_layers_[i];
+        auto* ptr = slab.storage.release();
+        FUSIONRT_CUDA_CHECK(cudaFree(ptr));
+        expert_slab_bytes_ -= slab.bytes;
+        slab.bytes = 0;
+        layer.cfg.gpu_resident_experts -= static_cast<int>(layer.borrowed_gate_up_w.shape[0]);
+        layer.borrowed_gate_up_w = {};
+        layer.borrowed_up_w = {};
+        layer.borrowed_down_w = {};
+        ++evicted;
+    }
+    std::clog << "MoE slabs evicted=" << evicted << " borrowed_bytes=" << expert_slab_bytes_
+              << " target_kv_bytes=" << target_kv_bytes << '\n';
+}
+
 void FusionModel::ensure_cuda_kv(CudaContext& ctx, int first_write, int tokens) {
     auto& slot = cuda_session();
-    if (cuda_kv_pool_.host_budget_bytes() == 0 || cuda_slots_.size() == 1) {
-        cuda_kv_pool_.ensure(ctx, slot.kv, slot.pages, first_write, tokens);
+    std::function<void(size_t, bool)> reclaim;
+    if (expert_slab_bytes_) reclaim = [&](size_t target, bool failed) { reclaim_cuda_expert_slabs(ctx, target, failed); };
+    if (cuda_slots_.size() == 1 || (!may_evict_paused_cuda_slots_ && cuda_kv_pool_.host_budget_bytes() == 0)) {
+        cuda_kv_pool_.ensure(ctx, slot.kv, slot.pages, first_write, tokens, {}, reclaim);
         return;
+    }
+    if (cuda_kv_pool_.host_budget_bytes() == 0) {
+        try {
+            cuda_kv_pool_.ensure(ctx, slot.kv, slot.pages, first_write, tokens, {}, reclaim);
+            return;
+        } catch (const KvVramExhausted&) {
+            // A paused prefix can be evicted and prefilled again when the active request needs its pages.
+        }
     }
     std::vector<CudaSession*> paused;
     for (const auto& candidate : cuda_slots_) {
@@ -1067,7 +1348,20 @@ void FusionModel::ensure_cuda_kv(CudaContext& ctx, int first_write, int tokens) 
     std::vector<CudaKvPool::Table*> victims;
     victims.reserve(paused.size());
     for (auto* candidate : paused) victims.push_back(&candidate->pages);
-    cuda_kv_pool_.ensure(ctx, slot.kv, slot.pages, first_write, tokens, victims);
+    for (size_t evicted = 0;; ++evicted) {
+        try {
+            cuda_kv_pool_.ensure(ctx, slot.kv, slot.pages, first_write, tokens,
+                cuda_kv_pool_.host_budget_bytes() ? std::span(victims).subspan(evicted) :
+                                                  std::span<CudaKvPool::Table*>{}, reclaim);
+            break;
+        } catch (const KvVramExhausted&) {
+            if (!may_evict_paused_cuda_slots_ || evicted >= paused.size()) throw;
+            auto& victim = *paused[evicted];
+            cuda_kv_pool_.truncate(victim.pages, 0);
+            victim.cached_tokens.clear();
+            victim.checkpoints.clear();
+        }
+    }
 }
 
 void FusionModel::save_cuda_checkpoint(CudaContext& ctx, int tokens, bool logits) {
@@ -1277,6 +1571,13 @@ static OpTiming operator_work(const IRNode& node, int rows, int pos, const CudaC
 
 }  // namespace
 
+struct CudaIRSegment {
+    int first, end;
+    int input_value;
+    int boundary_value = -1;
+    Tensor* boundary = nullptr;
+};
+
 template<bool Observe = false>
 static void execute_ir_graph_cuda(
     const MiniGraph& g, CudaIRWorkspace& ws, CudaContext& ctx,
@@ -1288,10 +1589,12 @@ static void execute_ir_graph_cuda(
     const std::vector<CudaKvView>& kv_states, const std::vector<CudaGdnState>& gdn_states,
     const std::vector<CudaSparseMoELayer>& moe_layers,
     bool use_fused, OpTrace* op_trace = nullptr, CudaOpTimer* timer = nullptr,
-    LayerTrace* layer_trace = nullptr, bool compute_logits = true, bool all_logits = false) {
+    LayerTrace* layer_trace = nullptr, bool compute_logits = true, bool all_logits = false,
+    const CudaIRSegment* segment = nullptr) {
     size_t mark = ctx.scratch_arena().mark();
     int H = g.hidden_size;
-    int num_nodes = static_cast<int>(g.nodes.size());
+    const int first_node = segment ? segment->first : 0;
+    const int num_nodes = segment ? segment->end : static_cast<int>(g.nodes.size());
     const auto& last_use = ws.last_use;
 
     Tensor ple;
@@ -1325,10 +1628,11 @@ static void execute_ir_graph_cuda(
 
     auto& bufs = ws.bufs;
     std::fill(bufs.begin(), bufs.end(), Tensor{});
-    bufs[g.input_value] = Tensor::make_contiguous({M, H}, DType::F32, Backend::CUDA, x_input.ptr());
+    bufs[segment ? segment->input_value : g.input_value] =
+        Tensor::make_contiguous({M, H}, DType::F32, Backend::CUDA, x_input.ptr());
     auto& pa = prof_acc();
 
-    for (int ni = 0; ni < num_nodes; ++ni) {
+    for (int ni = first_node; ni < num_nodes; ++ni) {
         const IRNode& node = g.nodes[ni];
         if (!node.alive) continue;
         if (ni > non_carry_busy_until) {
@@ -1590,7 +1894,7 @@ static void execute_ir_graph_cuda(
                                 L.conv_w.ptr<float>(), L.conv_bias.ptr<float>(), L.A_log.ptr<float>(), L.dt_bias.ptr<float>(),
                                 L.norm_w.ptr<float>(), state.convolution.ptr<float>(), state.recurrence.ptr<float>(),
                                 gdn_out.ptr<float>(), nk, nv, dk, dv, node.norm_eps, q_scale, ctx.stream(), scratch,
-                                cfg.tiled_value_heads);
+                                cfg.tiled_value_heads, L.cfg.conv_kernel_size);
                         } else {
                             Tensor sqkv = cuda_scratch(ctx, {conv_dim});
                             Tensor sy = cuda_scratch(ctx, {v_dim});
@@ -1599,7 +1903,7 @@ static void execute_ir_graph_cuda(
                                 L.conv_w.ptr<float>(), L.conv_bias.ptr<float>(), L.A_log.ptr<float>(), L.dt_bias.ptr<float>(),
                                 L.norm_w.ptr<float>(), state.convolution.ptr<float>(), state.recurrence.ptr<float>(),
                                 gdn_out.ptr<float>(), sqkv.ptr<float>(), sy.ptr<float>(),
-                                nk, nv, dk, dv, node.norm_eps, q_scale, ctx.stream(), cfg.tiled_value_heads);
+                                nk, nv, dk, dv, node.norm_eps, q_scale, ctx.stream(), cfg.tiled_value_heads, L.cfg.conv_kernel_size);
                         }
                     } else {
                         int s_qkv = g.values[node.inputs[0]].cols;
@@ -1613,7 +1917,7 @@ static void execute_ir_graph_cuda(
                             L.conv_w.ptr<float>(), L.conv_bias.ptr<float>(), L.A_log.ptr<float>(), L.dt_bias.ptr<float>(),
                             L.norm_w.ptr<float>(), state.convolution.ptr<float>(), state.recurrence.ptr<float>(),
                             gdn_out.ptr<float>(), rows, nk, nv, dk, dv, node.norm_eps, q_scale, ctx.stream(),
-                            gdn_ws.ptr<float>(), gdn_ws.numel(), cfg.tiled_value_heads);
+                            gdn_ws.ptr<float>(), gdn_ws.numel(), cfg.tiled_value_heads, L.cfg.conv_kernel_size);
                     }
                 };
                 if (pa.enabled && M > 1) pa.gdn_ms += time_cuda_fn(ctx.stream(), run_gdn);
@@ -1674,8 +1978,9 @@ static void execute_ir_graph_cuda(
                                                     cudaMemcpyDeviceToDevice, ctx.stream()));
                 Tensor x_v = (rows == 1) ? out_t.view({node.output_cols}) : out_t;
                 const auto& L = moe_layers[static_cast<size_t>(node.layer_index)];
-                if (rows == 1) L.forward_cuda(ctx, x_v, use_fused);
-                else L.forward_prefill_cuda(ctx, x_v, rows, use_fused);
+                const bool trace_routes = ctx.moe_route_trace && ctx.moe_route_trace->enabled_for(&moe_layers);
+                const int index = trace_routes || (rows == 1 && !(segment && segment->boundary)) ? node.layer_index : -1;
+                L.forward_prefill_cuda(ctx, x_v, rows, use_fused, index, trace_routes ? start_pos : -1);
                 break;
             }
         }
@@ -1754,6 +2059,11 @@ static void execute_ir_graph_cuda(
             }
         }
     }
+    if (segment && segment->boundary) {
+        const auto& output = bufs[segment->boundary_value];
+        FUSIONRT_CUDA_CHECK(cudaMemcpyAsync(segment->boundary->ptr(), output.ptr(), output.nbytes(),
+                                            cudaMemcpyDeviceToDevice, ctx.stream()));
+    }
     ctx.scratch_arena().reset(mark);
 }
 
@@ -1773,6 +2083,20 @@ static bool can_use_cuda_graph(const std::vector<CudaSparseMoELayer>& layers) {
     });
 }
 
+static std::optional<std::pair<int, int>> moe_graph_prefix(const MiniGraph& graph,
+                                                          const std::vector<CudaSparseMoELayer>& layers) {
+    if (graph.gemma_inputs.token_embeddings) return std::nullopt;
+    std::optional<std::pair<int, int>> prefix;
+    for (int i = 0; i < static_cast<int>(graph.nodes.size()); ++i) {
+        const auto& node = graph.nodes[i];
+        if (!node.alive || node.op != OpKind::MOE_FFN_BLOCK) continue;
+        const auto& cfg = layers[node.layer_index].cfg;
+        if (cfg.gpu_resident_experts != cfg.num_experts) return prefix;
+        prefix = {i + 1, node.out};
+    }
+    return std::nullopt;
+}
+
 static void embed_tokens(CudaContext& ctx, const Tensor& table, const Tensor& ids, Tensor& hidden,
                          int rows, int width, float scale) {
     cuda_ops::embed_lookup_f32(table.ptr(), table.dtype, ids.ptr<int32_t>(), hidden.ptr<float>(),
@@ -1780,7 +2104,7 @@ static void embed_tokens(CudaContext& ctx, const Tensor& table, const Tensor& id
     if (scale != 1.0f) cuda_ops::scale_f32(hidden.ptr<float>(), rows * width, scale, ctx.stream());
 }
 
-static void run_forward_token_step_cuda(
+static bool run_forward_token_step_cuda(
     CudaContext& ctx, const HybridModelConfig& cfg,
     const Tensor& tok_embeddings, const MiniGraph& ir, CudaIRWorkspace& ws,
     Tensor& hidden_buf, Tensor& logits_buf, Tensor& tok_id_dev, Tensor& pos_dev, Tensor& kv_len_dev,
@@ -1828,20 +2152,59 @@ static void run_forward_token_step_cuda(
             graph_split_bucket = bucket;
         }
         decode_graph.launch(ctx.stream());
-    } else {
-        run_body(false);
+        return true;
     }
+    if (use_graph && !timer) {
+        if (const auto prefix = moe_graph_prefix(ir, moe_layers)) {
+            const auto [cut, boundary] = *prefix;
+            const int kv_len = pos + 1;
+            FUSIONRT_CUDA_CHECK(cudaMemcpyAsync(pos_dev.ptr(), &pos, sizeof(pos), cudaMemcpyHostToDevice, ctx.stream()));
+            FUSIONRT_CUDA_CHECK(cudaMemcpyAsync(kv_len_dev.ptr(), &kv_len, sizeof(kv_len), cudaMemcpyHostToDevice, ctx.stream()));
+            const int bucket = select_decode_splits(ctx.cost_hardware(), kv_len, cfg.dense.num_key_value_heads, kMaxDecodeSplits);
+            if (!graph_captured || graph_fused_flag != use_fused || graph_has_argmax != with_argmax ||
+                graph_split_bucket != bucket) {
+                const CudaIRSegment captured{0, cut, ir.input_value, boundary, &hidden_buf};
+                decode_graph.capture(ctx.stream(), [&] {
+                    embed_tokens(ctx, tok_embeddings, tok_id_dev, hidden_buf, 1, H, cfg.embed_scale);
+                    execute_ir_graph_cuda(ir, ws, ctx, hidden_buf, tok_id_dev, logits_buf, 1, pos, pos,
+                        pos_dev.ptr<int>(), kv_len_dev.ptr<int>(), dense_layers, gdn_layers, kv_states, gdn_states,
+                        moe_layers, use_fused, nullptr, nullptr, nullptr, false, false, &captured);
+                });
+                graph_captured = true;
+                graph_fused_flag = use_fused;
+                graph_has_argmax = with_argmax;
+                graph_split_bucket = bucket;
+            }
+            if (ctx.moe_timing) {
+                for (int i = 0; i < cut; ++i) {
+                    const auto& node = ir.nodes[i];
+                    if (node.alive && node.op == OpKind::MOE_FFN_BLOCK)
+                        ctx.moe_timing->layer(node.layer_index).hot += moe_layers[node.layer_index].cfg.top_k;
+                }
+            }
+            decode_graph.launch(ctx.stream());
+            const CudaIRSegment eager{cut, static_cast<int>(ir.nodes.size()), boundary};
+            execute_ir_graph_cuda(ir, ws, ctx, hidden_buf, tok_id_dev, logits_buf, 1, pos, pos, nullptr, nullptr,
+                dense_layers, gdn_layers, kv_states, gdn_states, moe_layers, use_fused,
+                nullptr, nullptr, nullptr, true, false, &eager);
+            if (with_argmax) decode_argmax(ctx, logits_buf, tok_id_dev, cfg.vocab_size);
+            return true;
+        }
+    }
+    run_body(false);
+    return false;
 }
 
 std::vector<float> FusionModel::forward_token_cuda(CudaContext& ctx, int32_t token_id, int pos,
                                                    bool use_fused, bool use_graph) {
     if (pos < 0 || pos >= cfg_.dense.max_seq_len) throw std::invalid_argument("Token position exceeds context");
+    validate_token_id(token_id, pos, cfg_.vocab_size);
     clear_cuda_history();
     ensure_cuda_kv(ctx, pos, pos + 1);
     const MiniGraph& ir = use_fused ? fused_ir_graph_ : raw_ir_graph_;
     CudaIRWorkspace ws(ir);
-    int32_t tid = std::clamp(token_id, int32_t{0}, cfg_.vocab_size - 1);
-    FUSIONRT_CUDA_CHECK(cudaMemcpyAsync(cuda_workspace_.token_ids.ptr(), &tid, sizeof(tid), cudaMemcpyHostToDevice, ctx.stream()));
+    FUSIONRT_CUDA_CHECK(cudaMemcpyAsync(cuda_workspace_.token_ids.ptr(), &token_id, sizeof(token_id),
+                                        cudaMemcpyHostToDevice, ctx.stream()));
     run_forward_token_step_cuda(ctx, cfg_, tok_embeddings_, ir, ws,
                                 cuda_workspace_.hidden, cuda_workspace_.logits, cuda_workspace_.token_ids, cuda_workspace_.position, cuda_workspace_.kv_length,
                                 dense_layers_, gdn_layers_, cuda_session().kv, cuda_session().gdn, moe_layers_,
@@ -1884,7 +2247,11 @@ int FusionModel::prefill_batch_limit(CudaContext& ctx, bool verify) const {
                 cuda_ops::gated_deltanet_prefill_scratch_floats(rows, g.num_k_heads, g.num_v_heads,
                                                               g.head_k_dim, g.head_v_dim));
         }
-        const auto layer = std::max({dense, recurrent, 3 * cfg_.moe.intermediate_size * layer_rows});
+        const size_t moe = moe_layers_.empty() ? 0 :
+            (4 * static_cast<size_t>(d.hidden_size) + cfg_.moe.num_experts + 2 * cfg_.moe.top_k +
+             3 * cfg_.moe.shared_intermediate_size) * layer_rows +
+            static_cast<size_t>(cfg_.moe.top_k) * cfg_.moe.intermediate_size;
+        const auto layer = std::max({dense, recurrent, moe});
         const size_t ple = gemma_inputs_.token_embeddings.data ?
             static_cast<size_t>(gemma_inputs_.token_embeddings.shape[1]) * layer_rows : 0;
         const size_t live = std::max((kPrefillCarrySlots + 2) * d.hidden_size * layer_rows + layer + ple,
@@ -2009,6 +2376,7 @@ std::vector<float> FusionModel::forward_prefill_cuda(CudaContext& ctx, const std
     if (total_tokens > static_cast<size_t>(cfg_.dense.max_seq_len)) {
         throw prompt_context_error(total_tokens, cfg_.dense.max_seq_len);
     }
+    validate_token_ids(token_ids, start_pos, cfg_.vocab_size);
     clear_cuda_history();
     return prefill_cuda_impl(ctx, token_ids.data(), static_cast<int>(token_ids.size()), start_pos, use_fused,
                              nullptr, nullptr, false, inputs_embeds);
@@ -2020,6 +2388,7 @@ std::vector<float> FusionModel::prefill_cached_cuda(CudaContext& ctx, const std:
     if (prompt.empty()) throw std::invalid_argument("Prompt is empty");
     if (prompt.size() > static_cast<size_t>(cfg_.dense.max_seq_len))
         throw prompt_context_error(prompt.size(), cfg_.dense.max_seq_len);
+    validate_token_ids(prompt, 0, cfg_.vocab_size);
     const int length = static_cast<int>(prompt.size());
     struct Match {
         size_t index = 0;
@@ -2190,12 +2559,7 @@ std::vector<float> FusionModel::prefill_cuda_impl(CudaContext& ctx, const int32_
                                                  int start_pos, bool use_fused, LayerTrace* layer_trace,
                                                  OpTrace* op_trace, bool save_prefix_checkpoints,
                                                  std::span<const InputEmbedding> inputs_embeds) {
-    std::vector<int32_t> sanitized;
-    if (std::any_of(token_ids, token_ids + count, [&](int32_t id) { return id < 0 || id >= cfg_.vocab_size; })) {
-        sanitized.assign(token_ids, token_ids + count);
-        for (auto& token : sanitized) token = std::clamp(token, int32_t{0}, cfg_.vocab_size - 1);
-        token_ids = sanitized.data();
-    }
+    validate_token_ids({token_ids, static_cast<size_t>(count)}, start_pos, cfg_.vocab_size);
     execute_prefill_chunks(ctx, token_ids, count, start_pos, use_fused, layer_trace, op_trace, true,
                            save_prefix_checkpoints, inputs_embeds);
     HostTensor logits = ctx.download(cuda_workspace_.logits);
@@ -2213,14 +2577,13 @@ void FusionModel::verify_cuda(CudaContext& ctx, const std::vector<int32_t>& inpu
     } restore{arena, arena.mark()};
     const int rows = static_cast<int>(input.size());
     const int vocab = cfg_.vocab_size;
+    validate_token_ids(input, pos, vocab);
     const int hidden_size = static_cast<int>(tok_embeddings_.shape[1]);
     ensure_cuda_kv(ctx, pos, pos + rows);
     Tensor ids = cuda_scratch(ctx, {rows}, DType::I32);
     Tensor hidden = cuda_scratch(ctx, {rows, hidden_size});
     Tensor batch_logits = cuda_scratch(ctx, {rows, vocab});
-    auto tokens = input;
-    for (auto& token : tokens) token = std::clamp(token, int32_t{0}, vocab - 1);
-    FUSIONRT_CUDA_CHECK(cudaMemcpyAsync(ids.ptr(), tokens.data(), rows * sizeof(int32_t),
+    FUSIONRT_CUDA_CHECK(cudaMemcpyAsync(ids.ptr(), input.data(), rows * sizeof(int32_t),
                                         cudaMemcpyHostToDevice, ctx.stream()));
     embed_tokens(ctx, tok_embeddings_, ids, hidden, rows, hidden_size, cfg_.embed_scale);
     const auto& ir = use_fused ? fused_ir_graph_ : raw_ir_graph_;
@@ -2254,6 +2617,8 @@ void FusionModel::verify_cuda(CudaContext& ctx, const std::vector<int32_t>& inpu
                                             cudaMemcpyDeviceToHost, ctx.stream()));
     }
     ctx.synchronize();
+    if (greedy && std::find(argmax.begin(), argmax.end(), -1) != argmax.end())
+        throw std::runtime_error("Sampling found no selectable logits during speculative verification");
 }
 
 static void lookup_draft(const std::vector<int32_t>& history, int limit, std::vector<int32_t>& input) {
@@ -2310,7 +2675,7 @@ std::vector<int32_t> FusionModel::generate_cuda(CudaContext& ctx, const std::vec
     if (!keep_state) start_pos = 0;
     std::vector<int32_t> tokens = prompt_ids;
     if (tokens.empty()) tokens.push_back(std::min(1, cfg_.vocab_size - 1));
-    for (auto& token : tokens) token = std::clamp(token, int32_t{0}, cfg_.vocab_size - 1);
+    validate_token_ids(tokens, start_pos, cfg_.vocab_size);
     const auto embeds = options.inputs_embeds;
     validate_input_embeddings(embeds, prompt_ids.size(), static_cast<int>(tok_embeddings_.shape[1]));
     if (!embeds.empty() && (keep_state || draft || options.spec_ngram > 0))
@@ -2321,6 +2686,7 @@ std::vector<int32_t> FusionModel::generate_cuda(CudaContext& ctx, const std::vec
     }
     const int prompt_len = static_cast<int>(tokens.size());
     max_new_tokens = std::min(max_new_tokens, cfg_.dense.max_seq_len - start_pos - prompt_len);
+    validate_cuda_kv_capacity(start_pos + prompt_len + max_new_tokens);
     if (json && max_new_tokens == 0) throw std::invalid_argument("JSON generation needs room for output tokens");
     const int batch_limit = (draft || options.spec_ngram > 0) && max_new_tokens > 1
         ? prefill_batch_limit(ctx, true) : 1;
@@ -2331,15 +2697,22 @@ std::vector<int32_t> FusionModel::generate_cuda(CudaContext& ctx, const std::vec
     const bool reuse = options.reuse_prefix && !keep_state && embeds.empty();
     if (keep_state) clear_cuda_history();
     else if (!reuse) reset_kv_and_state(ctx);
+    promote_cuda_expert_slabs(ctx, start_pos + prompt_len + max_new_tokens);
+    auto* route_trace = ctx.moe_route_trace;
+    if (route_trace) route_trace->begin(&moe_layers_);
     const bool greedy = options.sampling.greedy() && !json;
     const bool stochastic = options.sampling.temperature > 0;
     if (use_graph) {
         const char* fallback = nullptr;
         if (options.op_trace) fallback = "operation tracing is enabled";
+        else if (route_trace) fallback = "MoE route tracing is enabled";
         else if (json) fallback = "JSON grammar is enabled";
         else if (stochastic) fallback = "temperature is greater than zero";
         else if (options.sampling.repeat_penalty != 1.0f) fallback = "repeat_penalty is not 1";
-        else if (!can_use_cuda_graph(moe_layers_)) fallback = "some expert weights are on the CPU";
+        else if (!can_use_cuda_graph(moe_layers_) &&
+                 (!options.warn_on_graph_fallback ||
+                  !moe_graph_prefix(use_fused ? fused_ir_graph_ : raw_ir_graph_, moe_layers_)))
+            fallback = "no eligible MoE GPU prefix";
         if (fallback && options.warn_on_graph_fallback)
             std::clog << "--graph requested, using eager decoding because " << fallback << '\n';
         use_graph = fallback == nullptr;
@@ -2356,6 +2729,7 @@ std::vector<int32_t> FusionModel::generate_cuda(CudaContext& ctx, const std::vec
         FUSIONRT_CUDA_CHECK(cudaMemcpyAsync(&tok, cuda_workspace_.token_ids.ptr<int32_t>(), sizeof(int32_t),
                                             cudaMemcpyDeviceToHost, ctx.stream()));
         ctx.synchronize();
+        if (tok < 0) throw std::runtime_error("Sampling found no selectable logits");
         return tok;
     };
     auto sample_gpu = [&]() {
@@ -2402,13 +2776,12 @@ std::vector<int32_t> FusionModel::generate_cuda(CudaContext& ctx, const std::vec
     bool used_cuda_graph = false;
     auto decode = [&](bool first_step) {
         ensure_cuda_kv(ctx, pos, pos + 1);
-        run_forward_token_step_cuda(ctx, cfg_, tok_embeddings_, ir, ws,
+        used_cuda_graph = run_forward_token_step_cuda(ctx, cfg_, tok_embeddings_, ir, ws,
                                     cuda_workspace_.hidden, cuda_workspace_.logits, cuda_workspace_.token_ids, cuda_workspace_.position, cuda_workspace_.kv_length,
                                     dense_layers_, gdn_layers_, cuda_session().kv, cuda_session().gdn, moe_layers_,
                                     cuda_workspace_.decode_graph, cuda_workspace_.graph_captured, cuda_workspace_.graph_fused, cuda_workspace_.graph_has_argmax,
                                     cuda_workspace_.graph_split_bucket,
                                     pos++, use_fused, use_graph, greedy, first_step, options.op_trace, timer.get());
-        used_cuda_graph = use_graph;
     };
     auto emit = [&](int32_t token) {
         tokens.push_back(token);
@@ -2430,6 +2803,8 @@ std::vector<int32_t> FusionModel::generate_cuda(CudaContext& ctx, const std::vec
                                             static_cast<size_t>(max_new_tokens - 1) * sizeof(int32_t),
                                             cudaMemcpyDeviceToHost, ctx.stream()));
         ctx.synchronize();
+        if (std::find(tokens.begin() + prompt_len, tokens.end(), -1) != tokens.end())
+            throw std::runtime_error("Sampling found no selectable logits");
         gen_count = max_new_tokens;
     } else if (!speculative) {
         for (int step = 0; step < max_new_tokens; ++step) {
@@ -2481,11 +2856,16 @@ std::vector<int32_t> FusionModel::generate_cuda(CudaContext& ctx, const std::vec
         std::vector<int32_t> input, row_ids, draft_history;
         std::vector<float> rows;
         std::vector<Sampler::Distribution> draft_probs;
+        int ngram_depth = 1, ngram_misses = 0, ngram_pause = 0;
+        bool pending_on_device = greedy, reset_decode_position = true;
         bool running = max_new_tokens > 0 && emit(next_tok);
         while (running) {
             const int remaining = max_new_tokens - gen_count;
             const int start = pos;
-            int limit = std::min({remaining - 1, batch_limit - 1, draft ? options.draft_tokens : options.spec_ngram});
+            const bool ngram_probe = !draft && ngram_pause == 0;
+            if (ngram_pause > 0) --ngram_pause;
+            int limit = std::min({remaining - 1, batch_limit - 1, draft ? options.draft_tokens :
+                                  ngram_probe ? ngram_depth : 0});
             input.assign(1, tokens.back());
             draft_probs.clear();
             if (draft_slot && limit > 0 && start < draft->cfg_.dense.max_seq_len) {
@@ -2525,9 +2905,17 @@ std::vector<int32_t> FusionModel::generate_cuda(CudaContext& ctx, const std::vec
             }
             const int proposed = static_cast<int>(input.size()) - 1;
             if (proposed == 0) {
-                FUSIONRT_CUDA_CHECK(cudaMemcpyAsync(cuda_workspace_.token_ids.ptr(), &input[0], sizeof(int32_t),
-                                                    cudaMemcpyHostToDevice, ctx.stream()));
-                decode(true);
+                if (ngram_probe && limit > 0 && ++ngram_misses >= 3) {
+                    ngram_pause = 8;
+                    ngram_misses = 0;
+                }
+                if (!pending_on_device) {
+                    FUSIONRT_CUDA_CHECK(cudaMemcpyAsync(cuda_workspace_.token_ids.ptr(), input.data(), sizeof(int32_t),
+                                                        cudaMemcpyHostToDevice, ctx.stream()));
+                }
+                decode(reset_decode_position);
+                pending_on_device = greedy;
+                reset_decode_position = false;
                 if (greedy) next_tok = download_argmax_tok();
                 else {
                     auto host = ctx.download(cuda_workspace_.logits);
@@ -2540,6 +2928,9 @@ std::vector<int32_t> FusionModel::generate_cuda(CudaContext& ctx, const std::vec
             spec_proposed += proposed;
             copy_state(target_snapshot, target_slot.gdn_data, target_slot.ssm_bytes);
             verify_cuda(ctx, input, start, use_fused, rows, row_ids, greedy, reuse && target_snapshot);
+            pending_on_device = false;
+            reset_decode_position = true;
+            int accepted_count = 0;
             for (int i = 0; i <= proposed; ++i) {
                 const bool bonus = i == proposed;
                 if (greedy) next_tok = row_ids[i];
@@ -2556,8 +2947,19 @@ std::vector<int32_t> FusionModel::generate_cuda(CudaContext& ctx, const std::vec
                 }
                 const bool accepted = !bonus && next_tok == input[i + 1];
                 spec_accepted += accepted;
+                accepted_count += accepted;
                 running = emit(next_tok);
                 if (!accepted || !running) break;
+            }
+            if (!draft) {
+                if (accepted_count == proposed) {
+                    ngram_misses = 0;
+                    if (proposed == ngram_depth && ngram_depth < options.spec_ngram) ++ngram_depth;
+                } else {
+                    ngram_depth = std::max(1, accepted_count);
+                    ngram_pause = accepted_count == 0 ? 8 : 0;
+                    ngram_misses = 0;
+                }
             }
             // The last emitted token is pending. Only earlier tokens belong to the live KV/SSM prefix.
             const int kept = start_pos + static_cast<int>(tokens.size()) - 1;
@@ -2591,6 +2993,7 @@ std::vector<int32_t> FusionModel::generate_cuda(CudaContext& ctx, const std::vec
     if (options.op_trace && options.op_trace->ops.empty()) *options.op_trace = std::move(prefill_profile);
     auto td1 = std::chrono::high_resolution_clock::now();
     double decode_ms = std::chrono::duration<double, std::milli>(td1 - td0).count();
+    if (route_trace) route_trace->finish(start_pos + prompt_len, pos);
 
     if (stats) {
         stats->prompt_tokens = static_cast<int>(prompt_ids.size());

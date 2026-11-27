@@ -166,7 +166,8 @@ void fused_gated_deltanet_step_f32(
     float* ssm_state,
     float* out,
     int num_k_heads, int num_v_heads, int dk, int dv,
-    float eps, float q_scale, cudaStream_t stream, float* scratch = nullptr, bool tiled_value_heads = false);
+    float eps, float q_scale, cudaStream_t stream, float* scratch = nullptr, bool tiled_value_heads = false,
+    int conv_kernel = 4);
 
 // Allocate this many floats to enable chunkwise prefill.
 size_t gated_deltanet_prefill_scratch_floats(int M, int nk, int nv, int dk, int dv);
@@ -185,7 +186,7 @@ void fused_gated_deltanet_prefill_f32(
     float* out,
     int M, int num_k_heads, int num_v_heads, int dk, int dv,
     float eps, float q_scale, cudaStream_t stream, float* scratch = nullptr, size_t scratch_floats = 0,
-    bool tiled_value_heads = false);
+    bool tiled_value_heads = false, int conv_kernel = 4);
 
 void unfused_gated_deltanet_step_f32(
     const float* qkv_proj, const float* z, const float* a, const float* b,
@@ -193,7 +194,7 @@ void unfused_gated_deltanet_step_f32(
     const float* norm_w, float* conv_state, float* ssm_state, float* out,
     float* scratch_qkv, float* scratch_y,
     int num_k_heads, int num_v_heads, int dk, int dv,
-    float eps, float q_scale, cudaStream_t stream, bool tiled_value_heads = false);
+    float eps, float q_scale, cudaStream_t stream, bool tiled_value_heads = false, int conv_kernel = 4);
 
 // Fusion 3: Fused Q/K RMSNorm (optional) + RoPE (full or partial) + KV Cache Append
 void fused_qk_norm_rope_kv_append_f32(
@@ -232,6 +233,8 @@ void fused_gemv_q4_0(const float* x, const void* w_q4, float* y,
 
 void linear_repacked_k_f32(const float* x, const void* w, DType dtype, float* y,
                            int M, int N, int K, cudaStream_t stream);
+void linear_q2_k_f32(const float* x, const void* w, float* y,
+                     int M, int N, int K, cudaStream_t stream, bool allow_wmma = true);
 void fused_gemv_q4_1(const float* x, const void* w_q4_1, float* y,
                      int M, int N, int K, cudaStream_t stream);
 
@@ -298,13 +301,13 @@ void mla_attention_f32(const float* q, const float* kv, const float* kv_norm,
 void moe_topk_router_f32(const float* logits, int* topk_idx, float* topk_weight,
                         int num_experts, int top_k, bool norm_topk, cudaStream_t stream,
                         const float* selection_bias = nullptr, bool sigmoid = false, float scale = 1.0f,
-                        int groups = 1, int groups_used = 1);
+                        int groups = 1, int groups_used = 1, int rows = 1);
 
 void moe_indexed_swiglu_gemv(
     const float* x, const int* topk_idx, const void* gate_w, DType gate_type,
     const void* up_w, DType up_type, const void* down_w, DType down_type,
     const float* topk_weight, float* out, float* scratch_inter,
-    int hidden, int inter, int top_k, int resident, cudaStream_t stream);
+    int hidden, int inter, int top_k, int resident, cudaStream_t stream, int first_expert = 0);
 
 inline void moe_indexed_swiglu_gemv_f32(
     const float* x, const int* topk_idx, const float* gate_up_w, const float* down_w,

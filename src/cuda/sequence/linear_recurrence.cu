@@ -1,4 +1,5 @@
 #include "../cuda_common.cuh"
+#include "../../core/gdn_shape.h"
 
 #include <algorithm>
 
@@ -986,8 +987,9 @@ void fused_gated_deltanet_step_f32(
     const float* conv_w, const float* conv_bias, const float* A_log, const float* dt_bias,
     const float* norm_w, float* conv_state, float* ssm_state, float* out,
     int num_k_heads, int num_v_heads, int dk, int dv,
-    float eps, float q_scale, cudaStream_t stream, float* scratch, bool tiled_value_heads)
+    float eps, float q_scale, cudaStream_t stream, float* scratch, bool tiled_value_heads, int conv_kernel)
 {
+    validate_gdn_shape(conv_kernel, dk, dv, num_k_heads, num_v_heads);
     if (scratch && dv >= 64 && (dk == 64 || dk == 128)) {
         float* alpha = scratch + 2 * num_k_heads * dk + num_v_heads * dv;
         float* beta = alpha + num_v_heads;
@@ -1037,8 +1039,9 @@ void unfused_gated_deltanet_step_f32(
     const float* norm_w, float* conv_state, float* ssm_state, float* out,
     float* scratch_qkv, float* scratch_y,
     int num_k_heads, int num_v_heads, int dk, int dv,
-    float eps, float q_scale, cudaStream_t stream, bool tiled_value_heads)
+    float eps, float q_scale, cudaStream_t stream, bool tiled_value_heads, int conv_kernel)
 {
+    validate_gdn_shape(conv_kernel, dk, dv, num_k_heads, num_v_heads);
     int q_dim = num_k_heads * dk;
     int v_dim = num_v_heads * dv;
     int conv_dim = 2 * q_dim + v_dim;
@@ -1074,8 +1077,9 @@ void fused_gated_deltanet_prefill_f32(
     const float* conv_w, const float* conv_bias, const float* A_log, const float* dt_bias,
     const float* norm_w, float* conv_state, float* ssm_state, float* out,
     int M, int num_k_heads, int num_v_heads, int dk, int dv,
-    float eps, float q_scale, cudaStream_t stream, float* scratch, size_t scratch_floats, bool tiled_value_heads)
+    float eps, float q_scale, cudaStream_t stream, float* scratch, size_t scratch_floats, bool tiled_value_heads, int conv_kernel)
 {
+    validate_gdn_shape(conv_kernel, dk, dv, num_k_heads, num_v_heads);
     if (M <= 0) return;
     if (scratch != nullptr && M >= 4 && num_v_heads % num_k_heads == 0 && dv % 16 == 0 && (dk == 64 || dk == 128) &&
         scratch_floats >= gated_deltanet_prefill_scratch_floats(M, num_k_heads, num_v_heads, dk, dv)) {
@@ -1103,7 +1107,7 @@ void fused_gated_deltanet_prefill_f32(
             k_gdn_chunkwise_ssm<128><<<state_tiles, 256, 0, stream>>>(
                 qkv_act, conv_dim, coefficients, ssm_state, y_raw, M, num_k_heads, num_v_heads, dv, tiled_value_heads);
         }
-        k_gdn_prefill_gated_rmsnorm<<<dim3(num_v_heads, M), dv, 0, stream>>>(
+        k_gdn_prefill_gated_rmsnorm<<<dim3(num_v_heads, M), ((dv + 31) / 32) * 32, 0, stream>>>(
             y_raw, z, z_stride, norm_w, out, num_v_heads, dv, eps);
         return;
     }

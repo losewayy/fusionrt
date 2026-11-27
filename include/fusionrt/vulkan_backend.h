@@ -45,18 +45,22 @@ struct VkBufferAllocation {
     VkBuffer buffer = VK_NULL_HANDLE;
     VkDeviceMemory memory = VK_NULL_HANDLE;
     VkDeviceSize size = 0;
+    VkDeviceSize allocation_size = 0;
+    uint32_t heap_index = 0;
     void* mapped = nullptr;
 };
 
 class VkArena {
 public:
+    using Preflight = std::function<void(uint32_t, VkDeviceSize)>;
     VkArena() = default;
     ~VkArena();
     VkArena(const VkArena&) = delete;
     VkArena& operator=(const VkArena&) = delete;
 
     void init(VkDevice device, VkPhysicalDevice phys, VkDeviceSize capacity_bytes,
-              VkBufferUsageFlags usage, VkMemoryPropertyFlags mem_props, VkDeviceSize align);
+              VkBufferUsageFlags usage, VkMemoryPropertyFlags mem_props, VkDeviceSize align,
+              const Preflight& preflight = {});
     void release(VkDevice device);
 
     VkDeviceSize alloc(VkDeviceSize bytes);
@@ -70,6 +74,7 @@ public:
     void* mapped() const { return alloc_.mapped; }
 
 private:
+    friend class VkContext;
     VkBufferAllocation alloc_;
     VkDeviceSize offset_ = 0;
     VkDeviceSize align_ = 256;
@@ -103,6 +108,7 @@ public:
     VkQueue queue() const { return queue_; }
 
     VkArena& weight_arena() { return weight_arena_; }
+    void reserve_model_memory(VkDeviceSize weight_bytes, VkDeviceSize context_bytes);
     VkArena& scratch_arena() { return scratch_arena_; }
 
     Tensor upload(const HostTensor& ht, bool persistent = true);

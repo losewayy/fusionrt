@@ -10,6 +10,84 @@
 namespace fusionrt {
 using namespace model_io;
 
+namespace {
+
+bool expand_vk_weight(DType dtype) {
+    return dtype == DType::F16 || dtype == DType::BF16 || dtype == DType::Q4_1 ||
+           dtype == DType::Q2_K || dtype == DType::Q4_K || dtype == DType::Q5_K || dtype == DType::Q6_K;
+}
+
+bool expand_vk_embedding(DType dtype, bool tied) {
+    return expand_vk_weight(dtype) && (tied || (dtype != DType::F16 && dtype != DType::BF16));
+}
+
+bool pack_vk_qkv(const LoadedLayerRaw& layer, int hidden) {
+    return hidden % 4 == 0 && layer.q_proj.desc.dtype != DType::Q4_0 && layer.q_proj.desc.dtype != DType::Q8_0;
+}
+
+void reserve_vulkan_model(VkContext& ctx, const LoadedModelRaw& raw) {
+    const auto& cfg = raw.cfg;
+    const auto& dense = cfg.dense;
+    const int H = dense.hidden_size;
+    const auto align = std::max<VkDeviceSize>(256, ctx.info().min_storage_offset_align);
+    VkDeviceSize bytes = 0, state = 0;
+    auto add = [&](VkDeviceSize n) { bytes = ((bytes + align - 1) & ~(align - 1)) + std::max<VkDeviceSize>(16, n); };
+    const auto f32 = [](const HostTensor& t) { return static_cast<VkDeviceSize>(t.desc.numel()) * sizeof(float); };
+    auto matrix = [&](const HostTensor& t) { add(expand_vk_weight(t.desc.dtype) ? f32(t) : t.desc.nbytes()); };
+    auto state_tensor = [&](VkDeviceSize n) { const auto before = bytes; add(n); state += bytes - before; };
+    const bool tied = raw.lm_head_w.bytes().empty();
+    add(expand_vk_embedding(raw.tok_embeddings.desc.dtype, tied) ? f32(raw.tok_embeddings) : raw.tok_embeddings.desc.nbytes());
+    add(f32(raw.final_norm_w));
+    if (!tied) matrix(raw.lm_head_w);
+    add(H * sizeof(float));
+    add(H * sizeof(float));
+    add(cfg.vocab_size * sizeof(float));
+    add(sizeof(int32_t));
+    add(std::max(1, dense.head_dim) * sizeof(float));
+    auto routed = [&](const LoadedLayerRaw& l) {
+        add(f32(l.mlp_norm.bytes().empty() ? l.attn_norm : l.mlp_norm));
+        add(f32(l.router_w));
+        add(f32(l.experts_gate_up) + (l.experts_up.bytes().empty() ? 0 : f32(l.experts_up)));
+        add(f32(l.experts_down));
+        if (l.has_shared) { matrix(l.shared_gate_up); matrix(l.shared_down); }
+    };
+    auto dense_ffn = [&](const LoadedLayerRaw& l) {
+        add(f32(l.mlp_norm));
+        if (l.gate_up.bytes().empty()) add(f32(l.gate) + f32(l.up));
+        else matrix(l.gate_up);
+        matrix(l.down);
+    };
+    for (const auto& l : raw.layers) {
+        if (l.kind == 0) {
+            add(f32(l.attn_norm));
+            if (pack_vk_qkv(l, H)) add(f32(l.q_proj) + f32(l.k_proj) + f32(l.v_proj));
+            else { matrix(l.q_proj); matrix(l.k_proj); matrix(l.v_proj); }
+            for (const auto* bias : {&l.q_bias, &l.k_bias, &l.v_bias})
+                if (!bias->bytes().empty()) add(bias->desc.nbytes());
+            if (dense.qk_norm && !l.q_norm.bytes().empty()) { add(f32(l.q_norm)); add(f32(l.k_norm)); }
+            matrix(l.o_proj);
+            if (l.router_w.bytes().empty()) dense_ffn(l);
+            else routed(l);
+            const auto plane = static_cast<VkDeviceSize>(dense.max_seq_len) * dense.num_key_value_heads *
+                dense.head_dim * sizeof(float);
+            state_tensor(plane);
+            state_tensor(plane);
+        } else if (l.kind == 1) {
+            add(f32(l.attn_norm));
+            for (const auto* w : {&l.qkv_proj, &l.z_proj, &l.a_proj, &l.b_proj}) matrix(*w);
+            for (const auto* w : {&l.conv_w, &l.conv_bias, &l.A_log, &l.dt_bias, &l.gdn_norm_w}) add(f32(*w));
+            matrix(l.o_proj);
+            dense_ffn(l);
+            const auto& g = cfg.gdn;
+            state_tensor(static_cast<VkDeviceSize>(l.conv_w.desc.shape[0]) * 3 * sizeof(float));
+            state_tensor(static_cast<VkDeviceSize>(g.num_v_heads) * g.head_k_dim * g.head_v_dim * sizeof(float));
+        } else routed(l);
+    }
+    ctx.reserve_model_memory(bytes - state, state);
+}
+
+}  // namespace
+
 static void upload_raw_model_to_vulkan(VkContext& ctx, const LoadedModelRaw& raw,
                                        HybridModelConfig& cfg_out,
                                        Tensor& tok_emb, Tensor& final_norm, Tensor& lm_head,
@@ -19,14 +97,13 @@ static void upload_raw_model_to_vulkan(VkContext& ctx, const LoadedModelRaw& raw
                                        std::vector<VkDenseGQALayer>& dense_layers,
                                        std::vector<VkGatedDeltaNetLayer>& gdn_layers,
                                        std::vector<VkSparseMoELayer>& moe_layers) {
+    reserve_vulkan_model(ctx, raw);
     cfg_out = raw.cfg;
     int H = cfg_out.dense.hidden_size;
     // Vulkan shader embed_lookup / gemv supports F32, F16, BF16, Q8_0, Q4_0;
     // for F16/BF16 weights in linear projections on Vulkan, convert 2D matrices to F32 if needed
     auto upload_vk_weight = [&](const HostTensor& ht) -> Tensor {
-        if (ht.desc.dtype == DType::F16 || ht.desc.dtype == DType::BF16 ||
-            ht.desc.dtype == DType::Q4_1 || ht.desc.dtype == DType::Q4_K ||
-            ht.desc.dtype == DType::Q5_K || ht.desc.dtype == DType::Q6_K) {
+        if (expand_vk_weight(ht.desc.dtype)) {
             return ctx.upload(to_f32_host(ht), true);
         }
         return ctx.upload(ht, true);
@@ -34,9 +111,7 @@ static void upload_raw_model_to_vulkan(VkContext& ctx, const LoadedModelRaw& raw
 
     const bool tied = raw.lm_head_w.bytes().empty();
     tok_emb = ctx.upload(
-        (raw.tok_embeddings.desc.dtype == DType::Q4_1 || raw.tok_embeddings.desc.dtype == DType::Q4_K ||
-         raw.tok_embeddings.desc.dtype == DType::Q5_K || raw.tok_embeddings.desc.dtype == DType::Q6_K ||
-         (tied && (raw.tok_embeddings.desc.dtype == DType::F16 || raw.tok_embeddings.desc.dtype == DType::BF16)))
+        expand_vk_embedding(raw.tok_embeddings.desc.dtype, tied)
             ? to_f32_host(raw.tok_embeddings) : raw.tok_embeddings,
         true);
     final_norm = ctx.upload(to_f32_host(raw.final_norm_w), true);
@@ -90,8 +165,7 @@ static void upload_raw_model_to_vulkan(VkContext& ctx, const LoadedModelRaw& raw
             VkDenseGQALayer L;
             L.cfg = cfg_out.dense;
             L.attn_norm_w = ctx.upload(to_f32_host(lr.attn_norm), true);
-            const bool packed_fp32 = (H % 4) == 0 && lr.q_proj.desc.dtype != DType::Q4_0 &&
-                                      lr.q_proj.desc.dtype != DType::Q8_0;
+            const bool packed_fp32 = pack_vk_qkv(lr, H);
             if (packed_fp32) {
                 L.qkv_proj_fused = ctx.upload(concat_rows_same_dtype(
                     {to_f32_host(lr.q_proj), to_f32_host(lr.k_proj), to_f32_host(lr.v_proj)}), true);
@@ -287,10 +361,11 @@ void FusionModel::reset_kv_and_state_vulkan(VkContext& ctx) {
 }
 
 std::vector<float> FusionModel::forward_token_vulkan(VkContext& ctx, int32_t token_id, int pos) {
+    if (pos < 0 || pos >= cfg_.dense.max_seq_len) throw std::invalid_argument("Token position exceeds context");
+    validate_token_id(token_id, pos, cfg_.vocab_size);
     int H = static_cast<int>(vk_hidden_a_.shape[0]);
-    int tid = std::max(0, std::min(cfg_.vocab_size - 1, token_id));
     HostTensor h_tid = HostTensor::create({1}, DType::I32);
-    h_tid.data<int32_t>()[0] = tid;
+    h_tid.data<int32_t>()[0] = token_id;
     // Upload token id into scratch and run ALL layers + final head in a single batched command buffer!
     size_t smark = ctx.scratch_arena().mark();
     Tensor d_tid = ctx.upload(h_tid, false);
@@ -499,7 +574,8 @@ std::vector<int32_t> FusionModel::generate_vulkan(VkContext& ctx, const std::vec
     if (max_new_tokens < 0 || start_pos < 0) throw std::invalid_argument("Invalid generation length or start position");
     if (!keep_state) start_pos = 0;
     std::vector<int32_t> tokens = prompt_ids;
-    if (tokens.empty()) tokens.push_back(1);
+    if (tokens.empty()) tokens.push_back(std::min(1, cfg_.vocab_size - 1));
+    validate_token_ids(tokens, start_pos, cfg_.vocab_size);
     const auto total_tokens = static_cast<size_t>(start_pos) + tokens.size();
     const int context = cfg_.dense.max_seq_len;
     if (total_tokens > static_cast<size_t>(context)) throw prompt_context_error(total_tokens, context);
@@ -520,8 +596,7 @@ std::vector<int32_t> FusionModel::generate_vulkan(VkContext& ctx, const std::vec
     int decode_steps = 0;
     auto td0 = std::chrono::high_resolution_clock::now();
     for (int step = 0; step < max_new_tokens; ++step) {
-        int32_t next_tok = static_cast<int32_t>(
-            std::distance(logits.begin(), std::max_element(logits.begin(), logits.end())));
+        const int32_t next_tok = Sampler::argmax(logits.data(), static_cast<int>(logits.size()));
         tokens.push_back(next_tok);
         ++gen_count;
         const bool eos = next_tok == stop_eos_id;

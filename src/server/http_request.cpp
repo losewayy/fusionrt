@@ -57,10 +57,12 @@ JsonObject error_body(std::string_view status, const std::string& message, std::
     return body;
 }
 
-JsonObject health_body(const std::string& model, const HybridModelConfig& cfg, int slots, const ModelMemory& cache) {
+JsonObject health_body(const std::string& model, const HybridModelConfig& cfg, int slots, int max_active_tokens,
+                       const ModelMemory& cache) {
     const auto& arch = cfg.model_architecture.empty() ? cfg.arch : cfg.model_architecture;
     return {{"status", "ok"}, {"model", model}, {"arch", arch}, {"backend", "cuda"},
-            {"max_seq", cfg.dense.max_seq_len}, {"slots", slots}, {"kv_pages", cache.kv_pages},
+            {"max_seq", cfg.dense.max_seq_len}, {"max_active_tokens", max_active_tokens},
+            {"slots", slots}, {"kv_pages", cache.kv_pages},
             {"kv_bytes", static_cast<int64_t>(cache.kv_bytes)},
             {"kv_reserved_bytes", static_cast<int64_t>(cache.kv_reserved_bytes)},
             {"host_kv_bytes", static_cast<int64_t>(cache.host_kv_bytes)},

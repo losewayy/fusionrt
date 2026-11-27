@@ -192,6 +192,11 @@ void ToolParser::push(std::string_view chunk) {
 
 void ToolParser::finish() {
     drain(true);
+    if (mode_ == Mode::tagged) {
+        emit_text(tool_open);
+        truncated_call_ = true;
+        mode_ = Mode::text;
+    }
 }
 
 void ToolParser::emit_text(std::string_view text) {
@@ -272,7 +277,14 @@ void ToolParser::drain(bool final) {
                 }
             }
             if (!end && !final) return;
-            if (!end) end = view.size();
+            if (!end) {
+                end = view.size();
+                if (mode_ == Mode::tagged) {
+                    emit_text(tool_open);
+                    emit_text(view);
+                    truncated_call_ = true;
+                }
+            }
             const bool call = payload && emit_call(view.substr(0, payload));
             if (!call && mode_ == Mode::json && !explicit_json_) emit_text(view.substr(0, end));
             pending_.erase(0, end);
@@ -299,8 +311,9 @@ void ToolParser::drain(bool final) {
             continue;
         }
         if (marker.empty()) {
-            emit_text(view.substr(0, view.size() - hold));
-            pending_.erase(0, final ? view.size() : view.size() - hold);
+            const size_t ready = final ? view.size() : view.size() - hold;
+            emit_text(view.substr(0, ready));
+            pending_.erase(0, ready);
             return;
         }
         emit_text(view.substr(0, offset));

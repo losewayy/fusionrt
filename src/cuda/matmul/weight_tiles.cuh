@@ -58,7 +58,7 @@ __device__ __forceinline__ float repacked_k_value(const BlockQ6_A& b, int i) {
 }
 
 // Weight kind enum for unified WMMA prefill kernel:
-// 0=F16, 1=BF16, 2=Q8_0, 3=Q4_0, 4=Q4_1, 5=Q4_K, 6=Q6_K, 7=Q5_K, 8=Q4_KA, 9=Q6_A
+// 0=F16, 1=BF16, 2=Q8_0, 3=Q4_0, 4=Q4_1, 5=Q4_K, 6=Q6_K, 7=Q5_K, 8=Q4_KA, 9=Q6_A, 10=Q2_K
 template <int WK>
 __device__ __forceinline__ float dequant_weight_elem(const void* w, int n, int k0, int c, int K) {
     if constexpr (WK == 0) {
@@ -100,6 +100,12 @@ __device__ __forceinline__ float dequant_weight_elem(const void* w, int n, int k
         using W = std::conditional_t<WK == 8, BlockQ4_KA, BlockQ6_A>;
         const int64_t block = static_cast<int64_t>(n) * (K / 256) + k0 / 256;
         return repacked_k_value(static_cast<const W*>(w)[block], (k0 + c) % 256);
+    } else if constexpr (WK == 10) {
+        const auto& b = reinterpret_cast<const BlockQ2_K*>(w)[static_cast<int64_t>(n) * (K / 256) + k0 / 256];
+        const int i = (k0 + c) % 256;
+        const int sm = __ldg(&b.scales[i / 16]);
+        const int q = (__ldg(&b.qs[(i / 128) * 32 + i % 32]) >> (((i / 32) % 4) * 2)) & 3;
+        return (half_bits_to_f32(__ldg(&b.d)) * (sm & 15)) * q - half_bits_to_f32(__ldg(&b.dmin)) * (sm >> 4);
     } else {
         int nb = K >> 8;
         const BlockQ6_K& blk = reinterpret_cast<const BlockQ6_K*>(w)[static_cast<int64_t>(n) * nb + (k0 >> 8)];

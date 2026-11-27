@@ -9,6 +9,7 @@
 #include "cli_args.h"
 #ifdef FUSIONRT_ENABLE_CUDA
 #include "fusionrt/cuda_backend.h"
+#include "../core/moe_route_trace.h"
 #endif
 #ifdef FUSIONRT_ENABLE_VULKAN
 #include "fusionrt/vulkan_backend.h"
@@ -43,6 +44,7 @@ void print_usage() {
               << "               [--steps <n>] [--max-seq 4096] [--graph|--no-graph] [--unfused] [--stream]\n"
               << "               [--temp 0] [--top-k 40] [--top-p 0.95] [--min-p 0.05] [--repeat-penalty 1] [--seed 42]\n"
               << "               [--profile <json>] [--profile-ops <json>] [--trace-layers <json>]\n"
+              << "               [--slots <n>] [--warmup <n>] [--trace-moe] [--trace-moe-routes <jsonl>] [--cpu-moe-f32]\n"
               << "               [--json-grammar] [--spec-ngram <k> | --draft-model <gguf> [--draft-tokens 4]]\n"
               << "               [--mmproj <gguf> --image <path> ...] (use <image> to place images in the prompt)\n"
               << "               --steps defaults to 512 with --model and 16 for synthetic models.\n"
@@ -50,9 +52,11 @@ void print_usage() {
               << "  fusionrt chat --model <path> [--system <text>] [--temp 0.7] [--max-tokens 512]\n"
               << "  fusionrt serve --model <path> [--mmproj <gguf>] [--image <preset> ...]\n"
               << "                 [--host 127.0.0.1] [--port 8080] [--max-seq 4096] [--slots 1] [--profile <json>]\n"
-              << "                 [--spec-ngram <k> | --draft-model <gguf> [--draft-tokens 4]]\n"
+              << "                 [--spec-ngram <k> | --draft-model <gguf> [--draft-tokens 4]] [--trace-moe-routes <jsonl>]\n"
               << "  fusionrt bench-model --model <path> [--pp 128] [--tg 64] [--decode-prefix 0] [--ubatch 512] [--reps 5] [--graph] [--profile-ops <json>]\n"
-              << "  CUDA run, chat, serve, inspect and bench-model accept --kv-type {f32|f16|q8_0}.\n"
+              << "  CUDA run, chat, serve, inspect and bench-model accept --kv-dtype {auto|f32|f16|q8_0}.\n"
+              << "  CUDA --threads <n> controls CPU execution (0: auto). --cpu-affinity spread pins workers.\n"
+              << "  generate is an alias for run.\n"
               << "  CUDA placement options: --kv-vram-mb <MiB> (0: auto), --host-kv-mb <MiB> (0: disabled),\n"
               << "                          --moe-gpu-experts <n> (-1: auto).\n"
               << "  fusionrt bench [--suite all|fusions|blocks|vulkan] [--output <path>] [--vk-device 0]\n";
@@ -95,30 +99,35 @@ std::filesystem::path utf8_path(const std::string& path) {
     return std::filesystem::path(std::u8string(path.begin(), path.end()));
 }
 
-size_t estimate_arena_mb(const std::string& model_path) {
-    if (model_path.empty()) return 512;
-    std::error_code ec;
-    auto sz = std::filesystem::file_size(utf8_path(model_path), ec);
-    if (ec) return 1024;
-    size_t file_mb = static_cast<size_t>(sz / (1024ULL * 1024ULL)) + 1;
-    return std::min<size_t>(8192, std::max<size_t>(2048, file_mb * 3 + 768));
-}
-
-DType parse_kv_type(const std::string& value) {
+std::optional<DType> parse_kv_type(const std::string& value) {
+    if (value == "auto") return std::nullopt;
     if (value == "f16") return DType::F16;
     if (value == "f32") return DType::F32;
     if (value == "q8_0") return DType::Q8_0;
-    throw std::invalid_argument("Expected f32, f16 or q8_0 for --kv-type");
+    throw std::invalid_argument("Expected auto, f32, f16 or q8_0 for --kv-dtype");
 }
 
 struct CudaPlacementOptions {
     static constexpr size_t mib = 1024 * 1024;
     size_t vram = 0, host = 0;
-    int experts = -1;
-    bool specified = false;
+    int experts = -1, threads = 0;
+    bool specified = false, spread_affinity = false;
 
     bool parse(std::string_view option, std::string_view value) {
-        if (option != "--kv-vram-mb" && option != "--host-kv-mb" && option != "--moe-gpu-experts") return false;
+        if (option == "--cpu-affinity") {
+            if (value != "spread" && value != "none") throw std::invalid_argument("Expected spread or none for --cpu-affinity");
+            spread_affinity = value == "spread";
+            specified = true;
+            return true;
+        }
+        if (option != "--kv-vram-mb" && option != "--host-kv-mb" && option != "--moe-gpu-experts" && option != "--threads")
+            return false;
+        if (option == "--threads") {
+            threads = parse_integer(option, value);
+            if (threads < 0) throw std::invalid_argument("Expected --threads >= 0");
+            specified = true;
+            return true;
+        }
         if (option == "--moe-gpu-experts") {
             experts = parse_integer(option, value);
             if (experts < -1) throw std::invalid_argument("Expected --moe-gpu-experts >= -1");
@@ -132,7 +141,8 @@ struct CudaPlacementOptions {
     }
 
 #ifdef FUSIONRT_ENABLE_CUDA
-    void apply(FusionModel& model) const {
+    void apply(CudaContext& ctx, FusionModel& model) const {
+        ctx.set_cpu_threads(threads, spread_affinity);
         model.set_kv_vram_budget_bytes(vram);
         model.set_kv_host_budget_bytes(host);
         model.set_moe_gpu_experts(experts);
@@ -295,7 +305,7 @@ struct WeightSummary {
 
 int cmd_daily(const std::string& cmd, int argc, char** argv) {
     std::string path, system, profile, host = "127.0.0.1";
-    std::string mmproj;
+    std::string mmproj, route_trace_path;
     std::vector<std::string> image_paths;
     int max_seq = 4096, steps = 512, port = 8080, slots = 1;
     std::optional<bool> graph;
@@ -304,7 +314,7 @@ int cmd_daily(const std::string& cmd, int argc, char** argv) {
     sampling.temperature = 0.7f;
     sampling.top_p = 0.9f;
     sampling.repeat_penalty = 1.1f;
-    DType kv_dtype = DType::F32;
+    std::optional<DType> kv_dtype;
     CudaPlacementOptions placement;
     cli::SpeculativeArgs speculative;
     for (int i = 2; i < argc; ++i) {
@@ -321,12 +331,13 @@ int cmd_daily(const std::string& cmd, int argc, char** argv) {
         const std::string value = argv[++i];
         if (arg == "--model") path = value;
         else if (arg == "--max-seq") max_seq = parse_integer(arg, value);
-        else if (arg == "--kv-type") kv_dtype = parse_kv_type(value);
+        else if (arg == "--kv-type" || arg == "--kv-dtype") kv_dtype = parse_kv_type(value);
         else if (arg == "--profile") profile = value;
         else if (placement.parse(arg, value)) continue;
         else if (cmd == "serve" && arg == "--host") host = value;
         else if (cmd == "serve" && arg == "--port") port = parse_integer(arg, value);
         else if (cmd == "serve" && arg == "--mmproj") mmproj = value;
+        else if (cmd == "serve" && arg == "--trace-moe-routes") route_trace_path = value;
         else if (cmd == "serve" && arg == "--image") image_paths.push_back(value);
         else if (cmd == "serve" && speculative.parse(arg, value)) continue;
         else if (cmd == "serve" && arg == "--slots") {
@@ -452,11 +463,11 @@ int cmd_daily(const std::string& cmd, int argc, char** argv) {
     std::cerr << "CUDA backend was not enabled in this build.\n";
     return 1;
 #else
-    CudaContext ctx(0, is_gguf(path) ? 0 : estimate_arena_mb(path), 256);
+    CudaContext ctx(0, 0, 256);
     ctx.set_kv_dtype(kv_dtype);
     FusionModel model(HybridModelConfig{});
     model.set_num_slots(slots);
-    placement.apply(model);
+    placement.apply(ctx, model);
     load_cuda_model(ctx, model, path, max_seq, profile);
     if (cmd == "inspect") {
         WeightSummary sizes;
@@ -501,6 +512,9 @@ int cmd_daily(const std::string& cmd, int argc, char** argv) {
     auto draft = load_draft_model(ctx, tokenizer, speculative, max_seq);
     std::vector<Image> preset_images;
     for (const auto& image_path : image_paths) preset_images.push_back(load_image(image_path));
+    std::unique_ptr<MoeRouteTrace> route_trace;
+    if (!route_trace_path.empty()) route_trace = std::make_unique<MoeRouteTrace>(route_trace_path);
+    ctx.moe_route_trace = route_trace.get();
     serve_http(ctx, model, tokenizer, model_filename(path), host, port, graph, vision.get(), preset_images,
                {speculative.ngram, draft.get(), speculative.draft_tokens});
     return 0;
@@ -511,7 +525,7 @@ int cmd_bench_model(int argc, char** argv) {
 #ifdef FUSIONRT_ENABLE_CUDA
     std::string path;
     int pp = 128, tg = 64, reps = 5, decode_prefix = 0, ubatch = 512;
-    DType kv_dtype = DType::F32;
+    std::optional<DType> kv_dtype;
     std::optional<bool> graph_option;
     std::string profile, profile_ops;
     CudaPlacementOptions placement;
@@ -525,7 +539,7 @@ int cmd_bench_model(int argc, char** argv) {
         if (a == "--graph" || a == "--no-graph") graph_option = a == "--graph";
         else if (a == "--profile" && i + 1 < argc) profile = argv[++i];
         else if (a == "--profile-ops" && i + 1 < argc) profile_ops = argv[++i];
-        else if (a == "--kv-type" && i + 1 < argc) kv_dtype = parse_kv_type(argv[++i]);
+        else if ((a == "--kv-type" || a == "--kv-dtype") && i + 1 < argc) kv_dtype = parse_kv_type(argv[++i]);
         else if (a == "--model" && i + 1 < argc) path = argv[++i];
         else if (a == "--pp" && i + 1 < argc) pp = parse_int(a, argv[++i]);
         else if (a == "--tg" && i + 1 < argc) tg = parse_int(a, argv[++i]);
@@ -542,10 +556,10 @@ int cmd_bench_model(int argc, char** argv) {
     if (decode_prefix > std::numeric_limits<int>::max() - tg || (decode_prefix != 0 && tg == 0)) {
         throw std::invalid_argument("--decode-prefix requires a positive generation count and a valid context length");
     }
-    CudaContext ctx(0, is_gguf(path) ? 0 : estimate_arena_mb(path), 256);
+    CudaContext ctx(0, 0, 256);
     ctx.set_kv_dtype(kv_dtype);
     FusionModel model(HybridModelConfig{});
-    placement.apply(model);
+    placement.apply(ctx, model);
     ctx.set_prefill_batch(ubatch);
     const auto load_start = std::chrono::steady_clock::now();
     load_cuda_model(ctx, model, path, std::max(pp, decode_prefix + tg), profile);
@@ -588,14 +602,15 @@ int cmd_run(int argc, char** argv) {
     std::string prompt = "Hello fusionrt";
     std::optional<int> steps_option;
     cli::SpeculativeArgs speculative;
-    int max_seq = 4096;
+    int max_seq = 4096, slots = 1, warmup = 0;
     int vk_dev = 0;
     std::optional<bool> graph_option;
     std::optional<DType> kv_dtype;
+    bool kv_dtype_set = false;
     CudaPlacementOptions placement;
     SamplingParams sampling;
-    std::string profile, profile_ops, layer_trace;
-    bool stream = false, sampling_set = false, json_grammar = false;
+    std::string profile, profile_ops, layer_trace, route_trace_path;
+    bool stream = false, sampling_set = false, json_grammar = false, trace_moe = false, cpu_moe_f32 = false;
     bool use_fused = true;
     bool chat_mode = false;
     bool ignore_eos = false;
@@ -615,7 +630,15 @@ int cmd_run(int argc, char** argv) {
         else if (a == "--prompt" && i + 1 < argc) prompt = argv[++i];
         else if (a == "--steps" && i + 1 < argc) steps_option = parse_integer(a, argv[++i]);
         else if (a == "--max-seq" && i + 1 < argc) max_seq = parse_integer(a, argv[++i]);
-        else if (a == "--kv-type" && i + 1 < argc) kv_dtype = parse_kv_type(argv[++i]);
+        else if (a == "--slots" && i + 1 < argc) slots = parse_integer(a, argv[++i]);
+        else if (a == "--warmup" && i + 1 < argc) warmup = parse_integer(a, argv[++i]);
+        else if (a == "--trace-moe") trace_moe = true;
+        else if (a == "--trace-moe-routes" && i + 1 < argc) route_trace_path = argv[++i];
+        else if (a == "--cpu-moe-f32") cpu_moe_f32 = true;
+        else if ((a == "--kv-type" || a == "--kv-dtype") && i + 1 < argc) {
+            kv_dtype = parse_kv_type(argv[++i]);
+            kv_dtype_set = true;
+        }
         else if (a == "--graph" || a == "--no-graph") graph_option = a == "--graph";
         else if (a == "--stream") stream = true;
         else if (a == "--profile" && i + 1 < argc) profile = argv[++i];
@@ -633,9 +656,13 @@ int cmd_run(int argc, char** argv) {
     }
     const int steps = steps_option.value_or(model_path.empty() ? 16 : 512);
     sampling.validate();
-    if (kv_dtype && backend_s != "cuda") throw std::invalid_argument("--kv-type requires the CUDA backend");
+    if (kv_dtype_set && backend_s != "cuda") throw std::invalid_argument("--kv-dtype requires the CUDA backend");
     if (placement.specified && backend_s != "cuda") throw std::invalid_argument("Placement options require the CUDA backend");
     if (steps < 0 || max_seq <= 0) throw std::invalid_argument("Invalid --steps or --max-seq");
+    if (slots < 1 || warmup < 0) throw std::invalid_argument("Expected --slots >= 1 and --warmup >= 0");
+    if ((slots != 1 || warmup || trace_moe || !route_trace_path.empty() || cpu_moe_f32) && (backend_s != "cuda" || chat_mode))
+        throw std::invalid_argument("--slots, --warmup, --trace-moe and --cpu-moe-f32 require non-interactive CUDA run");
+    if (trace_moe && speculative.enabled()) throw std::invalid_argument("--trace-moe requires standard decoding");
     if (!image_paths.empty() && mmproj.empty()) throw std::invalid_argument("--image requires --mmproj");
     if (!mmproj.empty() && (backend_s != "cuda" || chat_mode))
         throw std::invalid_argument("--mmproj requires non-interactive CUDA run");
@@ -664,20 +691,30 @@ int cmd_run(int argc, char** argv) {
     FusionModel model(cfg);
     BpeTokenizer tok;
     if (model_path.empty()) tok.init_byte_fallback(cfg.vocab_size);
-    size_t weight_mb = estimate_arena_mb(model_path);
-    (void)weight_mb;
 
     if (backend_s == "cuda") {
 #ifndef FUSIONRT_ENABLE_CUDA
         std::cerr << "CUDA backend was not enabled in this build.\n";
         return 1;
 #else
-        CudaContext ctx(0, is_gguf(model_path) ? 0 : weight_mb, 256);
+        CudaContext ctx(0, model_path.empty() ? 512 : 0, 256);
         const auto load_start = std::chrono::steady_clock::now();
-        placement.apply(model);
-        if (kv_dtype) ctx.set_kv_dtype(*kv_dtype);
+        placement.apply(ctx, model);
+        ctx.set_cpu_moe_q8(!cpu_moe_f32);
+        model.set_num_slots(slots);
+        ctx.set_kv_dtype(kv_dtype);
+        std::vector<int32_t> text_ids;
+        auto format_text = [&] {
+            return use_chatml && tok.has_chatml()
+                ? "<|im_start|>user\n" + prompt + "<|im_end|>\n<|im_start|>assistant\n" : prompt;
+        };
         if (!model_path.empty()) {
             load_tokenizer(tok, model_path);
+            if (image_paths.empty() && !chat_mode) {
+                text_ids = tok.encode(format_text(), true);
+                const auto requested = std::max(size_t{1}, text_ids.size()) + std::max(steps, warmup);
+                model.set_kv_commitment_tokens(static_cast<int>(std::min(requested, static_cast<size_t>(max_seq))));
+            }
             load_cuda_model(ctx, model, model_path, max_seq, profile);
         } else {
             model.init_synthetic(ctx, 42);
@@ -706,7 +743,7 @@ int cmd_run(int argc, char** argv) {
             final_prompt = "<|im_start|>user\n" + prompt + "<|im_end|>\n<|im_start|>assistant\n";
         VisionPrompt prepared;
         double vision_ms = 0;
-        if (image_paths.empty()) prepared.tokens = tok.encode(final_prompt, true);
+        if (image_paths.empty()) prepared.tokens = text_ids.empty() ? tok.encode(final_prompt, true) : std::move(text_ids);
         else {
             const auto image_start = std::chrono::steady_clock::now();
             std::vector<Image> images;
@@ -733,8 +770,30 @@ int cmd_run(int argc, char** argv) {
         options.op_trace = profile_ops.empty() ? nullptr : &op_trace;
         options.layer_trace = layer_trace.empty() ? nullptr : &trace;
         options.warn_on_graph_fallback = graph_option.value_or(false);
-        if (stream || stop_on_eos) {
+        if (warmup > 0) {
+            auto warm_options = options;
+            warm_options.op_trace = nullptr;
+            warm_options.layer_trace = nullptr;
+            model.generate_cuda(ctx, prompt_ids, warmup, use_fused, use_graph, nullptr, false, 0, -1, warm_options);
+        }
+        CudaMoeTiming moe_timing(trace_moe ? model.config().num_layers : 0);
+        std::unique_ptr<MoeRouteTrace> route_trace;
+        if (!route_trace_path.empty()) route_trace = std::make_unique<MoeRouteTrace>(route_trace_path);
+        ctx.moe_route_trace = route_trace.get();
+        using Clock = std::chrono::steady_clock;
+        Clock::time_point prev_token;
+        std::vector<double> decode_samples;
+        if (warmup || trace_moe) decode_samples.reserve(steps);
+        if (stream || stop_on_eos || warmup || trace_moe) {
             options.on_token = [&](int32_t id) {
+                if (warmup || trace_moe) {
+                    if (trace_moe) moe_timing.collect();
+                    const auto now = Clock::now();
+                    if (prev_token != Clock::time_point{})
+                        decode_samples.push_back(std::chrono::duration<double, std::milli>(now - prev_token).count());
+                    prev_token = now;
+                    if (trace_moe) ctx.moe_timing = &moe_timing;
+                }
                 if (stop_on_eos && tok.is_end_of_generation(id)) return false;
                 if (stream) std::cerr << utf8.push(tok.decode_token(id)) << std::flush;
                 return true;
@@ -743,6 +802,7 @@ int cmd_run(int argc, char** argv) {
         GenerationStats st;
         auto out_ids = model.generate_cuda(ctx, prompt_ids, steps, use_fused, use_graph, &st, false, 0,
                                            stop_on_eos ? tok.eos_id() : -1, options);
+        ctx.moe_timing = nullptr;
         if (stream) std::cerr << utf8.finish() << '\n';
         const auto name = model_filename(model_path);
         if (options.op_trace) op_trace.write(profile_ops, name);
@@ -763,6 +823,13 @@ int cmd_run(int argc, char** argv) {
                   << " prefill_tok/s=" << st.prefill_tok_per_s
                   << " decode_ms=" << st.decode_ms
                   << " decode_tok/s=" << st.decode_tok_per_s;
+        if (!decode_samples.empty()) {
+            std::sort(decode_samples.begin(), decode_samples.end());
+            auto percentile = [&](size_t p) { return decode_samples[(decode_samples.size() * p + 99) / 100 - 1]; };
+            const auto kv = model.cuda_cache_memory();
+            std::cout << " decode_p50_ms=" << percentile(50) << " decode_p95_ms=" << percentile(95)
+                      << " kv_reserved_bytes=" << kv.kv_reserved_bytes << " kv_live_bytes=" << kv.kv_bytes;
+        }
         if (!image_paths.empty()) {
             int64_t image_tokens = 0;
             for (const auto& embedding : prepared.inputs_embeds) image_tokens += embedding.rows.shape[0];
@@ -781,6 +848,16 @@ int cmd_run(int argc, char** argv) {
         const auto output_text = tok.decode(gen_only);
         if (constraint) (void)JsonValue::parse(output_text);
         std::cout << "output_text: " << output_text << "\n";
+        if (trace_moe) {
+            size_t index = 0;
+            for (const auto& layer : moe_timing.layers()) {
+                if (layer.hot || layer.cold)
+                    std::cout << "moe_layer=" << index << " hot=" << layer.hot << " cold=" << layer.cold
+                              << " d2h_wait_ms=" << layer.input_wait_ms << " cpu_ms=" << layer.cpu_ms
+                              << " exposed_gpu_gap_ms=" << layer.gpu_gap_ms << '\n';
+                ++index;
+            }
+        }
         return 0;
 #endif
     } else if (backend_s == "vulkan") {
@@ -791,7 +868,7 @@ int cmd_run(int argc, char** argv) {
         if (sampling_set || stream || !profile.empty() || !profile_ops.empty() || !layer_trace.empty()) {
             throw std::invalid_argument("Sampling, streaming and profiles require the CUDA backend");
         }
-        VkContext ctx(static_cast<uint32_t>(vk_dev), weight_mb, 256);
+        VkContext ctx(static_cast<uint32_t>(vk_dev), 0, 256);
         if (!model_path.empty()) {
             load_tokenizer(tok, model_path);
             std::string err;
@@ -898,13 +975,13 @@ int main(int argc, char** argv) {
             return 0;
         }
         if (cmd == "info") return cmd_info();
-        if (cmd == "run") return cmd_run(argc, argv);
+        if (cmd == "run" || cmd == "generate") return cmd_run(argc, argv);
         if (cmd == "inspect" || cmd == "chat" || cmd == "serve") return cmd_daily(cmd, argc, argv);
         if (cmd == "bench-model") return cmd_bench_model(argc, argv);
         if (cmd == "bench") {
             std::string suite = "all";
             std::string output = "bench_report.v1.json";
-            int vk_dev = 0;
+            std::optional<int> vk_dev;
             for (int i = 2; i < argc; ++i) {
                 std::string a = argv[i];
                 if (a == "--suite" && i + 1 < argc) suite = argv[++i];

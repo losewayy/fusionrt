@@ -3,12 +3,27 @@
 #include "fusionrt/types.h"
 
 #include <algorithm>
+#include <array>
 #include <bit>
 #include <cstddef>
 #include <cstdint>
 #include <limits>
+#include <numeric>
+#include <span>
+#include <vector>
 
 namespace fusionrt {
+
+constexpr size_t wddm_residency_reserve(size_t budget) {
+    // Leave room for residency changes and allocations outside the model arenas.
+    return budget / 8;
+}
+
+constexpr size_t wddm_model_available(size_t budget, size_t usage, size_t reclaimable) {
+    const auto resident_limit = budget - wddm_residency_reserve(budget);
+    usage -= std::min(usage, reclaimable);
+    return resident_limit - std::min(resident_limit, usage);
+}
 
 struct CostHardware {
     int sm_count = 0;
@@ -24,6 +39,123 @@ struct CostHardware {
     int shared_bytes_per_sm = 100 * 1024;
     int shared_bytes_per_block = 96 * 1024;
 };
+
+struct MoeLayerCost {
+    int experts = 0, top_k = 0, hidden = 0;
+    std::array<size_t, 3> expert_tensor_bytes{};
+
+    size_t gpu_bytes(int resident) const {
+        size_t bytes = 0;
+        for (const auto unit : expert_tensor_bytes) bytes += (unit * resident + 255) & ~size_t{255};
+        return bytes;
+    }
+};
+
+struct MoePlacement {
+    std::vector<int> gpu_experts;
+    std::array<double, 3> candidate_us{};
+    int choice = 0;
+};
+
+inline MoePlacement select_moe_placement(std::span<const MoeLayerCost> layers, size_t available,
+                                        const CostHardware& hw, double cpu_dispatch_us) {
+    std::array<std::vector<int>, 3> counts;
+    for (auto& candidate : counts) candidate.resize(layers.size());
+    int common = 0, maximum = 0;
+    for (const auto& layer : layers) maximum = std::max(maximum, layer.experts);
+    auto uniform_bytes = [&](int resident) {
+        size_t bytes = 0;
+        for (const auto& layer : layers) bytes += layer.gpu_bytes(std::min(layer.experts, resident));
+        return bytes;
+    };
+    for (int hi = maximum; common < hi;) {
+        const int n = common + (hi - common + 1) / 2;
+        if (uniform_bytes(n) <= available) common = n;
+        else hi = n - 1;
+    }
+    size_t remainder = available - uniform_bytes(common);
+    for (size_t i = 0; i < layers.size(); ++i) {
+        const auto& layer = layers[i];
+        auto& n = counts[0][i];
+        n = std::min(common, layer.experts);
+        if (n < layer.experts) {
+            const auto extra = layer.gpu_bytes(n + 1) - layer.gpu_bytes(n);
+            if (extra <= remainder) {
+                ++n;
+                remainder -= extra;
+            }
+        }
+    }
+
+    remainder = available;
+    for (size_t i = 0; i < layers.size(); ++i) {
+        const auto& layer = layers[i];
+        const auto full = layer.gpu_bytes(layer.experts);
+        if (full <= remainder) {
+            counts[1][i] = counts[2][i] = layer.experts;
+            remainder -= full;
+        } else {
+            while (counts[2][i] < layer.experts && layer.gpu_bytes(counts[2][i] + 1) <= remainder)
+                ++counts[2][i];
+            break;
+        }
+    }
+
+    const double cpu_bw = std::max(1.0, hw.cpu_q4_gemv_gbps) * 1000;
+    const double gpu_bw = std::max(1.0, hw.hbm_bw_gbps) * 1000;
+    const double pci_bw = std::max(1.0, hw.pcie_h2d_gbps) * 1000;
+    MoePlacement result;
+    for (size_t candidate = 0; candidate < counts.size(); ++candidate) {
+        auto& us = result.candidate_us[candidate];
+        for (size_t i = 0; i < layers.size(); ++i) {
+            const auto& l = layers[i];
+            if (l.experts == 0) continue;
+            const int gpu = counts[candidate][i];
+            const double bytes = static_cast<double>(l.gpu_bytes(l.experts)) / l.experts;
+            const double hot = l.top_k * static_cast<double>(gpu) / l.experts;
+            double all_hot = 1.0;
+            for (int k = 0; k < l.top_k; ++k)
+                all_hot *= static_cast<double>(std::max(0, gpu - k)) / (l.experts - k);
+            const double serial = gpu < l.experts ? hw.pcie_latency_us +
+                (l.hidden * sizeof(float) + l.top_k * (sizeof(float) + sizeof(int32_t))) / pci_bw : 0.0;
+            const double cpu = (l.top_k - hot) * bytes / cpu_bw + (1.0 - all_hot) * cpu_dispatch_us;
+            const double gpu_us = hot * bytes / gpu_bw;
+            us += serial + std::max(cpu, gpu_us) +
+                (1.0 - all_hot) * (hw.pcie_latency_us + l.hidden * sizeof(float) / pci_bw);
+        }
+        if (us < result.candidate_us[result.choice]) result.choice = static_cast<int>(candidate);
+    }
+    result.gpu_experts = std::move(counts[result.choice]);
+    return result;
+}
+
+struct MoeKvPlacement {
+    DType dtype;
+    MoePlacement experts;
+};
+
+inline MoeKvPlacement select_moe_kv_precision(std::span<const MoeLayerCost> layers, size_t available,
+    size_t arena_limit, size_t f16_bytes, size_t q8_bytes, const CostHardware& hw, double dispatch_us) {
+    auto placement = [&](size_t kv) {
+        return select_moe_placement(layers, std::min(available - kv, arena_limit), hw, dispatch_us);
+    };
+    if (f16_bytes > available) {
+        if (q8_bytes <= available) return {DType::Q8_0, placement(q8_bytes)};
+        return {DType::F16, {}};
+    }
+    auto half = placement(f16_bytes);
+    const auto resident = [](const MoePlacement& p) {
+        return std::accumulate(p.gpu_experts.begin(), p.gpu_experts.end(), 0);
+    };
+    const int total = std::accumulate(layers.begin(), layers.end(), 0,
+        [](int n, const MoeLayerCost& l) { return n + l.experts; });
+    if (resident(half) < total && q8_bytes < f16_bytes) {
+        auto quant = placement(q8_bytes);
+        if (resident(quant) > resident(half) && quant.candidate_us[quant.choice] < half.candidate_us[half.choice])
+            return {DType::Q8_0, std::move(quant)};
+    }
+    return {DType::F16, std::move(half)};
+}
 
 enum class MmqTileConfig : uint8_t {
     M16N32, M32N32, M32N64, M64N32, M64N64, M64N64K256,

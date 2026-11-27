@@ -9,6 +9,8 @@
 #include "fusionrt/json.h"
 #include <cstdint>
 #include <functional>
+#include <iosfwd>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -97,6 +99,9 @@ AbTimingResult measure_cuda_ab_interleaved(
 #endif
 
 // Run full benchmark suite and write bench_report.v1.json
-int run_benchmark_suite(const std::string& suite, const std::string& output_json_path, int vk_device_idx = 0);
+inline bool benchmark_passed(size_t entries, size_t failed) { return entries > 0 && failed == 0; }
+bool write_benchmark_report(std::ostream& output, const JsonObject& report);
+int run_benchmark_suite(const std::string& suite, const std::string& output_json_path,
+                        std::optional<int> vk_device = {});
 
 }  // namespace fusionrt::bench

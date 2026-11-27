@@ -87,6 +87,55 @@ void dequantize_row_q4_1(const BlockQ4_1* src, float* dst, int64_t cols) {
     }
 }
 
+void quantize_row_q2_k(const float* src, BlockQ2_K* dst, int64_t cols) {
+    for (int64_t block = 0; block < cols / 256; ++block) {
+        auto& out = dst[block];
+        const auto* x = src + block * 256;
+        float scales[16], minima[16];
+        float max_scale = 0.0f, max_min = 0.0f;
+        for (int sub = 0; sub < 16; ++sub) {
+            const auto* begin = x + sub * 16;
+            const auto [low, high] = std::minmax_element(begin, begin + 16);
+            minima[sub] = std::max(0.0f, -*low);
+            scales[sub] = (*high + minima[sub]) / 3.0f;
+            max_scale = std::max(max_scale, scales[sub]);
+            max_min = std::max(max_min, minima[sub]);
+        }
+        out.d = fp32_to_fp16(max_scale / 15.0f);
+        out.dmin = fp32_to_fp16(max_min / 15.0f);
+        const float d = fp16_to_fp32(out.d), dmin = fp16_to_fp32(out.dmin);
+        std::fill_n(out.qs, 64, uint8_t{0});
+        auto code = [](float value, float scale, int maximum) {
+            return scale > 0.0f ? static_cast<int>(std::clamp(std::nearbyint(value / scale), 0.0f,
+                                                            static_cast<float>(maximum))) : 0;
+        };
+        for (int sub = 0; sub < 16; ++sub) {
+            const int scale = code(scales[sub], d, 15), minimum = code(minima[sub], dmin, 15);
+            out.scales[sub] = static_cast<uint8_t>(scale | (minimum << 4));
+            for (int lane = 0; lane < 16; ++lane) {
+                const int i = sub * 16 + lane;
+                const int q = code(x[i] + dmin * minimum, d * scale, 3);
+                out.qs[(i / 128) * 32 + i % 32] |= static_cast<uint8_t>(q << (2 * ((i / 32) % 4)));
+            }
+        }
+    }
+}
+
+void dequantize_row_q2_k(const BlockQ2_K* src, float* dst, int64_t cols) {
+    for (int64_t block = 0; block < cols / 256; ++block) {
+        const auto& w = src[block];
+        const float d = fp16_to_fp32(w.d), dmin = fp16_to_fp32(w.dmin);
+        for (int sub = 0; sub < 16; ++sub) {
+            const int sm = w.scales[sub];
+            const float scale = d * (sm & 15), minimum = dmin * (sm >> 4);
+            const auto* packed = w.qs + (sub / 8) * 32 + (sub % 2) * 16;
+            const int shift = ((sub / 2) % 4) * 2;
+            for (int i = 0; i < 16; ++i)
+                dst[block * 256 + sub * 16 + i] = scale * ((packed[i] >> shift) & 3) - minimum;
+        }
+    }
+}
+
 void dequantize_row_q4_k(const BlockQ4_K* src, float* dst, int64_t cols) {
     const int64_t nb = cols / 256;
     auto get_scale_min = [](int j, const uint8_t* q, uint8_t& d_out, uint8_t& m_out) {

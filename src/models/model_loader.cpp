@@ -1,4 +1,5 @@
 #include "model_loader.h"
+#include "../core/gdn_shape.h"
 #include "fusionrt/gguf.h"
 #include "fusionrt/json.h"
 #include "fusionrt/safetensors.h"
@@ -14,6 +15,50 @@
 #include <string_view>
 
 namespace fusionrt::model_io {
+
+static void validate_gdn_layer(const LoadedLayerRaw& layer, int64_t taps, const GatedDeltaNetConfig& cfg,
+                               const std::string& prefix) {
+    validate_gdn_shape(taps, cfg.head_k_dim, cfg.head_v_dim, cfg.num_k_heads, cfg.num_v_heads);
+    const int64_t hidden = cfg.hidden_size, heads = cfg.num_v_heads;
+    const int64_t value_width = heads * cfg.head_v_dim;
+    const int64_t channels = 2LL * cfg.num_k_heads * cfg.head_k_dim + value_width;
+    auto check = [&](const char* name, const HostTensor& tensor, std::initializer_list<int64_t> expected) {
+        const auto& d = tensor.desc;
+        if (static_cast<size_t>(d.ndim) == expected.size() &&
+            std::equal(expected.begin(), expected.end(), d.shape.begin())) return;
+        std::ostringstream msg;
+        msg << "Invalid GDN tensor shape: " << prefix << name << " expected [";
+        const char* separator = "";
+        for (int64_t dim : expected) {
+            msg << separator << dim;
+            separator = ", ";
+        }
+        msg << "], got [";
+        for (int i = 0; i < d.ndim; ++i) msg << (i ? ", " : "") << d.shape[i];
+        msg << ']';
+        throw std::invalid_argument(msg.str());
+    };
+    if (layer.conv_w.desc.ndim == 3) check("conv_w", layer.conv_w, {channels, 1, taps});
+    else check("conv_w", layer.conv_w, {channels, taps});
+    check("conv_bias", layer.conv_bias, {channels});
+    check("A_log", layer.A_log, {heads});
+    check("dt_bias", layer.dt_bias, {heads});
+    check("gdn_norm_w", layer.gdn_norm_w, {cfg.head_v_dim});
+    check("qkv_proj", layer.qkv_proj, {channels, hidden});
+    check("z_proj", layer.z_proj, {value_width, hidden});
+    check("a_proj", layer.a_proj, {heads, hidden});
+    check("b_proj", layer.b_proj, {heads, hidden});
+    check("o_proj", layer.o_proj, {hidden, value_width});
+    check("attn_norm", layer.attn_norm, {hidden});
+    check("mlp_norm", layer.mlp_norm, {hidden});
+    if (layer.gate_up.bytes().empty()) {
+        check("gate", layer.gate, {cfg.intermediate_size, hidden});
+        check("up", layer.up, {cfg.intermediate_size, hidden});
+    } else {
+        check("gate_up", layer.gate_up, {2LL * cfg.intermediate_size, hidden});
+    }
+    check("down", layer.down, {hidden, cfg.intermediate_size});
+}
 
 HostTensor make_rand_f32(const std::vector<int64_t>& shape, std::mt19937_64& rng, float scale) {
     HostTensor ht = HostTensor::create(shape, DType::F32);
@@ -59,6 +104,12 @@ HostTensor quantize_host_matrix(const HostTensor& f32_ht, DType dt) {
         auto* dst = reinterpret_cast<BlockQ4_0*>(out.storage.data());
         int64_t nb = cols / 32;
         for (int64_t r = 0; r < rows; ++r) quantize_row_q4_0(src + r * cols, dst + r * nb, cols);
+        return out;
+    }
+    if (dt == DType::Q2_K) {
+        auto* dst = out.data<BlockQ2_K>();
+        const int64_t blocks = cols / 256;
+        for (int64_t r = 0; r < rows; ++r) quantize_row_q2_k(src + r * cols, dst + r * blocks, cols);
         return out;
     }
     if (dt == DType::Q4_A) {
@@ -128,6 +179,9 @@ HostTensor to_f32_host(const HostTensor& ht) {
         } else if (ht.desc.dtype == DType::Q4_1) {
             const auto* src = reinterpret_cast<const BlockQ4_1*>(ht.bytes().data());
             for (int64_t r = 0; r < rows; ++r) dequantize_row_q4_1(src + r * nb, out.data<float>() + r * cols, cols);
+        } else if (ht.desc.dtype == DType::Q2_K) {
+            const auto* src = ht.data<BlockQ2_K>();
+            for (int64_t r = 0; r < rows; ++r) dequantize_row_q2_k(src + r * (cols / 256), out.data<float>() + r * cols, cols);
         } else if (ht.desc.dtype == DType::Q4_K) {
             int64_t nbk = cols / 256;
             const auto* src = reinterpret_cast<const BlockQ4_K*>(ht.bytes().data());
@@ -170,13 +224,12 @@ struct GgufArchitecture {
     std::string_view name;
     bool rope_neox;
     bool recurrent = false;
-    bool experts = false;
 };
 
 constexpr GgufArchitecture supported_architectures[] = {
     {"llama", false}, {"qwen2", true}, {"qwen3", true}, {"qwen35", true, true},
-    {"qwen3moe", true, false, true}, {"deepseek2", false, false, true}, {"mistral", true}, {"phi3", true},
-    {"gemma", true}, {"gemma4", true}, {"dense", true}, {"hybrid", true, true}, {"moe", true, false, true},
+    {"qwen3moe", true}, {"deepseek2", false}, {"mistral", true}, {"phi3", true},
+    {"gemma", true}, {"gemma4", true}, {"dense", true}, {"hybrid", true, true}, {"moe", true},
 };
 
 }  // namespace
@@ -525,7 +578,7 @@ bool parse_gguf_model_raw(const std::string& path, int max_seq_override, LoadedM
                 throw std::runtime_error("DeepSeek MLA layer disagrees with leading_dense_block_count: " + p);
             }
             if (has_gdn && !spec->recurrent) throw std::runtime_error("Unexpected GGUF recurrent attention: " + arch);
-            if (has_moe && !spec->experts) throw std::runtime_error("Unexpected GGUF expert layer: " + arch);
+            if (has_moe && gemma4) throw std::runtime_error("Gemma 4 expert layers are unsupported");
             if (!has_attn && !has_gdn && !has_moe) throw std::runtime_error("GGUF layer has no supported attention: " + p);
             if (has_moe) {
                 if (has_gdn) throw std::runtime_error("Combined recurrent attention and MoE is unsupported");
@@ -536,12 +589,13 @@ bool parse_gguf_model_raw(const std::string& path, int max_seq_override, LoadedM
                 L.mlp_norm = to_f32_host(req(p + "ffn_norm.weight"));
                 L.router_w = to_f32_host(req(p + "ffn_gate_inp.weight"));
                 int E = static_cast<int>(L.router_w.desc.shape[0]);
-                if (L.router_w.desc.ndim != 2 || L.router_w.desc.shape[1] != H || E < out.cfg.moe.top_k ||
+                if (L.mlp_norm.desc.ndim != 1 || L.mlp_norm.desc.shape[0] != H ||
+                    L.router_w.desc.ndim != 2 || L.router_w.desc.shape[1] != H || E < out.cfg.moe.top_k ||
                     out.cfg.moe.top_k <= 0 || E > 256) {
                     throw std::runtime_error("Unsupported GGUF expert router shape: " + p);
                 }
                 if (deepseek2) {
-                    if (E != mla_experts || L.mlp_norm.desc.ndim != 1 || L.mlp_norm.desc.shape[0] != H) {
+                    if (E != mla_experts) {
                         throw std::runtime_error("Invalid DeepSeek MoE router or FFN norm: " + p);
                     }
                     if (gf.find_tensor(p + "exp_probs_b.bias")) {
@@ -648,7 +702,8 @@ bool parse_gguf_model_raw(const std::string& path, int max_seq_override, LoadedM
                     (gf.find_tensor(p + "ssm_z.weight") ? req(p + "ssm_z.weight") : req(p + "gdn_z.weight"));
                 L.a_proj = gf.find_tensor(p + "ssm_alpha.weight") ? req(p + "ssm_alpha.weight") : req(p + "gdn_a.weight");
                 L.b_proj = gf.find_tensor(p + "ssm_beta.weight") ? req(p + "ssm_beta.weight") : req(p + "gdn_b.weight");
-                L.conv_w = to_f32_host(gf.find_tensor(p + "ssm_conv1d.weight") ? gf.view_tensor(p + "ssm_conv1d.weight") : req(p + "gdn_conv.weight"));
+                L.conv_w = to_f32_host(gf.find_tensor(p + "ssm_conv1d.weight") ? gf.view_tensor(p + "ssm_conv1d.weight") :
+                    req(p + "gdn_conv.weight"));
                 if (gf.find_tensor(p + "ssm_conv1d.bias")) {
                     L.conv_bias = to_f32_host(gf.view_tensor(p + "ssm_conv1d.bias"));
                 } else if (gf.find_tensor(p + "gdn_conv.bias")) {
@@ -830,6 +885,7 @@ bool parse_gguf_model_raw(const std::string& path, int max_seq_override, LoadedM
             if (!valid_gate_up || !matrix(L.down, H, layer_inter)) {
                 throw std::runtime_error("Invalid GGUF FFN projection shapes: " + p);
             }
+            if (L.kind == 1) validate_gdn_layer(L, get_arch_int("ssm.conv_kernel", 4), out.cfg.gdn, p);
         }
     } catch (const std::exception& e) {
         if (err) *err = e.what();
@@ -971,6 +1027,7 @@ bool parse_safetensors_model_raw(const std::string& path, int max_seq_override, 
                 L.mlp_norm = to_f32_host(req(pfx + "post_attention_layernorm.weight"));
                 L.gate_up = concat_rows_same_dtype({req(pfx + "mlp.gate_proj.weight"), req(pfx + "mlp.up_proj.weight")});
                 L.down = req(pfx + "mlp.down_proj.weight");
+                validate_gdn_layer(L, get_int("linear_conv_kernel_dim", 4), out.cfg.gdn, pfx);
             } else if (sf.find_tensor(pfx + "mlp.gate.weight")) {
                 L.kind = 2;
                 saw_moe = true;

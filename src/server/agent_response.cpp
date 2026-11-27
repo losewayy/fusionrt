@@ -54,11 +54,13 @@ JsonObject chat_usage(const AgentResult& result) {
 }
 
 const char* chat_reason(const AgentResult& result) {
+    if (result.finish == Finish::truncated_tool_call) return "length";
     if (result.has_calls()) return "tool_calls";
     return result.finish == Finish::length ? "length" : "stop";
 }
 
 const char* messages_reason(const AgentResult& result) {
+    if (result.finish == Finish::truncated_tool_call) return "max_tokens";
     if (result.has_calls()) return "tool_use";
     return result.finish == Finish::length ? "max_tokens" : "end_turn";
 }
@@ -250,7 +252,7 @@ void AgentResponse::finish(Finish reason, int output_tokens) {
         }
         send("", std::string_view("[DONE]"));
     } else if (protocol_ == Protocol::responses) {
-        const bool incomplete = reason == Finish::length && !result_.has_calls();
+        const bool incomplete = reason == Finish::truncated_tool_call || (reason == Finish::length && !result_.has_calls());
         send(incomplete ? "response.incomplete" : "response.completed",
             {{"response", responses_body(incomplete ? "incomplete" : "completed")}});
     } else {
@@ -276,7 +278,9 @@ void AgentResponse::error(std::string_view message) {
 JsonValue AgentResponse::body() const {
     if (protocol_ == Protocol::messages) return messages_body(false);
     if (protocol_ == Protocol::responses) {
-        return responses_body(result_.finish == Finish::length && !result_.has_calls() ? "incomplete" : "completed");
+        const bool incomplete = result_.finish == Finish::truncated_tool_call ||
+                                (result_.finish == Finish::length && !result_.has_calls());
+        return responses_body(incomplete ? "incomplete" : "completed");
     }
     std::string text, reasoning;
     JsonArray calls;

@@ -87,6 +87,7 @@ struct HybridModelConfig {
     DenseGQAConfig dense;
     GatedDeltaNetConfig gdn;
     MoEConfig moe;
+    std::vector<int> gpu_experts;  // Per transformer layer, zero where there are no routed experts.
     std::string model_architecture;
     float embed_scale = 1.0f;
     float final_logit_softcapping = 0.0f;
@@ -95,6 +96,16 @@ struct HybridModelConfig {
 inline std::invalid_argument prompt_context_error(size_t tokens, int context) {
     return std::invalid_argument("Prompt (" + std::to_string(tokens) + " tokens) exceeds model context (" +
                                  std::to_string(context) + ")");
+}
+
+inline void validate_token_id(int32_t id, size_t position, int vocab_size) {
+    if (id < 0 || id >= vocab_size)
+        throw std::invalid_argument("Token ID " + std::to_string(id) + " at position " + std::to_string(position) +
+                                    " is outside vocabulary size " + std::to_string(vocab_size));
+}
+
+inline void validate_token_ids(std::span<const int32_t> ids, size_t start, int vocab_size) {
+    for (size_t i = 0; i < ids.size(); ++i) validate_token_id(ids[i], start + i, vocab_size);
 }
 
 struct GenerationStats {
@@ -220,20 +231,25 @@ struct CudaGdnState {
 
 struct CudaSparseMoELayer {
     MoEConfig cfg;
+    int model_layer_index = -1;
     Tensor norm_w;                // [hidden]
     Tensor router_w;              // [num_experts, hidden]
     Tensor router_bias;           // Optional correction for expert selection.
     Tensor gpu_gate_up_w;         // [gpu_resident_experts, (2*)inter, hidden]
     Tensor gpu_up_w;              // Separate up projection for unpacked gate/up weights.
     Tensor gpu_down_w;            // [gpu_resident_experts, hidden, inter]
+    Tensor borrowed_gate_up_w, borrowed_up_w, borrowed_down_w;
     HostTensor cpu_gate_up_w;     // [offloaded, (2*)inter, hidden]
     HostTensor cpu_up_w;
     HostTensor cpu_down_w;        // [offloaded, hidden, inter]
     Tensor shared_gate_up_w;      // [2*shared_inter, hidden]
     Tensor shared_down_w;         // [hidden, shared_inter]
 
-    void forward_cuda(CudaContext& ctx, Tensor& x_in_out, bool use_fused = true) const;
-    void forward_prefill_cuda(CudaContext& ctx, Tensor& x_in_out, int M, bool use_fused = true) const;
+    void forward_cuda(CudaContext& ctx, Tensor& x_in_out, bool use_fused = true, int moe_index = -1) const {
+        forward_prefill_cuda(ctx, x_in_out, 1, use_fused, moe_index);
+    }
+    void forward_prefill_cuda(CudaContext& ctx, Tensor& x_in_out, int M, bool use_fused = true,
+                              int moe_index = -1, int route_pos = -1) const;
 };
 #endif
 
@@ -304,7 +320,12 @@ public:
 #ifdef FUSIONRT_ENABLE_CUDA
     void set_num_slots(int n);
     int num_slots() const { return static_cast<int>(cuda_slots_.size()); }
-    void set_kv_vram_budget_bytes(size_t bytes) { cuda_kv_pool_.set_kv_vram_budget_bytes(bytes); }
+    void set_kv_vram_budget_bytes(size_t bytes) {
+        cuda_kv_pool_.set_kv_vram_budget_bytes(bytes);
+        requested_kv_budget_ = bytes;
+    }
+    void set_kv_commitment_tokens(int tokens);
+    void validate_cuda_kv_capacity(int tokens) const;
     void set_kv_host_budget_bytes(size_t bytes) { cuda_kv_pool_.set_kv_host_budget_bytes(bytes); }
     void set_moe_gpu_experts(int count);
     void init_synthetic(CudaContext& ctx, uint64_t seed = 42);
@@ -330,6 +351,7 @@ public:
     void set_device_profile(CudaContext& ctx, const DeviceProfile& profile);
     bool recommended_cuda_graph() const { return recommend_cuda_graph_; }
     ModelMemory cuda_cache_memory() const;
+    int cuda_max_active_tokens() const;
     DType cuda_kv_dtype() const { return cuda_kv_dtype_; }
     ModelMemory inspect_cuda(CudaContext& ctx);
     int prefill_batch_limit(CudaContext& ctx, bool verify = false) const;
@@ -337,6 +359,7 @@ public:
     const std::vector<CudaDenseGQALayer>& dense_layers() const { return dense_layers_; }
     const std::vector<CudaGatedDeltaNetLayer>& gdn_layers() const { return gdn_layers_; }
     const std::vector<CudaSparseMoELayer>& moe_layers() const { return moe_layers_; }
+    size_t cuda_borrowed_expert_bytes() const { return expert_slab_bytes_; }
     const MiniGraph& raw_ir_graph() const { return raw_ir_graph_; }
     const MiniGraph& fused_ir_graph() const { return fused_ir_graph_; }
     void rebuild_cuda_ir();
@@ -402,6 +425,9 @@ private:
     size_t active_slot_ = 0;
     uint64_t slot_clock_ = 0;
     int moe_gpu_experts_override_ = -1;
+    size_t requested_kv_budget_ = 0;
+    int kv_commitment_tokens_ = 0;
+    bool may_evict_paused_cuda_slots_ = false;
     CudaContext* owned_gguf_arena_ = nullptr;
 
     CudaSession& cuda_session() { return *cuda_slots_[active_slot_]; }
@@ -410,11 +436,21 @@ private:
     void clear_cuda_history();
     void zero_cuda_gdn(CudaContext& ctx);
     void ensure_cuda_kv(CudaContext& ctx, int first_write, int tokens);
+    void promote_cuda_expert_slabs(CudaContext& ctx, int budgeted_tokens);
+    friend struct CudaReviewTestAccess;
+    size_t cuda_kv_page_bytes() const;
+    void reclaim_cuda_expert_slabs(CudaContext& ctx, size_t target_kv_bytes, bool allocation_failed);
     void save_cuda_checkpoint(CudaContext& ctx, int tokens, bool logits);
 
     std::vector<CudaDenseGQALayer> dense_layers_;
     std::vector<CudaGatedDeltaNetLayer> gdn_layers_;
     std::vector<CudaSparseMoELayer> moe_layers_;
+    struct ExpertSlab {
+        std::unique_ptr<uint8_t, decltype(&cudaFree)> storage{nullptr, cudaFree};
+        size_t bytes = 0;
+    };
+    std::vector<ExpertSlab> expert_slabs_;
+    size_t expert_slab_bytes_ = 0;
     MiniGraph raw_ir_graph_;
     MiniGraph fused_ir_graph_;
     bool recommend_cuda_graph_ = false;

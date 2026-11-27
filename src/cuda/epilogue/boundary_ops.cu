@@ -210,7 +210,7 @@ __global__ void k_argmax_f32(const float* __restrict__ x, int n, int32_t* __rest
     int lane = tid & 31;
     int wid = tid >> 5;
     float best_v = -INFINITY;
-    int32_t best_i = 0;
+    int32_t best_i = -1;
 
     for (int i = blockIdx.x * blockDim.x + tid; i < n; i += gridDim.x * blockDim.x) {
         float v = __ldg(x + i);
@@ -237,7 +237,7 @@ __global__ void k_argmax_f32(const float* __restrict__ x, int n, int32_t* __rest
     if (wid == 0) {
         int nwarps = blockDim.x >> 5;
         best_v = (lane < nwarps) ? sv[lane] : -INFINITY;
-        best_i = (lane < nwarps) ? si[lane] : 0;
+        best_i = (lane < nwarps) ? si[lane] : -1;
         for (int off = 16; off > 0; off >>= 1) {
             float ov = __shfl_down_sync(0xFFFFFFFFu, best_v, off);
             int32_t oi = __shfl_down_sync(0xFFFFFFFFu, best_i, off);
@@ -357,7 +357,9 @@ __global__ void k_moe_topk_router(const float* __restrict__ logits,
                                   int num_experts, int top_k, bool norm_topk,
                                   const float* selection_bias, bool sigmoid, float scale,
                                   int groups, int groups_used) {
-    if (threadIdx.x != 0 || blockIdx.x != 0) return;
+    logits += static_cast<size_t>(blockIdx.x) * num_experts;
+    topk_idx += static_cast<size_t>(blockIdx.x) * top_k;
+    topk_weight += static_cast<size_t>(blockIdx.x) * top_k;
     float probs[256];
     const int ne = min(num_experts, 256);
     if (sigmoid) {
@@ -446,6 +448,7 @@ __device__ float moe_warp_dot(const float* x, const void* w, DType type, int row
         case DType::Q8_0: return moe_warp_dot<2>(x, w, row, cols);
         case DType::Q4_0: return moe_warp_dot<3>(x, w, row, cols);
         case DType::Q4_1: return moe_warp_dot<4>(x, w, row, cols);
+        case DType::Q2_K: return moe_warp_dot<10>(x, w, row, cols);
         case DType::Q4_K: return moe_warp_dot<5>(x, w, row, cols);
         case DType::Q6_K: return moe_warp_dot<6>(x, w, row, cols);
         case DType::Q5_K: return moe_warp_dot<7>(x, w, row, cols);
@@ -459,7 +462,7 @@ __global__ void k_moe_indexed_gate_up_swiglu(
     const void* gate_w, DType gate_type,
     const void* up_w, DType up_type,
     float* __restrict__ scratch_inter,
-    int hidden, int inter, int top_k, int resident)
+    int hidden, int inter, int top_k, int resident, int first_expert)
 {
     int wid = (blockIdx.x * blockDim.x + threadIdx.x) >> 5;
     int lane = threadIdx.x & 31;
@@ -468,7 +471,7 @@ __global__ void k_moe_indexed_gate_up_swiglu(
 
     int k_slot = wid / inter;
     int c = wid % inter;
-    int e = topk_idx[k_slot];
+    int e = topk_idx[k_slot] - first_expert;
     if (e < 0 || e >= resident) return;
     const int gate_row = (up_w ? e : 2 * e) * inter + c;
     const float g_acc = moe_warp_dot(x, gate_w, gate_type, gate_row, hidden);
@@ -485,7 +488,7 @@ __global__ void k_moe_indexed_down_combine(
     const void* __restrict__ down_w, DType down_type,
     const float* __restrict__ topk_weight,
     float* __restrict__ out,
-    int hidden, int inter, int top_k, int resident)
+    int hidden, int inter, int top_k, int resident, int first_expert)
 {
     int wid = (blockIdx.x * blockDim.x + threadIdx.x) >> 5;
     int lane = threadIdx.x & 31;
@@ -493,7 +496,7 @@ __global__ void k_moe_indexed_down_combine(
 
     float total = 0.0f;
     for (int k_slot = 0; k_slot < top_k; ++k_slot) {
-        int e = topk_idx[k_slot];
+        int e = topk_idx[k_slot] - first_expert;
         if (e < 0 || e >= resident) continue;
         total += moe_warp_dot(scratch_inter + k_slot * inter, down_w, down_type,
                               e * hidden + wid, inter) * topk_weight[k_slot];
@@ -510,6 +513,10 @@ __global__ void k_embed_lookup_f32(const uint8_t* __restrict__ table, int dtype,
     int m = idx / hidden;
     int c = idx % hidden;
     int tid = token_ids[m];
+    if (tid < 0) {
+        out[idx] = 0.0f;
+        return;
+    }
 
     float val = 0.0f;
     if (dtype == static_cast<int>(DType::F32)) {
@@ -543,6 +550,8 @@ __global__ void k_embed_lookup_f32(const uint8_t* __restrict__ table, int dtype,
         uint8_t byte_v = b.qs[i & 15];
         int q = (i < 16) ? static_cast<int>(byte_v & 0x0Fu) : static_cast<int>(byte_v >> 4);
         val = d * static_cast<float>(q) + mb;
+    } else if (dtype == static_cast<int>(DType::Q2_K)) {
+        val = dequant_weight_elem<10>(table, tid, c & ~31, c & 31, hidden);
     } else if (dtype == static_cast<int>(DType::Q4_K)) {
         val = dequant_weight_elem<5>(table, tid, c & ~31, c & 31, hidden);
     } else if (dtype == static_cast<int>(DType::Q5_K)) {
@@ -576,14 +585,20 @@ __global__ void k_embed_lookup_repacked_f32(const Block* __restrict__ table,
     const int row = blockIdx.y;
     const int col = blockIdx.x;
     const int lane = threadIdx.x;
-    const auto& b = table[static_cast<int64_t>(token_ids[row]) * blocks_per_row + col];
+    const auto index = (static_cast<int64_t>(row) * blocks_per_row + col) * 256 + lane;
+    const int token = token_ids[row];
+    if (token < 0) {
+        out[index] = 0.0f;
+        return;
+    }
+    const auto& b = table[static_cast<int64_t>(token) * blocks_per_row + col];
     float val;
     if constexpr (std::is_same_v<Block, BlockQ8_A>) {
         val = half_bits_to_f32(b.d[lane >> 5]) * reinterpret_cast<const int8_t*>(b.qs)[lane];
     } else {
         val = repacked_k_value(b, lane);
     }
-    out[(static_cast<int64_t>(row) * blocks_per_row + col) * 256 + lane] = val;
+    out[index] = val;
 }
 
 __device__ __forceinline__ void store_q8_1x4(float4 v, BlockQ8_1* out) {
@@ -941,13 +956,13 @@ void fused_qk_norm_rope_kv_append_f32(
 
 void moe_topk_router_f32(const float* logits, int* topk_idx, float* topk_weight,
                          int num_experts, int top_k, bool norm_topk, cudaStream_t stream,
-                         const float* selection_bias, bool sigmoid, float scale, int groups, int groups_used) {
-    if (num_experts <= 0 || num_experts > 256 || top_k <= 0 || groups <= 0 || groups > 128 ||
+                         const float* selection_bias, bool sigmoid, float scale, int groups, int groups_used, int rows) {
+    if (rows <= 0 || num_experts <= 0 || num_experts > 256 || top_k <= 0 || groups <= 0 || groups > 128 ||
         groups_used <= 0 || groups_used > groups || num_experts % groups != 0 ||
         groups_used * (num_experts / groups) < top_k) {
         throw std::invalid_argument("Invalid CUDA MoE router dimensions");
     }
-    k_moe_topk_router<<<1, 1, 0, stream>>>(logits, topk_idx, topk_weight, num_experts, top_k, norm_topk,
+    k_moe_topk_router<<<rows, 1, 0, stream>>>(logits, topk_idx, topk_weight, num_experts, top_k, norm_topk,
                                           selection_bias, sigmoid, scale, groups, groups_used);
 }
 
@@ -955,17 +970,17 @@ void moe_indexed_swiglu_gemv(
     const float* x, const int* topk_idx, const void* gate_w, DType gate_type,
     const void* up_w, DType up_type, const void* down_w, DType down_type,
     const float* topk_weight, float* out, float* scratch_inter,
-    int hidden, int inter, int top_k, int resident, cudaStream_t stream)
+    int hidden, int inter, int top_k, int resident, cudaStream_t stream, int first_expert)
 {
     constexpr int WARPS = 8;
     int total_up_rows = top_k * inter;
     int up_blocks = (total_up_rows + WARPS - 1) / WARPS;
     k_moe_indexed_gate_up_swiglu<<<up_blocks, WARPS * 32, 0, stream>>>(
-        x, topk_idx, gate_w, gate_type, up_w, up_type, scratch_inter, hidden, inter, top_k, resident);
+        x, topk_idx, gate_w, gate_type, up_w, up_type, scratch_inter, hidden, inter, top_k, resident, first_expert);
 
     int down_blocks = (hidden + WARPS - 1) / WARPS;
     k_moe_indexed_down_combine<<<down_blocks, WARPS * 32, 0, stream>>>(
-        scratch_inter, topk_idx, down_w, down_type, topk_weight, out, hidden, inter, top_k, resident);
+        scratch_inter, topk_idx, down_w, down_type, topk_weight, out, hidden, inter, top_k, resident, first_expert);
 }
 
 void embed_lookup_f32(const void* emb_table, DType table_dtype,

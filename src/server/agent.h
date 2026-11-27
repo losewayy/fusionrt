@@ -85,6 +85,7 @@ public:
     ToolParser(const AgentRequest& request, const AgentPrompt& prompt, TextSink text, CallSink call, TextSink thought = {});
     void push(std::string_view chunk);
     void finish();
+    bool truncated_call() const { return truncated_call_; }
 
 private:
     enum class Mode { text, thought, tagged, json };
@@ -101,10 +102,10 @@ private:
     size_t scanned_ = 0;
     int depth_ = 0;
     bool quoted_ = false, escape_ = false;
-    bool llama_calls_ = false, explicit_json_ = false, saw_text_ = false;
+    bool llama_calls_ = false, explicit_json_ = false, saw_text_ = false, truncated_call_ = false;
 };
 
-enum class Finish { stop, length };
+enum class Finish { stop, length, truncated_tool_call };
 
 struct Thought {
     std::string text;

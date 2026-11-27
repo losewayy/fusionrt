@@ -9,12 +9,17 @@
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <optional>
 #include <span>
 #include <string>
 #include <utility>
 #include <vector>
 
 namespace fusionrt {
+
+class CpuWorkers;
+class MoeRouteTrace;
+struct CpuMoeWorkspace;
 
 struct CudaDeviceInfo {
     int device_id = 0;
@@ -34,6 +39,28 @@ struct CudaDeviceInfo {
     int memory_bus_width_bits = 0;
     double peak_bandwidth_gbps = 0.0;
     std::string driver_version;
+};
+
+class CudaMoeTiming {
+public:
+    struct Layer {
+        size_t hot = 0, cold = 0;
+        double input_wait_ms = 0, cpu_ms = 0, gpu_gap_ms = 0;
+        cudaEvent_t gpu_done = nullptr, cpu_done = nullptr;
+        bool pending = false;
+    };
+    explicit CudaMoeTiming(int layers) : layers_(layers) {}
+    ~CudaMoeTiming();
+    CudaMoeTiming(const CudaMoeTiming&) = delete;
+    CudaMoeTiming& operator=(const CudaMoeTiming&) = delete;
+    Layer& layer(int index) { return layers_[index]; }
+    void begin_gap(Layer& layer, cudaStream_t stream);
+    void end_gap(Layer& layer, cudaStream_t stream);
+    void collect();
+    std::span<const Layer> layers() const { return layers_; }
+
+private:
+    std::vector<Layer> layers_;
 };
 
 // Bump-pointer GPU arena with 256-byte alignment and save/restore scratch watermark.
@@ -80,6 +107,10 @@ public:
     bool valid() const { return exec_ != nullptr; }
 
 private:
+    friend struct CudaReviewTestAccess;
+    cudaError_t (*instantiate_)(cudaGraphExec_t*, cudaGraph_t) = [](cudaGraphExec_t* exec, cudaGraph_t graph) {
+        return cudaGraphInstantiate(exec, graph, nullptr, nullptr, 0);
+    };
     cudaGraph_t graph_ = nullptr;
     cudaGraphExec_t exec_ = nullptr;
 };
@@ -118,8 +149,9 @@ public:
         device_profile_.empirical_l2_bytes = bytes;
         set_device_profile(device_profile_);
     }
-    DType kv_dtype() const { return kv_dtype_; }
-    void set_kv_dtype(DType dtype);
+    DType kv_dtype() const { return kv_request_.value_or(DType::F16); }
+    std::optional<DType> requested_kv_dtype() const { return kv_request_; }
+    void set_kv_dtype(std::optional<DType> dtype);
 
     CudaArena& weight_arena() { return weight_arena_; }
     CudaArena& scratch_arena() { return scratch_arena_; }
@@ -130,6 +162,13 @@ public:
     void synchronize();
     float* moe_transfer_buffer(size_t bytes);
     cudaEvent_t moe_input_ready() const { return moe_input_ready_; }
+    CudaMoeTiming* moe_timing = nullptr;
+    MoeRouteTrace* moe_route_trace = nullptr;
+    void set_cpu_threads(int threads, bool spread_affinity = false);
+    void set_cpu_moe_q8(bool enabled) { cpu_moe_q8_ = enabled; }
+    bool cpu_moe_q8() const { return cpu_moe_q8_; }
+    CpuWorkers& cpu_workers();
+    CpuMoeWorkspace& cpu_moe_workspace();
 
     // L2 cache flush buffer (> 2x device L2) for anti-noise benchmarking
     void flush_l2();
@@ -148,13 +187,23 @@ private:
     void* l2_flush_buf_ = nullptr;
     size_t l2_flush_bytes_ = 0;
     int prefill_batch_ = 512;
-    DType kv_dtype_ = DType::F32;
+    std::optional<DType> kv_request_ = DType::F32;
     std::unique_ptr<float, decltype(&cudaFreeHost)> moe_transfer_{nullptr, cudaFreeHost};
     size_t moe_transfer_bytes_ = 0;
     cudaEvent_t moe_input_ready_ = nullptr;
+    int cpu_threads_ = 0;
+    bool cpu_spread_affinity_ = false;
+    bool cpu_moe_q8_ = true;
+    std::unique_ptr<CpuWorkers> cpu_workers_;
+    std::unique_ptr<CpuMoeWorkspace> cpu_moe_workspace_;
 };
 
 inline constexpr int kKvPageTokens = 128;
+
+class KvVramExhausted : public std::runtime_error {
+public:
+    using std::runtime_error::runtime_error;
+};
 
 struct CudaKvView {
     uint8_t** pages = nullptr;
@@ -186,7 +235,8 @@ public:
     };
 
     void ensure(CudaContext& ctx, std::span<const CudaKvView> layers, Table& table, int first_write, int tokens,
-                std::span<Table* const> paused = {});
+                std::span<Table* const> paused = {}, const std::function<void(size_t, bool)>& reclaim = {});
+    void release_unused_tail();
     void fork(Table& dst, const Table& src, int tokens);
     void truncate(Table& table, int tokens);
     void release();
@@ -201,6 +251,8 @@ public:
     int host_pages() const { return host_pages_; }
 
 private:
+    friend struct CudaReviewTestAccess;
+    cudaError_t (*allocate_)(void**, size_t) = [](void** data, size_t bytes) { return cudaMalloc(data, bytes); };
     struct Page {
         uint8_t* data;
         size_t refs = 0;
@@ -221,7 +273,11 @@ private:
     void exchange_spilled_pages(CudaContext& ctx, Table& table, int requested, std::span<const SlotPage> victims);
     void restore_pages_from_host(CudaContext& ctx, Table& table, int requested);
 
-    std::vector<std::unique_ptr<uint8_t, decltype(&cudaFree)>> slabs_;
+    struct Slab {
+        std::unique_ptr<uint8_t, decltype(&cudaFree)> data;
+        int pages;
+    };
+    std::vector<Slab> slabs_;
     std::vector<Page> physical_;
     size_t page_bytes_ = 0;
     int pages_ = 0;

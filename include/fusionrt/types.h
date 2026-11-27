@@ -26,6 +26,7 @@ enum class DType : uint8_t {
     Q8_1 = 13, // block size 32: packed activation quants, scale and sums (48 bytes)
     Q4_KA = 14, // CUDA: 256 weights in 144 aligned bytes
     Q6_A = 15,  // CUDA: 256 weights in 224 aligned bytes
+    Q2_K = 16,  // 256 weights in 84 bytes
 };
 
 enum class Backend : uint8_t {
@@ -53,6 +54,14 @@ struct BlockQ4_1 {
     uint8_t qs[16];  // 32 4-bit unsigned nibbles [0..15]
 };
 static_assert(sizeof(BlockQ4_1) == 20, "BlockQ4_1 must be 20 bytes");
+
+struct BlockQ2_K {
+    uint8_t scales[16];  // low nibble: scale, high nibble: minimum magnitude
+    uint8_t qs[64];
+    uint16_t d;
+    uint16_t dmin;
+};
+static_assert(sizeof(BlockQ2_K) == 84);
 
 struct BlockQ4_K {
     uint16_t d;
@@ -143,6 +152,7 @@ inline constexpr size_t dtype_block_size(DType dt) {
         case DType::Q8_1: return 32;
         case DType::Q4_0: return 32;
         case DType::Q4_1: return 32;
+        case DType::Q2_K:
         case DType::Q4_K: return 256;
         case DType::Q5_K: return 256;
         case DType::Q6_K:
@@ -156,7 +166,7 @@ inline constexpr size_t dtype_block_size(DType dt) {
 
 inline constexpr bool dtype_is_quantized(DType dt) {
     return dt == DType::Q8_0 || dt == DType::Q4_0 || dt == DType::Q4_1 ||
-           dt == DType::Q4_K || dt == DType::Q5_K || dt == DType::Q6_K ||
+           dt == DType::Q2_K || dt == DType::Q4_K || dt == DType::Q5_K || dt == DType::Q6_K ||
            dt == DType::Q4_A || dt == DType::Q8_A || dt == DType::Q8_1 ||
            dt == DType::Q4_KA || dt == DType::Q6_A;
 }
@@ -171,6 +181,7 @@ inline constexpr size_t dtype_type_size(DType dt) {
         case DType::I32:  return 4;
         case DType::U8:   return 1;
         case DType::Q4_1: return sizeof(BlockQ4_1);
+        case DType::Q2_K: return sizeof(BlockQ2_K);
         case DType::Q4_K: return sizeof(BlockQ4_K);
         case DType::Q5_K: return sizeof(BlockQ5_K);
         case DType::Q6_K: return sizeof(BlockQ6_K);
@@ -202,6 +213,7 @@ inline const char* dtype_name(DType dt) {
         case DType::I32:  return "I32";
         case DType::U8:   return "U8";
         case DType::Q4_1: return "Q4_1";
+        case DType::Q2_K: return "Q2_K";
         case DType::Q4_K: return "Q4_K";
         case DType::Q5_K: return "Q5_K";
         case DType::Q6_K: return "Q6_K";

@@ -1,4 +1,5 @@
 #include "fusionrt/cuda_backend.h"
+#include "../core/cpu_moe.h"
 #include <algorithm>
 #include <sstream>
 #include <stdexcept>
@@ -35,11 +36,11 @@ void check_cu(CUresult err, const char* expr, const char* file, int line) {
     }
 }
 
-void CudaContext::set_kv_dtype(DType dtype) {
-    if (dtype != DType::F16 && dtype != DType::F32 && dtype != DType::Q8_0) {
+void CudaContext::set_kv_dtype(std::optional<DType> dtype) {
+    if (dtype && dtype != DType::F16 && dtype != DType::F32 && dtype != DType::Q8_0) {
         throw std::invalid_argument("CUDA KV cache supports F16, F32 and Q8_0");
     }
-    kv_dtype_ = dtype;
+    kv_request_ = dtype;
 }
 
 CudaKvView make_cuda_kv_view(CudaArena& arena, DType dtype, int max_tokens, int kv_heads, int head_dim,
@@ -74,14 +75,15 @@ bool CudaKvPool::grow(int count) {
     if (physical_.size() + count > physical_.capacity()) {
         physical_.reserve(std::max(2 * physical_.size(), physical_.size() + count));
     }
-    uint8_t* data = nullptr;
-    const auto status = cudaMalloc(&data, count * page_bytes_);
+    void* storage = nullptr;
+    const auto status = allocate_(&storage, count * page_bytes_);
     if (status == cudaErrorMemoryAllocation) {
         (void)cudaGetLastError();
         return false;
     }
     FUSIONRT_CUDA_CHECK(status);
-    slabs_.emplace_back(data, cudaFree);
+    auto* data = static_cast<uint8_t*>(storage);
+    slabs_.push_back({{data, cudaFree}, count});
     for (int i = 0; i < count; ++i) {
         physical_.push_back({data + i * page_bytes_, 0, i + 1 < count ? old_size + i + 1 : free_});
     }
@@ -127,7 +129,7 @@ std::vector<CudaKvPool::SlotPage> CudaKvPool::select_spill_pages(std::span<Table
             if (victims.size() == static_cast<size_t>(count)) return victims;
         }
     }
-    throw std::runtime_error("KV VRAM exhausted with too few private pages in paused slots");
+    throw KvVramExhausted("KV VRAM exhausted with too few private pages in paused slots");
 }
 
 void CudaKvPool::spill_pages_to_host(CudaContext& ctx, std::span<const SlotPage> victims) {
@@ -137,7 +139,12 @@ void CudaKvPool::spill_pages_to_host(CudaContext& ctx, std::span<const SlotPage>
     batch.reserve(victims.size());
     for (size_t i = 0; i < victims.size(); ++i) {
         uint8_t* data = nullptr;
-        FUSIONRT_CUDA_CHECK(cudaMallocHost(&data, page_bytes_));
+        const auto status = cudaMallocHost(&data, page_bytes_);
+        if (status == cudaErrorMemoryAllocation) {
+            (void)cudaGetLastError();
+            throw KvVramExhausted("Unable to allocate pinned host KV memory");
+        }
+        FUSIONRT_CUDA_CHECK(status);
         batch.emplace_back(data, cudaFreeHost);
     }
     try {
@@ -180,14 +187,14 @@ void CudaKvPool::exchange_spilled_pages(CudaContext& ctx, Table& table, int requ
         if (id < 0 && host_[-id - 1].refs == 1) incoming.push_back(p);
     }
     if (incoming.size() != victims.size()) {
-        throw std::runtime_error("KV VRAM exhausted and host KV budget cannot hold the spill");
+        throw KvVramExhausted("KV VRAM exhausted and host KV budget cannot hold the spill");
     }
     // With both tiers full, reuse the incoming pinned pages for the outgoing pages.
     auto& arena = ctx.scratch_arena();
     const size_t mark = arena.mark();
     const size_t aligned = (mark + 255) & ~size_t{255};
     const size_t chunk = std::min(page_bytes_, arena.capacity() - std::min(arena.capacity(), aligned));
-    if (chunk == 0) throw std::runtime_error("No CUDA scratch available for a full-tier KV exchange");
+    if (chunk == 0) throw KvVramExhausted("No CUDA scratch available for a full-tier KV exchange");
     auto* scratch = arena.alloc(chunk);
     try {
         const auto stream = ctx.stream();
@@ -249,7 +256,8 @@ void CudaKvPool::restore_pages_from_host(CudaContext& ctx, Table& table, int req
 }
 
 void CudaKvPool::ensure(CudaContext& ctx, std::span<const CudaKvView> layers, Table& table,
-                        int first_write, int tokens, std::span<Table* const> paused) {
+                        int first_write, int tokens, std::span<Table* const> paused,
+                        const std::function<void(size_t, bool)>& reclaim) {
     if (tokens <= 0 || layers.empty()) return;
     const int requested = kv_pages_for(tokens);
     const int existing = static_cast<int>(table.pages_.size());
@@ -263,14 +271,23 @@ void CudaKvPool::ensure(CudaContext& ctx, std::span<const CudaKvView> layers, Ta
     if (page_bytes_ == 0) {
         for (const auto& layer : layers) page_bytes_ += layer.page_bytes();
     }
+    if (vram_budget_bytes_ && static_cast<size_t>(requested) > vram_budget_bytes_ / page_bytes_)
+        throw std::invalid_argument("Active KV needs " + std::to_string(requested * page_bytes_) +
+            " bytes, exceeding the " + std::to_string(vram_budget_bytes_) + "-byte KV budget");
     const int missing = needed - (static_cast<int>(physical_.size()) - pages_);
     if (missing > 0) {
         const int growth = vram_budget_bytes_ == 0 ? missing : static_cast<int>(
             std::min(static_cast<size_t>(missing), (vram_budget_bytes_ - reserved_bytes()) / page_bytes_));
         int to_spill = missing - growth;
+        const auto target = reserved_bytes() + growth * page_bytes_;
+        if (growth > 0 && reclaim) reclaim(target, false);
         if (growth > 0 && !grow(growth)) {
-            // A single large slab can fail even when smaller allocations still fit.
             int remaining = growth;
+            if (reclaim) {
+                reclaim(target, true);
+                if (grow(growth)) remaining = 0;
+            }
+            // A single large slab can fail even when smaller allocations still fit.
             for (int chunk = growth / 2; chunk > 0 && remaining > 0; chunk /= 2) {
                 while (chunk <= remaining && grow(chunk)) remaining -= chunk;
             }
@@ -352,6 +369,24 @@ void CudaKvPool::truncate(Table& table, int tokens) {
     table.published_ = std::min(table.published_, kept);
 }
 
+void CudaKvPool::release_unused_tail() {
+    const auto prior = physical_.size();
+    while (!slabs_.empty()) {
+        const int n = slabs_.back().pages;
+        if (std::any_of(physical_.end() - n, physical_.end(), [](const auto& p) { return p.refs != 0; }))
+            break;
+        physical_.resize(physical_.size() - n);
+        slabs_.pop_back();
+    }
+    if (prior == physical_.size()) return;
+    free_ = -1;
+    for (int i = static_cast<int>(physical_.size()) - 1; i >= 0; --i) {
+        if (physical_[i].refs != 0) continue;
+        physical_[i].next_free = free_;
+        free_ = i;
+    }
+}
+
 void CudaKvPool::release() {
     slabs_.clear();
     physical_.clear();
@@ -424,7 +459,7 @@ void CudaGraphExec::reset() {
 }
 
 void CudaGraphExec::capture(cudaStream_t stream, const std::function<void()>& fn) {
-    reset();
+    CudaGraphExec next;
     FUSIONRT_CUDA_CHECK(cudaStreamBeginCapture(stream, cudaStreamCaptureModeGlobal));
     try {
         fn();
@@ -434,8 +469,10 @@ void CudaGraphExec::capture(cudaStream_t stream, const std::function<void()>& fn
         if (aborted) cudaGraphDestroy(aborted);
         throw;
     }
-    FUSIONRT_CUDA_CHECK(cudaStreamEndCapture(stream, &graph_));
-    FUSIONRT_CUDA_CHECK(cudaGraphInstantiate(&exec_, graph_, nullptr, nullptr, 0));
+    FUSIONRT_CUDA_CHECK(cudaStreamEndCapture(stream, &next.graph_));
+    FUSIONRT_CUDA_CHECK(instantiate_(&next.exec_, next.graph_));
+    std::swap(graph_, next.graph_);
+    std::swap(exec_, next.exec_);
 }
 
 void CudaGraphExec::launch(cudaStream_t stream) {
@@ -519,8 +556,6 @@ CudaContext::CudaContext(int device_id, size_t weight_arena_mb, size_t scratch_a
 
     // Allocate L2 flush buffer >= 2x device L2 (or at least 64 MiB)
     l2_flush_bytes_ = std::max<size_t>(info_.l2_cache_bytes * 2, 64ULL * 1024ULL * 1024ULL);
-    FUSIONRT_CUDA_CHECK(cudaMalloc(&l2_flush_buf_, l2_flush_bytes_));
-    FUSIONRT_CUDA_CHECK(cudaMemsetAsync(l2_flush_buf_, 0xA5, l2_flush_bytes_, stream_));
     FUSIONRT_CUDA_CHECK(cudaStreamSynchronize(stream_));
 }
 
@@ -615,12 +650,62 @@ HostTensor CudaContext::download(const Tensor& t) {
     return ht;
 }
 
+void CudaContext::set_cpu_threads(int threads, bool spread_affinity) {
+    if (threads < 0) throw std::invalid_argument("Expected --threads >= 0");
+    if (cpu_threads_ != threads || cpu_spread_affinity_ != spread_affinity) {
+        cpu_workers_.reset();
+        cpu_threads_ = threads;
+        cpu_spread_affinity_ = spread_affinity;
+    }
+}
+
+CpuWorkers& CudaContext::cpu_workers() {
+    if (!cpu_workers_) cpu_workers_ = std::make_unique<CpuWorkers>(cpu_threads_, cpu_spread_affinity_);
+    return *cpu_workers_;
+}
+
+CpuMoeWorkspace& CudaContext::cpu_moe_workspace() {
+    if (!cpu_moe_workspace_) cpu_moe_workspace_ = std::make_unique<CpuMoeWorkspace>();
+    return *cpu_moe_workspace_;
+}
+
 void CudaContext::synchronize() {
     FUSIONRT_CUDA_CHECK(cudaStreamSynchronize(stream_));
 }
 
 void CudaContext::flush_l2() {
+    if (!l2_flush_buf_) FUSIONRT_CUDA_CHECK(cudaMalloc(&l2_flush_buf_, l2_flush_bytes_));
     FUSIONRT_CUDA_CHECK(cudaMemsetAsync(l2_flush_buf_, 0x5A, l2_flush_bytes_, stream_));
+}
+
+CudaMoeTiming::~CudaMoeTiming() {
+    for (const auto& layer : layers_) {
+        if (layer.gpu_done) cudaEventDestroy(layer.gpu_done);
+        if (layer.cpu_done) cudaEventDestroy(layer.cpu_done);
+    }
+}
+
+void CudaMoeTiming::begin_gap(Layer& layer, cudaStream_t stream) {
+    if (!layer.gpu_done) {
+        FUSIONRT_CUDA_CHECK(cudaEventCreate(&layer.gpu_done));
+        FUSIONRT_CUDA_CHECK(cudaEventCreate(&layer.cpu_done));
+    }
+    FUSIONRT_CUDA_CHECK(cudaEventRecord(layer.gpu_done, stream));
+}
+
+void CudaMoeTiming::end_gap(Layer& layer, cudaStream_t stream) {
+    FUSIONRT_CUDA_CHECK(cudaEventRecord(layer.cpu_done, stream));
+    layer.pending = true;
+}
+
+void CudaMoeTiming::collect() {
+    for (auto& layer : layers_) {
+        if (!layer.pending) continue;
+        float elapsed = 0;
+        FUSIONRT_CUDA_CHECK(cudaEventElapsedTime(&elapsed, layer.gpu_done, layer.cpu_done));
+        layer.gpu_gap_ms += elapsed;
+        layer.pending = false;
+    }
 }
 
 }  // namespace fusionrt

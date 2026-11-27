@@ -1,4 +1,5 @@
 #include "fusionrt/vulkan_backend.h"
+#include "vulkan_memory.h"
 #include <algorithm>
 #include <cstdlib>
 #include <cstring>
@@ -24,9 +25,8 @@ void check_vk(VkResult res, const char* expr, const char* file, int line) {
 
 namespace {
 
-uint32_t find_memory_type(VkPhysicalDevice phys, uint32_t type_filter, VkMemoryPropertyFlags props) {
-    VkPhysicalDeviceMemoryProperties mem_props{};
-    vkGetPhysicalDeviceMemoryProperties(phys, &mem_props);
+uint32_t find_memory_type(const VkPhysicalDeviceMemoryProperties& mem_props, uint32_t type_filter,
+                          VkMemoryPropertyFlags props) {
     for (uint32_t i = 0; i < mem_props.memoryTypeCount; ++i) {
         if ((type_filter & (1u << i)) &&
             (mem_props.memoryTypes[i].propertyFlags & props) == props) {
@@ -37,7 +37,8 @@ uint32_t find_memory_type(VkPhysicalDevice phys, uint32_t type_filter, VkMemoryP
 }
 
 VkBufferAllocation create_vk_buffer(VkDevice device, VkPhysicalDevice phys, VkDeviceSize size,
-                                    VkBufferUsageFlags usage, VkMemoryPropertyFlags props, bool map_mem) {
+                                    VkBufferUsageFlags usage, VkMemoryPropertyFlags props, bool map_mem,
+                                    const VkArena::Preflight& preflight = {}) {
     VkBufferAllocation out{};
     out.size = size;
 
@@ -54,12 +55,20 @@ VkBufferAllocation create_vk_buffer(VkDevice device, VkPhysicalDevice phys, VkDe
     VkMemoryAllocateInfo mai{};
     mai.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
     mai.allocationSize = req.size;
-    mai.memoryTypeIndex = find_memory_type(phys, req.memoryTypeBits, props);
-    FUSIONRT_VK_CHECK(vkAllocateMemory(device, &mai, nullptr, &out.memory));
-    FUSIONRT_VK_CHECK(vkBindBufferMemory(device, out.buffer, out.memory, 0));
-
-    if (map_mem) {
-        FUSIONRT_VK_CHECK(vkMapMemory(device, out.memory, 0, size, 0, &out.mapped));
+    try {
+        VkPhysicalDeviceMemoryProperties memory{};
+        vkGetPhysicalDeviceMemoryProperties(phys, &memory);
+        mai.memoryTypeIndex = find_memory_type(memory, req.memoryTypeBits, props);
+        out.heap_index = memory.memoryTypes[mai.memoryTypeIndex].heapIndex;
+        out.allocation_size = req.size;
+        if (preflight) preflight(mai.memoryTypeIndex, req.size);
+        FUSIONRT_VK_CHECK(vkAllocateMemory(device, &mai, nullptr, &out.memory));
+        FUSIONRT_VK_CHECK(vkBindBufferMemory(device, out.buffer, out.memory, 0));
+        if (map_mem) FUSIONRT_VK_CHECK(vkMapMemory(device, out.memory, 0, size, 0, &out.mapped));
+    } catch (...) {
+        vkDestroyBuffer(device, out.buffer, nullptr);
+        if (out.memory) vkFreeMemory(device, out.memory, nullptr);
+        throw;
     }
     return out;
 }
@@ -182,11 +191,12 @@ VkDeviceInfo query_vk_device_info(VkInstance instance, VkPhysicalDevice phys, ui
 VkArena::~VkArena() = default;
 
 void VkArena::init(VkDevice device, VkPhysicalDevice phys, VkDeviceSize capacity_bytes,
-                   VkBufferUsageFlags usage, VkMemoryPropertyFlags mem_props, VkDeviceSize align) {
+                   VkBufferUsageFlags usage, VkMemoryPropertyFlags mem_props, VkDeviceSize align,
+                   const Preflight& preflight) {
     release(device);
     align_ = std::max<VkDeviceSize>(align, 256);
     bool map_mem = (mem_props & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) != 0;
-    alloc_ = create_vk_buffer(device, phys, capacity_bytes, usage, mem_props, map_mem);
+    alloc_ = create_vk_buffer(device, phys, capacity_bytes, usage, mem_props, map_mem, preflight);
     offset_ = 0;
 }
 
@@ -203,7 +213,7 @@ void VkArena::release(VkDevice device) {
         vkFreeMemory(device, alloc_.memory, nullptr);
         alloc_.memory = VK_NULL_HANDLE;
     }
-    alloc_.size = 0;
+    alloc_ = {};
     offset_ = 0;
 }
 
@@ -401,8 +411,9 @@ VkContext::VkContext(uint32_t device_index, size_t weight_arena_mb, size_t scrat
                                    VK_BUFFER_USAGE_TRANSFER_SRC_BIT |
                                    VK_BUFFER_USAGE_TRANSFER_DST_BIT;
 
-    weight_arena_.init(device_, phys_, weight_arena_mb * 1024ULL * 1024ULL,
-                       buf_usage, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, info_.min_storage_offset_align);
+    if (weight_arena_mb)
+        weight_arena_.init(device_, phys_, weight_arena_mb * 1024ULL * 1024ULL,
+                           buf_usage, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, info_.min_storage_offset_align);
     scratch_arena_.init(device_, phys_, scratch_arena_mb * 1024ULL * 1024ULL,
                         buf_usage, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, info_.min_storage_offset_align);
     staging_arena_.init(device_, phys_, 64ULL * 1024ULL * 1024ULL,
@@ -414,6 +425,47 @@ VkContext::VkContext(uint32_t device_index, size_t weight_arena_mb, size_t scrat
     l2_flush_buf_ = create_vk_buffer(device_, phys_, l2_flush_bytes_,
                                      VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
                                      VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, false);
+}
+
+void VkContext::reserve_model_memory(VkDeviceSize weight_bytes, VkDeviceSize context_bytes) {
+    const auto bytes = weight_bytes + context_bytes;
+    const auto alignment = std::max<VkDeviceSize>(256, info_.min_storage_offset_align);
+    const auto used = (weight_arena_.used() + alignment - 1) & ~(alignment - 1);
+    const auto unused = weight_arena_.capacity() - std::min(used, weight_arena_.capacity());
+    if (bytes <= unused) return;
+    const auto failure = [&](VkDeviceSize available) {
+        return std::runtime_error("Vulkan model needs " + std::to_string(weight_bytes) +
+            " weight/workspace bytes and " + std::to_string(context_bytes) +
+            " KV/state bytes (" + std::to_string(bytes) + " total), but only " +
+            std::to_string(available) + " device bytes are available");
+    };
+    if (used) throw failure(unused);
+    VkPhysicalDeviceMemoryBudgetPropertiesEXT budget{};
+    budget.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_BUDGET_PROPERTIES_EXT;
+    VkPhysicalDeviceMemoryProperties2 memory{};
+    memory.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_PROPERTIES_2;
+    const bool has_budget = has_device_ext(phys_, VK_EXT_MEMORY_BUDGET_EXTENSION_NAME);
+    if (has_budget) memory.pNext = &budget;
+    VkDeviceSize available = 0;
+    auto check_heap = [&](uint32_t memory_type, VkDeviceSize required) {
+        vkGetPhysicalDeviceMemoryProperties2(phys_, &memory);
+        const auto heap = memory.memoryProperties.memoryTypes[memory_type].heapIndex;
+        const auto& scratch = scratch_arena_.alloc_;
+        const auto reserved = (scratch.heap_index == heap ? scratch.allocation_size : 0) +
+                              (l2_flush_buf_.heap_index == heap ? l2_flush_buf_.allocation_size : 0);
+        available = vulkan_detail::available_heap_bytes(memory.memoryProperties, has_budget ? &budget : nullptr,
+                                                         memory_type, reserved);
+        if (required > available)
+            throw std::runtime_error("Vulkan allocation requires " + std::to_string(required) +
+                " bytes after buffer alignment on device heap " + std::to_string(heap));
+    };
+    try {
+        const auto usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT |
+                           VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+        weight_arena_.init(device_, phys_, bytes, usage, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, alignment, check_heap);
+    } catch (const std::runtime_error& e) {
+        throw std::runtime_error(std::string(failure(available).what()) + ". " + e.what());
+    }
 }
 
 VkContext::~VkContext() {

@@ -1394,6 +1394,20 @@ void linear_repacked_k_f32(const float* x, const void* w, DType dtype, float* y,
     else launch.template operator()<9>();
 }
 
+void linear_q2_k_f32(const float* x, const void* w, float* y,
+                     int M, int N, int K, cudaStream_t stream, bool allow_wmma) {
+    if (M >= 16 && allow_wmma) {
+        matmul::launch_wmma<10, false>(x, nullptr, w, y, M, N, K, 0.0f, stream);
+    } else {
+        for (int row = 0; row < M;) {
+            const int count = std::min(M - row, 65535);
+            k_repacked_k_linear<10><<<dim3((N + 3) / 4, count), 128, 0, stream>>>(
+                x + static_cast<int64_t>(row) * K, w, y + static_cast<int64_t>(row) * N, N, K);
+            row += count;
+        }
+    }
+}
+
 void fused_gemv_q4_1(const float* x, const void* w_q4_1, float* y,
                      int M, int N, int K, cudaStream_t stream) {
     if (M >= 16 && (K & 31) == 0) {

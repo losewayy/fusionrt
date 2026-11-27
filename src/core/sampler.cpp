@@ -42,7 +42,7 @@ static Sampler::Distribution sampling_weights(const float* logits, int vocab_siz
         }
         candidates.emplace_back(score, id);
     }
-    if (candidates.empty()) return {{1.0, 0}};
+    if (candidates.empty()) throw std::invalid_argument("Sampling found no selectable logits");
     auto better = [](const Candidate& a, const Candidate& b) {
         return a.first != b.first ? a.first > b.first : a.second < b.second;
     };
@@ -83,6 +83,7 @@ Sampler::Distribution Sampler::distribution(const float* logits, int vocab_size,
 }
 
 int32_t Sampler::draw(const Distribution& distribution, std::mt19937_64& rng) {
+    if (distribution.empty()) throw std::invalid_argument("Sampling requires a nonempty distribution");
     // Rejection sampling can pass unnormalized residual weights.
     double mass = 0.0;
     for (const auto& [weight, id] : distribution) mass += weight;
@@ -92,6 +93,20 @@ int32_t Sampler::draw(const Distribution& distribution, std::mt19937_64& rng) {
         if (draw < 0) return id;
     }
     return distribution.back().second;
+}
+
+int32_t Sampler::argmax(const float* logits, int vocab_size) {
+    if (!logits || vocab_size <= 0) throw std::invalid_argument("Sampling requires logits");
+    float max = -std::numeric_limits<float>::infinity();
+    int32_t best = -1;
+    for (int32_t i = 0; i < vocab_size; ++i) {
+        if (logits[i] > max) {
+            max = logits[i];
+            best = i;
+        }
+    }
+    if (best < 0) throw std::invalid_argument("Sampling found no selectable logits");
+    return best;
 }
 
 int32_t Sampler::sample(const float* logits, int vocab_size, const std::vector<int32_t>& recent_tokens,

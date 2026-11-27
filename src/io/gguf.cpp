@@ -97,6 +97,7 @@ enum class GgmlType : uint32_t {
     Q4_0 = 2,
     Q4_1 = 3,
     Q8_0 = 8,
+    Q2_K = 10,
     Q4_K = 12,
     Q5_K = 13,
     Q6_K = 14,
@@ -111,6 +112,7 @@ DType ggml_to_dtype(uint32_t t) {
         case 2: return DType::Q4_0;
         case 3: return DType::Q4_1;
         case 8: return DType::Q8_0;
+        case 10: return DType::Q2_K;
         case 12: return DType::Q4_K;
         case 13: return DType::Q5_K;
         case 14: return DType::Q6_K;
@@ -127,6 +129,7 @@ uint32_t dtype_to_ggml(DType dt) {
         case DType::Q4_0: return 2;
         case DType::Q4_1: return 3;
         case DType::Q8_0: return 8;
+        case DType::Q2_K: return 10;
         case DType::Q4_K: return 12;
         case DType::Q5_K: return 13;
         case DType::Q6_K: return 14;
