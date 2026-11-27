@@ -153,6 +153,25 @@ struct StopBuffer {
     }
 };
 
+struct ServePrompt {
+    std::vector<int32_t> tokens;
+    std::vector<InputEmbedding> inputs_embeds;
+#ifdef FUSIONRT_ENABLE_CUDA
+    std::vector<VisionEmbedding> cuda_images;
+#endif
+};
+
+struct ServeBackend {
+    const char* backend_name;
+    std::string device_name;
+    int max_context;
+    std::function<void(const std::vector<int32_t>&, int, GenerationStats&, const GenerationOptions&)> generate;
+    std::function<ServePrompt(std::string_view, std::span<const Image* const>, std::span<const size_t>, int)> encode_vision;
+    std::function<void(int)> validate_capacity;
+    std::function<void()> reset_state;
+    std::function<JsonObject()> health;
+};
+
 struct Completion {
     GenerationStats stats;
     agent::Finish finish = agent::Finish::length;
@@ -167,9 +186,9 @@ JsonObject diagnostics(const Completion& result, const ServeSpeculation& specula
 }
 
 template<class Emit>
-Completion generate(CudaContext& ctx, FusionModel& model, const BpeTokenizer& tokenizer,
+Completion generate(const ServeBackend& backend, const BpeTokenizer& tokenizer,
                     const std::vector<int32_t>& prompt, const agent::GenerationParams& params,
-                    int limit, std::optional<bool> graph, bool reuse_prefix, Emit emit,
+                    int limit, Emit emit,
                     const JsonConstraint* constraint, std::span<const InputEmbedding> embeds,
                     const ServeSpeculation& speculation, const std::atomic_bool& cancelled) {
     StopBuffer stop{params.stops, {}, nullptr};
@@ -178,10 +197,9 @@ Completion generate(CudaContext& ctx, FusionModel& model, const BpeTokenizer& to
     bool connected = true;
     auto opts = speculation.for_inputs(embeds);
     opts.sampling = params.sampling;
-    opts.reuse_prefix = reuse_prefix;
+    opts.reuse_prefix = true;
     opts.json_constraint = constraint;
     opts.cancel = &cancelled;
-    opts.warn_on_graph_fallback = graph.value_or(false);
     opts.on_token = [&](int32_t id) {
         if (tokenizer.is_end_of_generation(id)) {
             completion.finish = agent::Finish::stop;
@@ -190,8 +208,7 @@ Completion generate(CudaContext& ctx, FusionModel& model, const BpeTokenizer& to
         connected = emit(stop.push(utf8.push(tokenizer.decode_token(id))));
         return connected && !stop.matched && !cancelled.load(std::memory_order_relaxed);
     };
-    model.generate_cuda(ctx, prompt, limit, true, graph.value_or(model.recommended_cuda_graph()),
-                        &completion.stats, false, 0, -1, opts);
+    backend.generate(prompt, limit, completion.stats, opts);
     const auto& stats = completion.stats;
     std::clog << "prompt_tokens=" << stats.prompt_tokens << " prefilled_tokens=" << stats.prefilled_tokens
               << " cached_tokens=" << stats.prompt_tokens - stats.prefilled_tokens
@@ -212,9 +229,9 @@ Completion generate(CudaContext& ctx, FusionModel& model, const BpeTokenizer& to
     return completion;
 }
 
-void complete(const Write& write, CudaContext& ctx, FusionModel& model, const BpeTokenizer& tokenizer,
+void complete(const Write& write, const ServeBackend& backend, const BpeTokenizer& tokenizer,
               const std::string& name, const std::vector<int32_t>& prompt, const agent::GenerationParams& params,
-              int context, std::optional<bool> graph, uint64_t request_id, std::span<const InputEmbedding> embeds,
+              int context, uint64_t request_id, std::span<const InputEmbedding> embeds,
               const ServeSpeculation& speculation, const std::atomic_bool& cancelled) {
     const int64_t created = std::time(nullptr);
     const std::string id = "cmpl-" + std::to_string(created) + "-" + std::to_string(request_id);
@@ -225,7 +242,7 @@ void complete(const Write& write, CudaContext& ctx, FusionModel& model, const Bp
     };
     auto event = [&](const JsonValue& v) { return send_event(write, "", v.dump(0)); };
     const int limit = agent::generation_limit(params, context, prompt.size());
-    model.validate_cuda_kv_capacity(static_cast<int>(prompt.size()) + limit);
+    if (backend.validate_capacity) backend.validate_capacity(static_cast<int>(prompt.size()) + limit);
     if (params.stream && !start_stream(write)) return;
     std::string result;
     bool connected = true;
@@ -237,7 +254,7 @@ void complete(const Write& write, CudaContext& ctx, FusionModel& model, const Bp
     };
     Completion completion;
     try {
-        completion = generate(ctx, model, tokenizer, prompt, params, limit, graph, true, emit, nullptr, embeds, speculation, cancelled);
+        completion = generate(backend, tokenizer, prompt, params, limit, emit, nullptr, embeds, speculation, cancelled);
     } catch (const std::exception& e) {
         if (!params.stream) throw;
         if (connected && event(JsonObject{{"error", JsonObject{{"message", e.what()}, {"type", "server_error"}}}})) {
@@ -260,17 +277,17 @@ void complete(const Write& write, CudaContext& ctx, FusionModel& model, const Bp
     }
 }
 
-void complete_agent(const Write& write, CudaContext& ctx, FusionModel& model, const BpeTokenizer& tokenizer,
+void complete_agent(const Write& write, const ServeBackend& backend, const BpeTokenizer& tokenizer,
                     const std::string& name, agent::Protocol protocol, const agent::AgentRequest& request,
                     const agent::AgentPrompt& rendered, const std::vector<int32_t>& prompt,
-                    int context, std::optional<bool> graph, uint64_t request_id, const JsonConstraint* constraint,
+                    int context, uint64_t request_id, const JsonConstraint* constraint,
                     std::span<const InputEmbedding> embeds, const ServeSpeculation& speculation, const std::atomic_bool& cancelled) {
     const int64_t created = std::time(nullptr);
     const char* prefix = protocol == agent::Protocol::chat ? "chatcmpl-" :
                          protocol == agent::Protocol::responses ? "resp_" : "msg_";
     const auto id = prefix + std::to_string(created) + "-" + std::to_string(request_id);
     const int limit = agent::generation_limit(request.generation, context, prompt.size());
-    model.validate_cuda_kv_capacity(static_cast<int>(prompt.size()) + limit);
+    if (backend.validate_capacity) backend.validate_capacity(static_cast<int>(prompt.size()) + limit);
     agent::EventSink event;
     if (request.generation.stream) {
         if (!start_stream(write)) return;
@@ -283,7 +300,7 @@ void complete_agent(const Write& write, CudaContext& ctx, FusionModel& model, co
                              [&](agent::ToolCall call) { response.call(std::move(call)); },
                              [&](std::string_view thought) { response.thought(thought); });
     try {
-        const auto completion = generate(ctx, model, tokenizer, prompt, request.generation, limit, graph, true,
+        const auto completion = generate(backend, tokenizer, prompt, request.generation, limit,
             [&](const std::string& text) {
                 if (constraint) response.text(text);
                 else parser.push(text);
@@ -331,39 +348,25 @@ SocketHandle listen_on(const std::string& host, int port) {
     throw std::runtime_error("Cannot listen on " + host + ":" + std::to_string(port));
 }
 
-}  // namespace
-
-void serve_http(CudaContext& ctx, FusionModel& model, const BpeTokenizer& tokenizer,
-                const std::string& model_name, const std::string& host, int port, std::optional<bool> graph,
-                const VisionEncoder* vision, std::span<const Image> preset_images, ServeSpeculation speculation,
-                std::stop_token shutdown) {
+void serve(const ServeBackend& backend, const HybridModelConfig& cfg, const BpeTokenizer& tokenizer,
+           const std::string& model_name, const std::string& host, int port,
+           std::span<const Image> preset_images, const ServeSpeculation& speculation, std::stop_token shutdown) {
+    const bool vision = static_cast<bool>(backend.encode_vision);
     if (!vision && !preset_images.empty()) throw std::invalid_argument("Preset images require --mmproj");
     [[maybe_unused]] SocketRuntime sockets;
     Socket listener(listen_on(host, port));
     StopHandler stop_handler;
     uint64_t request_id = 0;
-    const auto& cfg = model.config();
     std::map<JsonRoot, JsonConstraint> json_constraints;
     std::mutex health_mutex;
     JsonObject snapshot;
     auto refresh_health = [&] {
-        auto health = http::health_body(model_name, cfg, model.num_slots(), model.cuda_max_active_tokens(),
-                                        model.cuda_cache_memory());
-        health["vision"] = vision != nullptr;
+        auto health = backend.health();
+        health["backend"] = backend.backend_name;
+        health["device"] = backend.device_name;
+        health["vision"] = vision;
         health["speculative"] = speculation.enabled();
         health["speculative_mode"] = speculation.mode();
-        health["kv_dtype_requested"] = ctx.requested_kv_dtype() ? dtype_name(*ctx.requested_kv_dtype()) : "auto";
-        health["kv_dtype"] = dtype_name(model.cuda_kv_dtype());
-        health["borrowed_expert_bytes"] = static_cast<int64_t>(model.cuda_borrowed_expert_bytes());
-        int full_gpu = 0, resident = 0, slabs = 0;
-        for (const auto& layer : model.moe_layers()) {
-            full_gpu += layer.cfg.gpu_resident_experts == layer.cfg.num_experts;
-            resident += layer.cfg.gpu_resident_experts;
-            slabs += layer.borrowed_gate_up_w.data != nullptr;
-        }
-        health["full_gpu_expert_layers"] = full_gpu;
-        health["gpu_resident_experts"] = resident;
-        health["borrowed_expert_slabs"] = slabs;
         std::lock_guard lock(health_mutex);
         snapshot = std::move(health);
     };
@@ -371,57 +374,57 @@ void serve_http(CudaContext& ctx, FusionModel& model, const BpeTokenizer& tokeni
 
     auto post = [&](const Write& write, const Request& req, std::optional<agent::Protocol> protocol,
                     const std::atomic_bool& cancelled) {
-    const JsonValue parsed = [&] {
-        try {
-            return JsonValue::parse(req.body);
-        } catch (const std::runtime_error& e) {
-            throw std::invalid_argument(e.what());
-        }
-    }();
-    if (!parsed.is_object()) throw std::invalid_argument("Expected a JSON object");
-    const auto& obj = parsed.as_object();
-    const int context = std::min(cfg.dense.max_seq_len, model.cuda_max_active_tokens());
-    if (protocol) {
-        const auto input = agent::parse_request(obj, *protocol, vision != nullptr);
-        const auto rendered = agent::render_prompt(input, tokenizer, preset_images);
-        VisionPrompt prompt;
-        if (rendered.images.empty()) prompt.tokens = http::encode_prompt(tokenizer, rendered.text, context);
-        else prompt = encode_vision_prompt(ctx, *vision, tokenizer, rendered.text, rendered.images,
-                                           rendered.image_offsets, context);
-        const JsonConstraint* constraint = nullptr;
-        if (input.generation.json) {
-            const auto root = *input.generation.json;
-            constraint = &json_constraints.try_emplace(root, tokenizer, cfg.vocab_size, root).first->second;
-        }
-        complete_agent(write, ctx, model, tokenizer, model_name, *protocol, input, rendered, prompt.tokens,
-                       context, graph, request_id, constraint, prompt.inputs_embeds, speculation, cancelled);
-    } else {
-        const auto& text = agent::field(obj, "prompt");
-        if (!text.is_string()) throw std::invalid_argument("prompt must be a string");
-        const auto params = agent::parse_generation(obj, "max_tokens");
-        VisionPrompt prompt;
-        if (preset_images.empty()) prompt.tokens = http::encode_prompt(tokenizer, text.as_string(), context);
-        else {
-            std::vector<const Image*> images;
-            std::vector<size_t> offsets;
-            std::string marked;
-            for (const auto& image : preset_images) {
-                images.push_back(&image);
-                offsets.push_back(marked.size());
-                marked += image_placeholder;
+        const JsonValue parsed = [&] {
+            try {
+                return JsonValue::parse(req.body);
+            } catch (const std::runtime_error& e) {
+                throw std::invalid_argument(e.what());
             }
-            prompt = encode_vision_prompt(ctx, *vision, tokenizer, marked + text.as_string(), images, offsets, context);
+        }();
+        if (!parsed.is_object()) throw std::invalid_argument("Expected a JSON object");
+        const auto& obj = parsed.as_object();
+        const int context = backend.max_context;
+        const auto id = ++request_id;
+        if (protocol) {
+            const auto input = agent::parse_request(obj, *protocol, vision);
+            const auto rendered = agent::render_prompt(input, tokenizer, preset_images);
+            ServePrompt prompt;
+            if (rendered.images.empty()) prompt.tokens = http::encode_prompt(tokenizer, rendered.text, context);
+            else prompt = backend.encode_vision(rendered.text, rendered.images, rendered.image_offsets, context);
+            const JsonConstraint* constraint = nullptr;
+            if (input.generation.json) {
+                const auto root = *input.generation.json;
+                constraint = &json_constraints.try_emplace(root, tokenizer, cfg.vocab_size, root).first->second;
+            }
+            complete_agent(write, backend, tokenizer, model_name, *protocol, input, rendered, prompt.tokens,
+                           context, id, constraint, prompt.inputs_embeds, speculation, cancelled);
+        } else {
+            const auto& text = agent::field(obj, "prompt");
+            if (!text.is_string()) throw std::invalid_argument("prompt must be a string");
+            const auto params = agent::parse_generation(obj, "max_tokens");
+            ServePrompt prompt;
+            if (preset_images.empty()) prompt.tokens = http::encode_prompt(tokenizer, text.as_string(), context);
+            else {
+                std::vector<const Image*> images;
+                std::vector<size_t> offsets;
+                std::string marked;
+                for (const auto& image : preset_images) {
+                    images.push_back(&image);
+                    offsets.push_back(marked.size());
+                    marked += image_placeholder;
+                }
+                prompt = backend.encode_vision(marked + text.as_string(), images, offsets, context);
+            }
+            complete(write, backend, tokenizer, model_name, prompt.tokens, params, context,
+                     id, prompt.inputs_embeds, speculation, cancelled);
         }
-        complete(write, ctx, model, tokenizer, model_name, prompt.tokens, params, context, graph,
-                 request_id, prompt.inputs_embeds, speculation, cancelled);
-    }
     };
     InferenceQueue queue;
     std::promise<void> ready;
     auto startup = ready.get_future();
     std::jthread worker([&](std::stop_token stop) {
         try {
-            FUSIONRT_CUDA_CHECK(cudaSetDevice(ctx.info().device_id));
+            if (backend.reset_state) backend.reset_state();
             ready.set_value();
         } catch (...) {
             ready.set_exception(std::current_exception());
@@ -487,7 +490,7 @@ void serve_http(CudaContext& ctx, FusionModel& model, const BpeTokenizer& tokeni
     };
     std::vector<Connection> connections;
     std::cout << "fusionrt listening on " << host << ':' << port << " max_seq=" << cfg.dense.max_seq_len
-              << " kv_type=" << dtype_name(model.cuda_kv_dtype()) << '\n' << std::flush;
+              << " backend=" << backend.backend_name << " kv_type=" << snapshot.at("kv_dtype").as_string() << '\n' << std::flush;
     while (!StopHandler::stopping.load(std::memory_order_relaxed) && !shutdown.stop_requested()) {
         std::erase_if(connections, [](const auto& connection) { return connection.done->load(std::memory_order_acquire); });
         const int incoming = socket_ready(listener.get(), false, 100);
@@ -515,5 +518,80 @@ void serve_http(CudaContext& ctx, FusionModel& model, const BpeTokenizer& tokeni
     connections.clear();
     worker.request_stop();
 }
+
+}  // namespace
+
+#ifdef FUSIONRT_ENABLE_CUDA
+void serve_http(CudaContext& ctx, FusionModel& model, const BpeTokenizer& tokenizer,
+                const std::string& model_name, const std::string& host, int port, std::optional<bool> graph,
+                const VisionEncoder* vision, std::span<const Image> preset_images, ServeSpeculation speculation,
+                std::stop_token shutdown) {
+    const auto& cfg = model.config();
+    ServeBackend backend{};
+    backend.backend_name = "cuda";
+    backend.device_name = ctx.info().name;
+    backend.max_context = std::min(cfg.dense.max_seq_len, model.cuda_max_active_tokens());
+    backend.generate = [&](const auto& prompt, int limit, auto& stats, GenerationOptions options) {
+        options.warn_on_graph_fallback = graph.value_or(false);
+        model.generate_cuda(ctx, prompt, limit, true, graph.value_or(model.recommended_cuda_graph()),
+                            &stats, false, 0, -1, options);
+    };
+    if (vision) backend.encode_vision = [&](auto text, auto images, auto offsets, int context) {
+        auto prompt = encode_vision_prompt(ctx, *vision, tokenizer, text, images, offsets, context);
+        return ServePrompt{std::move(prompt.tokens), std::move(prompt.inputs_embeds), std::move(prompt.images)};
+    };
+    backend.validate_capacity = [&](int tokens) { model.validate_cuda_kv_capacity(tokens); };
+    backend.reset_state = [&] { FUSIONRT_CUDA_CHECK(cudaSetDevice(ctx.info().device_id)); };
+    backend.health = [&] {
+        auto health = http::health_body(model_name, cfg, model.num_slots(), model.cuda_max_active_tokens(),
+                                        model.cuda_cache_memory());
+        health["kv_dtype_requested"] = ctx.requested_kv_dtype() ? dtype_name(*ctx.requested_kv_dtype()) : "auto";
+        health["kv_dtype"] = dtype_name(model.cuda_kv_dtype());
+        health["borrowed_expert_bytes"] = static_cast<int64_t>(model.cuda_borrowed_expert_bytes());
+        int full_gpu = 0, resident = 0, slabs = 0;
+        for (const auto& layer : model.moe_layers()) {
+            full_gpu += layer.cfg.gpu_resident_experts == layer.cfg.num_experts;
+            resident += layer.cfg.gpu_resident_experts;
+            slabs += layer.borrowed_gate_up_w.data != nullptr;
+        }
+        health["full_gpu_expert_layers"] = full_gpu;
+        health["gpu_resident_experts"] = resident;
+        health["borrowed_expert_slabs"] = slabs;
+        return health;
+    };
+    serve(backend, cfg, tokenizer, model_name, host, port, preset_images, speculation, shutdown);
+}
+#endif
+
+#ifdef FUSIONRT_ENABLE_VULKAN
+void serve_http(VkContext& ctx, FusionModel& model, const BpeTokenizer& tokenizer,
+                const std::string& model_name, const std::string& host, int port,
+                const VulkanVisionEncoder* vision, std::span<const Image> preset_images,
+                ServeSpeculation speculation, std::stop_token shutdown) {
+    if (speculation.enabled()) throw std::invalid_argument("Speculative decoding requires CUDA");
+    const auto& cfg = model.config();
+    ServeBackend backend{};
+    backend.backend_name = "vulkan";
+    backend.device_name = ctx.info().name;
+    backend.max_context = cfg.dense.max_seq_len;
+    backend.generate = [&](const auto& prompt, int limit, auto& stats, const GenerationOptions& options) {
+        model.generate_vulkan(ctx, prompt, limit, &stats, false, 0, -1, options);
+    };
+    if (vision) backend.encode_vision = [&](auto text, auto images, auto offsets, int context) {
+        auto prompt = encode_vision_prompt_vulkan(ctx, *vision, tokenizer, text, images, offsets, context);
+        ServePrompt result;
+        result.tokens = std::move(prompt.tokens);
+        result.inputs_embeds = std::move(prompt.inputs_embeds);
+        return result;
+    };
+    backend.reset_state = [&] { model.reset_kv_and_state_vulkan(ctx); };
+    backend.health = [&] {
+        auto health = http::health_body(model_name, cfg, 1, backend.max_context, {});
+        health["kv_dtype"] = health["kv_dtype_requested"] = ctx.kv_dtype() ? dtype_name(*ctx.kv_dtype()) : "auto";
+        return health;
+    };
+    serve(backend, cfg, tokenizer, model_name, host, port, preset_images, speculation, shutdown);
+}
+#endif
 
 }  // namespace fusionrt

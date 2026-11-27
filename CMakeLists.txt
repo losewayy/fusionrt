@@ -164,7 +164,6 @@ if(FUSIONRT_ENABLE_CUDA)
         src/models/cuda_ir.cpp
         src/models/cuda_executor.cpp
         src/models/cuda_generate.cpp
-        src/server/http_server.cpp
     )
 endif()
 
@@ -201,6 +200,7 @@ if(FUSIONRT_ENABLE_VULKAN)
         "${SHADER_SRC_DIR}/*.comp"
         "${SHADER_SRC_DIR}/matmul/*.comp"
         "${SHADER_SRC_DIR}/sequence/*.comp"
+        "${SHADER_SRC_DIR}/epilogue/*.comp"
     )
     set(SHADER_SPV_OUTPUTS "")
 
@@ -235,9 +235,14 @@ if(FUSIONRT_ENABLE_VULKAN)
         src/models/vulkan_session.cpp
         src/models/vulkan_executor.cpp
         src/models/vulkan_dispatch.cpp
+        src/models/vulkan_vision.cpp
         src/vulkan/vulkan_backend.cpp
         src/vulkan/vulkan_ops.cpp
     )
+endif()
+
+if(FUSIONRT_ENABLE_CUDA OR FUSIONRT_ENABLE_VULKAN)
+    list(APPEND FUSIONRT_SOURCES src/server/http_server.cpp)
 endif()
 
 add_library(fusionrt_core STATIC ${FUSIONRT_SOURCES})
@@ -248,7 +253,11 @@ target_compile_definitions(fusionrt_core PUBLIC
 )
 
 if(FUSIONRT_ENABLE_CUDA AND WIN32)
-    target_link_libraries(fusionrt_core PRIVATE ws2_32 dxgi)
+    target_link_libraries(fusionrt_core PRIVATE dxgi)
+endif()
+
+if(WIN32 AND (FUSIONRT_ENABLE_CUDA OR FUSIONRT_ENABLE_VULKAN))
+    target_link_libraries(fusionrt_core PRIVATE ws2_32)
 endif()
 
 if(FUSIONRT_ENABLE_VULKAN)

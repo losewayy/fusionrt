@@ -1,0 +1,253 @@
+#version 450
+
+// Set 0, std430: 0:a/qkv, 1:b/weight/q_norm_w, 2:k_norm_w, 3:y/q_out (float arrays),
+// 4:k_cache and 5:v_cache (uint RW), 6:rope_factors (float).
+// Push (60 bytes): int mode@0, M@4, N@8, num_q_heads@12, num_kv_heads@16,
+// head_dim@20, rot_dim@24, start_pos@28, kv_dtype@32, flags@36;
+// float theta@40, eps@44, scale_a@48, scale_b@52, cap@56.
+// 0 GeGLU (ceil(M*N/64),1,1): a is gate, b is up, both [M,N].
+// 1 RMSNorm (M,1,1): a/y[M,N], weight[N]. Flags: 1 add one to weight,
+//   2 weightless (overrides 1), 4 apply output scale_a.
+// 2 Softcap (ceil(M*N/64),1,1): a/y[M,N], cap > 0.
+// 3 Scale+add (ceil(M*N/64),1,1): a/b/y[M,N]. If scale_b is zero, b is unused.
+// 4 RoPE+KV append (num_q_heads+num_kv_heads,M,1): packed Q,K,V per token,
+//   q_out[M,num_q_heads,head_dim]. K/V [tokens,num_kv_heads,head_dim] with
+//   dtype 0 F32, 1 F16, 3 Q8_0 (32 values per 34-byte block, both K and V).
+//   Pad cache buffer ranges to uint words. 0 <= rot_dim <= head_dim <= 512,
+//   rot_dim even, Q8_0 head_dim a multiple of 32. Flags: 1 QK norm, 2 NeoX,
+//   4 divide frequency by factors[rot_dim/2], 8 add one to QK weights,
+//   16 weightless V norm, 32 weightless Q norm, 64 weightless K norm.
+//   Weightless Q/K flags independently enable that norm and override its weights.
+// y may alias a or b in modes 0..3 (weight must be separate for mode 1).
+layout(local_size_x = 64) in;
+layout(std430, binding = 0) readonly buffer A { float a[]; };
+layout(std430, binding = 1) readonly buffer B { float b[]; };
+layout(std430, binding = 2) readonly buffer KNorm { float k_norm_w[]; };
+layout(std430, binding = 3) writeonly buffer Out { float y[]; };
+layout(std430, binding = 4) buffer KCache { uint k_cache[]; };
+layout(std430, binding = 5) buffer VCache { uint v_cache[]; };
+layout(std430, binding = 6) readonly buffer Factors { float rope_factors[]; };
+
+layout(push_constant) uniform Push {
+    int mode, M, N, num_q_heads, num_kv_heads, head_dim, rot_dim, start_pos, kv_dtype, flags;
+    float theta, eps, scale_a, scale_b, cap;
+} pc;
+
+const int Q8_0 = 3;
+const uint Q8_HALFWORDS = 17u;
+shared float head[512];
+shared float sums[64];
+shared vec2 q8_max[16];
+
+float sum_group(float value) {
+    uint lane = gl_LocalInvocationIndex;
+    sums[lane] = value;
+    barrier();
+    for (uint step = 32u; step > 0u; step >>= 1u) {
+        if (lane < step) sums[lane] += sums[lane + step];
+        barrier();
+    }
+    float result = sums[0];
+    barrier();
+    return result;
+}
+
+void rmsnorm() {
+    int row = int(gl_WorkGroupID.x);
+    if (row >= pc.M) return;
+    int base = row * pc.N;
+    int lane = int(gl_LocalInvocationIndex);
+    float sq = 0.0;
+    for (int i = lane; i < pc.N; i += 64) {
+        float value = a[base + i];
+        sq += value * value;
+    }
+    float inv = inversesqrt(sum_group(sq) / float(pc.N) + pc.eps);
+    float offset = (pc.flags & 1) != 0 ? 1.0 : 0.0;
+    float scale = (pc.flags & 4) != 0 ? pc.scale_a : 1.0;
+    for (int i = lane; i < pc.N; i += 64) {
+        float w = (pc.flags & 2) != 0 ? 1.0 : b[i] + offset;
+        y[base + i] = a[base + i] * inv * w * scale;
+    }
+}
+
+uint pack_half_rte(float value) {
+    uint bits = floatBitsToUint(value);
+    uint magnitude = bits & 0x7fffffffu;
+    uint sign_bit = (bits >> 16) & 0x8000u;
+    if (magnitude < 0x38800000u) return sign_bit | uint(roundEven(abs(value) * 16777216.0));
+    if (magnitude >= 0x477ff000u) return sign_bit | (magnitude > 0x7f800000u ? 0x7e00u : 0x7c00u);
+    uint rounded = bits + 0xfffu + ((bits >> 13) & 1u);
+    return packHalf2x16(vec2(uintBitsToFloat(rounded & 0xffffe000u), 0.0));
+}
+
+uvec2 quantize(vec2 value, vec2 multiplier) {
+    return uvec2(ivec2(clamp(roundEven(value * multiplier), -127.0, 127.0))) & 255u;
+}
+
+uvec2 cache_halfword(uint i, uint v_base, float v_inv) {
+    if (pc.kv_dtype != Q8_0)
+        return uvec2(pack_half_rte(head[i]), pack_half_rte(a[v_base + i] * v_inv));
+
+    uint block = i / Q8_HALFWORDS;
+    uint slot = i % Q8_HALFWORDS;
+    vec2 peak = q8_max[block];
+    if (slot == 0u) {
+        vec2 scale = peak * (1.0 / 127.0);
+        return uvec2(pack_half_rte(scale.x), pack_half_rte(scale.y));
+    }
+
+    uint d = block * 32u + 2u * (slot - 1u);
+    vec2 divisor = mix(vec2(1.0), peak, greaterThan(peak, vec2(0.0)));
+    precise vec2 multiplier = 127.0 / divisor;
+    // Refine the quotient before rounding, so reciprocal error cannot move an int8 tie.
+    multiplier = fma(fma(-divisor, multiplier, vec2(127.0)), multiplier * (1.0 / 127.0), multiplier);
+    return quantize(vec2(head[d], a[v_base + d] * v_inv), multiplier) |
+          (quantize(vec2(head[d + 1u], a[v_base + d + 1u] * v_inv), multiplier) << 8u);
+}
+
+void store_cache_word(uint word, uvec2 packed, uint mask) {
+    if (mask == 0xffffffffu) {
+        k_cache[word] = packed.x;
+        v_cache[word] = packed.y;
+        return;
+    }
+
+    // Adjacent heads or tokens may each own half of the same packed word.
+    uint old = 0u;
+    for (;;) {
+        uint current = atomicCompSwap(k_cache[word], old, (old & ~mask) | packed.x);
+        if (current == old) break;
+        old = current;
+    }
+    old = 0u;
+    for (;;) {
+        uint current = atomicCompSwap(v_cache[word], old, (old & ~mask) | packed.y);
+        if (current == old) break;
+        old = current;
+    }
+}
+
+void rotary_and_cache() {
+    int h = int(gl_WorkGroupID.x);
+    int m = int(gl_WorkGroupID.y);
+    int lane = int(gl_LocalInvocationIndex);
+    if (m >= pc.M || h >= pc.num_q_heads + pc.num_kv_heads) return;
+
+    bool is_q = h < pc.num_q_heads;
+    int pos = pc.start_pos + m;
+    uint dim = uint(pc.head_dim);
+    uint base = (uint(m) * uint(pc.num_q_heads + 2 * pc.num_kv_heads) + uint(h)) * dim;
+    uint v_base = base + uint(pc.num_kv_heads) * dim;
+    bool weightless = (pc.flags & (is_q ? 32 : 64)) != 0;
+    bool normalize = weightless || (pc.flags & 1) != 0;
+
+    float sq = 0.0;
+    for (int i = lane; i < pc.head_dim; i += 64) {
+        float value = a[base + i];
+        head[i] = value;
+        if (normalize) sq += value * value;
+    }
+
+    if (normalize) {
+        float inv = inversesqrt(sum_group(sq) / float(pc.head_dim) + pc.eps);
+        float offset = (pc.flags & 8) != 0 ? 1.0 : 0.0;
+        for (int i = lane; i < pc.head_dim; i += 64) {
+            float w = weightless ? 1.0 : (is_q ? b[i] : k_norm_w[i]) + offset;
+            head[i] = head[i] * inv * w;
+        }
+    }
+    barrier();
+
+    int half_rot = pc.rot_dim / 2;
+    bool neox = (pc.flags & 2) != 0;
+    for (int i = lane; i < half_rot; i += 64) {
+        float angle = float(pos) * pow(pc.theta, -float(2 * i) / float(pc.rot_dim));
+        if ((pc.flags & 4) != 0) angle /= rope_factors[i];
+        float c = cos(angle), s = sin(angle);
+        int lo = neox ? i : 2 * i;
+        int hi = neox ? i + half_rot : 2 * i + 1;
+        float x0 = head[lo], x1 = head[hi];
+        head[lo] = x0 * c - x1 * s;
+        head[hi] = x0 * s + x1 * c;
+    }
+    barrier();
+
+    if (is_q) {
+        uint q_base = (uint(m) * uint(pc.num_q_heads) + uint(h)) * dim;
+        for (int i = lane; i < pc.head_dim; i += 64) y[q_base + i] = head[i];
+        return;
+    }
+
+    float v_inv = 1.0;
+    if ((pc.flags & 16) != 0) {
+        float v_sq = 0.0;
+        for (int i = lane; i < pc.head_dim; i += 64) {
+            float value = a[v_base + i];
+            v_sq += value * value;
+        }
+        v_inv = inversesqrt(sum_group(v_sq) / float(pc.head_dim) + pc.eps);
+    }
+
+    uint entry = uint(pos) * uint(pc.num_kv_heads) + uint(h - pc.num_q_heads);
+    if (pc.kv_dtype == 0) {
+        for (int i = lane; i < pc.head_dim; i += 64) {
+            k_cache[entry * dim + i] = floatBitsToUint(head[i]);
+            v_cache[entry * dim + i] = floatBitsToUint(a[v_base + i] * v_inv);
+        }
+        return;
+    }
+
+    uint halfwords = dim;
+    if (pc.kv_dtype == Q8_0) {
+        int blocks = pc.head_dim / 32;
+        halfwords = uint(blocks) * Q8_HALFWORDS;
+        if (lane < blocks) {
+            vec2 peak = vec2(0.0);
+            int first = lane * 32;
+            for (int i = first; i < first + 32; ++i)
+                peak = max(peak, abs(vec2(head[i], a[v_base + i] * v_inv)));
+            q8_max[lane] = peak;
+        }
+        barrier();
+    }
+
+    uint begin = entry * halfwords;
+    uint end = begin + halfwords;
+    for (uint word = (begin >> 1u) + uint(lane); word < ((end + 1u) >> 1u); word += 64u) {
+        uint lo = 2u * word, hi = lo + 1u;
+        uvec2 packed = uvec2(0u);
+        uint mask = 0u;
+        if (lo >= begin) {
+            packed = cache_halfword(lo - begin, v_base, v_inv);
+            mask = 0xffffu;
+        }
+        if (hi < end) {
+            packed |= cache_halfword(hi - begin, v_base, v_inv) << 16u;
+            mask |= 0xffff0000u;
+        }
+        store_cache_word(word, packed, mask);
+    }
+}
+
+void main() {
+    if (pc.mode == 1) {
+        rmsnorm();
+    } else if (pc.mode == 4) {
+        rotary_and_cache();
+    } else {
+        int i = int(gl_GlobalInvocationID.x);
+        if (i >= pc.M * pc.N) return;
+        float v = a[i];
+        if (pc.mode == 0) {
+            float arg = 0.7978845608028654 * v * (1.0 + 0.044715 * v * v);
+            float g = (0.5 * v) * (1.0 + tanh(clamp(arg, -10.0, 10.0)));
+            y[i] = g * b[i];
+        } else if (pc.mode == 2) {
+            y[i] = pc.cap * tanh(clamp(v / pc.cap, -10.0, 10.0));
+        } else if (pc.mode == 3) {
+            float rhs = pc.scale_b != 0.0 ? b[i] * pc.scale_b : 0.0;
+            y[i] = v * pc.scale_a + rhs;
+        }
+    }
+}

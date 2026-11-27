@@ -158,6 +158,7 @@ struct InputEmbedding {
     int start = 0;  // Offset into prompt token IDs.
     Tensor rows;
     bool bidirectional = false;
+    HostTensor host_rows;
 };
 
 struct ModelMemory {

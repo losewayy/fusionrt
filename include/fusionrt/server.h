@@ -42,4 +42,13 @@ void serve_http(CudaContext& ctx, FusionModel& model, const BpeTokenizer& tokeni
                 ServeSpeculation speculation = {}, std::stop_token shutdown = {});
 #endif
 
+#ifdef FUSIONRT_ENABLE_VULKAN
+class VkContext;
+class VulkanVisionEncoder;
+void serve_http(VkContext& ctx, FusionModel& model, const BpeTokenizer& tokenizer,
+                const std::string& model_name, const std::string& host, int port,
+                const VulkanVisionEncoder* vision = nullptr, std::span<const Image> preset_images = {},
+                ServeSpeculation speculation = {}, std::stop_token shutdown = {});
+#endif
+
 }  // namespace fusionrt

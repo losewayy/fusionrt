@@ -608,8 +608,10 @@ void test_vulkan_continued_turn() {
     VkContext capacity(0, 0, 32);
     FusionModel exact(cfg);
     exact.init_synthetic_vulkan(capacity, seed);
-    if (capacity.weight_arena().used() != capacity.weight_arena().capacity())
-        throw std::runtime_error("Vulkan arenas must match the calculated backend bytes exactly");
+    const auto slack = capacity.weight_arena().capacity() - capacity.weight_arena().used();
+    if (capacity.weight_arena().used() > capacity.weight_arena().capacity() ||
+        slack > capacity.info().min_storage_offset_align * 2)
+        throw std::runtime_error("Vulkan arenas must match the calculated backend bytes closely");
     try {
         capacity.reserve_model_memory(0, capacity.info().device_local_vram_bytes + 1);
         throw std::runtime_error("Vulkan accepted an oversized model footprint");

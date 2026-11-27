@@ -26,6 +26,32 @@ struct PushRopeKv { int num_q_heads, num_kv_heads, head_dim, rot_dim, pos; float
 struct PushGqaDecode { int num_q_heads, num_kv_heads, head_dim, kv_len; float scale; };
 struct PushSwiglu { int rows, inter_dim; };
 struct PushGdnStep { int num_k_heads, num_v_heads, dk, dv; float eps, q_scale; int has_conv_bias, tiled_value_heads; };
+// Wave B V2 shader push constants (std430 scalars, four bytes each).
+struct PushGdnChunk {
+    int mode, M, num_k_heads, num_v_heads, dk, dv, kernel_size, flags;
+    float eps, q_scale;
+};
+struct PushMla {
+    int mode, M, num_q_heads, kv_lora_rank, qk_rope_head_dim, start_pos, window, cache_dtype, flags;
+    float scale, theta, rope_amplitude, eps;
+};
+struct PushHadamard {
+    int mode, M, N, block_size, flags, head_dim, key_heads;
+    float eps;
+};
+struct PushMoeQuant {
+    int mode, M, H, I, num_experts, top_k, flags, num_groups, groups_used;
+    int gate_dtype, up_dtype, down_dtype, resident, first_expert;
+    uint32_t gate_offset, up_offset, down_offset;
+    float route_scale;
+};
+struct PushGemma {
+    int mode, M, N, num_q_heads, num_kv_heads, head_dim, rot_dim, start_pos, kv_dtype, flags;
+    float theta, eps, scale_a, scale_b, cap;
+};
+static_assert(sizeof(PushGdnChunk) == 40 && sizeof(PushMla) == 52 && sizeof(PushHadamard) == 32 &&
+              sizeof(PushMoeQuant) == 72 && sizeof(PushGemma) == 60);
+
 struct PushResidual { int n; };
 struct PushEmbed { int M, hidden, dtype; };
 struct PushMoeTopk { int num_experts, top_k, norm_topk; float scale; };

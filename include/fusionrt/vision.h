@@ -46,4 +46,37 @@ VisionPrompt encode_vision_prompt(CudaContext& ctx, const VisionEncoder& encoder
                                    std::span<const size_t> offsets, int context);
 #endif
 
+#ifdef FUSIONRT_ENABLE_VULKAN
+class VkContext;
+
+class VulkanVisionEncoder {
+public:
+    VulkanVisionEncoder(VkContext& ctx, const std::string& path, int text_hidden_size);
+    ~VulkanVisionEncoder();
+    HostTensor encode(VkContext& ctx, const Image& image, int max_tokens) const;
+    const VisionInfo& info() const;
+
+private:
+    struct Weights;
+    std::unique_ptr<Weights> weights_;
+};
+
+struct VulkanVisionPrompt {
+    std::vector<int32_t> tokens;
+    std::vector<InputEmbedding> inputs_embeds;
+};
+
+VulkanVisionPrompt encode_vision_prompt_vulkan(VkContext& ctx, const VulkanVisionEncoder& encoder,
+    const BpeTokenizer& tokenizer, std::string_view text, std::span<const Image* const> images,
+    std::span<const size_t> offsets, int context);
+
+inline VulkanVisionPrompt encode_vision_prompt_vulkan(VkContext& ctx, const VulkanVisionEncoder& encoder,
+    const BpeTokenizer& tokenizer, std::string_view text, std::span<const Image* const> images, int context) {
+    std::vector<size_t> offsets;
+    for (size_t pos = text.find(image_placeholder); pos != text.npos;
+         pos = text.find(image_placeholder, pos + image_placeholder.size())) offsets.push_back(pos);
+    return encode_vision_prompt_vulkan(ctx, encoder, tokenizer, text, images, offsets, context);
+}
+#endif
+
 }  // namespace fusionrt

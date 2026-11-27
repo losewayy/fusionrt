@@ -3,7 +3,7 @@
 #include "../src/models/cuda_dispatch.h"
 #endif
 #ifdef FUSIONRT_ENABLE_VULKAN
-#include "test_vulkan_v1.h"
+#include "test_vulkan_v2.h"
 #endif
 #include "test_support.h"
 #include <future>
@@ -171,6 +171,7 @@ void test_wave1_inputs() {
     std::cout << "  [PASS] Wave 1 CPU quantization, metadata validation and terminal protocol contracts\n";
 #ifdef FUSIONRT_ENABLE_VULKAN
     test_vulkan_dense_kv_reset();
+    test_vulkan_v2();
 #ifndef FUSIONRT_ENABLE_CUDA
     test_vulkan_v1();
 #endif

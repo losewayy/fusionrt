@@ -13,7 +13,8 @@ struct VulkanModelRuntime {
     VulkanLoadHooks load_hooks(VkContext& ctx) {
         return {
             [&](const DenseGQAConfig& cfg, DType kv_type) { sessions.allocate_dense(ctx, cfg, kv_type); },
-            [&](const GatedDeltaNetConfig& cfg, int conv_dim) { sessions.allocate_gdn(ctx, cfg, conv_dim); }
+            [&](const GatedDeltaNetConfig& cfg, int conv_dim) { sessions.allocate_gdn(ctx, cfg, conv_dim); },
+            [&](int source) { sessions.allocate_dense(ctx, {}, DType::F32, source); }
         };
     }
 
@@ -55,9 +56,9 @@ std::vector<float> FusionModel::forward_token_vulkan(VkContext& ctx, int32_t tok
 
 std::vector<int32_t> FusionModel::generate_vulkan(VkContext& ctx, const std::vector<int32_t>& prompt_ids,
                                                   int max_new_tokens, GenerationStats* stats, bool keep_state,
-                                                  int start_pos, int32_t stop_eos_id) {
+                                                  int start_pos, int32_t stop_eos_id, const GenerationOptions& options) {
     if (!vulkan_) throw std::logic_error("Vulkan model is not loaded");
-    return vulkan_->executor.generate_vulkan(ctx, prompt_ids, max_new_tokens, stats, keep_state, start_pos, stop_eos_id);
+    return vulkan_->executor.generate_vulkan(ctx, prompt_ids, max_new_tokens, stats, keep_state, start_pos, stop_eos_id, options);
 }
 
 }  // namespace fusionrt

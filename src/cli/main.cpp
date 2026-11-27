@@ -52,14 +52,16 @@ void print_usage(std::string_view command = {}) {
     if (show("run")) std::cout << "fusionrt run [--model PATH] [--arch dense|hybrid|moe] [--dtype f32|f16|bf16|q4|q8]\n"
         << "  [--backend cuda|vulkan] [--vk-device N] [--prompt TEXT] [--steps N] [--max-seq N] [--chat]\n"
         << "  [--stream] [--ignore-eos] [--chatml] [--graph|--no-graph] [--unfused]\n"
-        << "  CUDA: [--slots N] [--warmup N] [--json-grammar] [--mmproj GGUF] [--image PATH]...\n"
+        << "  [--json|--json-grammar] [--mmproj GGUF] [--image PATH]...\n"
+        << "  CUDA: [--slots N] [--warmup N]\n"
         << "  CUDA: [--profile-ops FILE] [--trace-layers FILE] [--trace-moe] [--trace-moe-routes FILE] [--cpu-moe-f32]\n"
         << sampling << placement << vulkan << speculative << "  --steps defaults to 512 for real models and 16 for synthetic models.\n";
     if (show("chat")) std::cout << "fusionrt chat --model PATH [--system TEXT] [--max-tokens N] [--max-seq N] [--graph|--no-graph]\n"
         << sampling << placement;
     if (show("serve")) std::cout << "fusionrt serve --model PATH [--host HOST] [--port N] [--max-seq N] [--slots N]\n"
-        << "  [--graph|--no-graph] [--mmproj GGUF] [--image PATH]... [--trace-moe-routes FILE]\n"
-        << placement << speculative;
+        << "  [--backend cuda|vulkan] [--vk-device N] [--mmproj GGUF] [--image PATH]...\n"
+        << "  CUDA: [--graph|--no-graph] [--trace-moe-routes FILE]\n"
+        << placement << vulkan << speculative;
     if (show("inspect")) std::cout << "fusionrt inspect --model PATH [--max-seq N] [--device-memory]\n"
         << "  CUDA placement flags require --device-memory.\n" << placement;
     if (show("bench-model")) std::cout << "fusionrt bench-model --model PATH [--pp N] [--tg N] [--decode-prefix N]\n"
@@ -253,6 +255,33 @@ void load_tokenizer(BpeTokenizer& tok, const std::string& model_path) {
     throw std::runtime_error("Cannot load tokenizer at " + expected + ": " + error);
 }
 
+std::vector<Image> load_images(const std::vector<std::string>& paths) {
+    std::vector<Image> images;
+    images.reserve(paths.size());
+    for (const auto& path : paths) images.push_back(load_image(path));
+    return images;
+}
+
+std::string format_run_prompt(std::string prompt, const BpeTokenizer& tok, bool chatml,
+                              size_t images, std::string_view architecture) {
+    if (images && prompt.find(image_placeholder) == std::string::npos) {
+        std::string prefix;
+        for (size_t i = 0; i < images; ++i) prefix += image_placeholder;
+        prompt.insert(0, prefix);
+    }
+    if (images && architecture == "gemma4" && !prompt.starts_with("<|turn>"))
+        return tok.format_chat_messages({{"user", prompt}});
+    if (chatml && tok.has_chatml()) return "<|im_start|>user\n" + prompt + "<|im_end|>\n<|im_start|>assistant\n";
+    return prompt;
+}
+
+std::vector<const Image*> image_refs(std::span<const Image> images) {
+    std::vector<const Image*> refs;
+    refs.reserve(images.size());
+    for (const auto& image : images) refs.push_back(&image);
+    return refs;
+}
+
 const char* stop_reason(int generated, int steps, bool eos, bool context_full) {
     if (eos) return "eos";
     if (generated == steps) return "max_steps";
@@ -348,11 +377,21 @@ struct WeightSummary {
     }
 };
 
+#ifdef FUSIONRT_ENABLE_VULKAN
+void load_vulkan_model(VkContext& ctx, FusionModel& model, const std::string& path, int max_seq);
+#endif
+
 int cmd_daily(const std::string& cmd, int argc, char** argv) {
     std::string path, system, profile, host = "127.0.0.1";
+#if defined(FUSIONRT_ENABLE_VULKAN) && !defined(FUSIONRT_ENABLE_CUDA)
+    std::string backend = "vulkan";
+#else
+    std::string backend = "cuda";
+#endif
     std::string mmproj, route_trace_path;
     std::vector<std::string> image_paths;
     int max_seq = 4096, steps = 512, port = 8080, slots = 1;
+    std::optional<int> vk_device;
     std::optional<bool> graph;
     bool inspect_device = false, kv_dtype_specified = false;
     SamplingParams sampling;
@@ -388,6 +427,8 @@ int cmd_daily(const std::string& cmd, int argc, char** argv) {
         }
         else if (arg == "--profile") profile = value;
         else if (placement.parse(arg, value)) continue;
+        else if (cmd == "serve" && arg == "--backend") backend = value;
+        else if (cmd == "serve" && arg == "--vk-device") vk_device = parse_integer(arg, value);
         else if (cmd == "serve" && arg == "--host") host = value;
         else if (cmd == "serve" && arg == "--port") port = parse_integer(arg, value);
         else if (cmd == "serve" && arg == "--mmproj") mmproj = value;
@@ -515,6 +556,34 @@ int cmd_daily(const std::string& cmd, int argc, char** argv) {
             std::chrono::steady_clock::now() - start).count() << '\n';
         return 0;
     }
+    if (cmd == "serve") {
+        if (backend != "cuda" && backend != "vulkan") throw std::invalid_argument("Unknown --backend: " + backend);
+        if (vk_device && backend != "vulkan") throw std::invalid_argument("--vk-device requires the Vulkan backend");
+        if (backend == "vulkan") {
+#ifndef FUSIONRT_ENABLE_VULKAN
+            throw std::invalid_argument("Vulkan backend was not enabled in this build");
+#else
+            const int vk_dev = vk_device.value_or(0);
+            if (vk_dev < 0) throw std::invalid_argument("Expected --vk-device >= 0");
+            if (placement.specified || slots != 1 || !route_trace_path.empty() || speculative.enabled())
+                throw std::invalid_argument("Placement, multiple slots, MoE route tracing and speculative decoding require CUDA");
+            if (graph.value_or(false)) std::clog << "--graph requested, using eager decoding on Vulkan\n";
+            VkContext ctx(static_cast<uint32_t>(vk_dev), 0, 0);
+            ctx.set_kv_dtype(kv_dtype);
+            ctx.set_device_profile(DeviceProfile::load(profile));
+            FusionModel model({});
+            BpeTokenizer tokenizer;
+            load_tokenizer(tokenizer, path);
+            load_vulkan_model(ctx, model, path, max_seq);
+            std::unique_ptr<VulkanVisionEncoder> vision;
+            if (!mmproj.empty())
+                vision = std::make_unique<VulkanVisionEncoder>(ctx, mmproj, model.config().dense.hidden_size);
+            const auto preset_images = load_images(image_paths);
+            serve_http(ctx, model, tokenizer, model_filename(path), host, port, vision.get(), preset_images);
+            return 0;
+#endif
+        }
+    }
 #ifndef FUSIONRT_ENABLE_CUDA
     std::cerr << "CUDA backend was not enabled in this build.\n";
     return 1;
@@ -567,8 +636,7 @@ int cmd_daily(const std::string& cmd, int argc, char** argv) {
     std::unique_ptr<VisionEncoder> vision;
     if (!mmproj.empty()) vision = std::make_unique<VisionEncoder>(ctx, mmproj, model.config().dense.hidden_size);
     auto draft = load_draft_model(ctx, tokenizer, speculative, max_seq);
-    std::vector<Image> preset_images;
-    for (const auto& image_path : image_paths) preset_images.push_back(load_image(image_path));
+    const auto preset_images = load_images(image_paths);
     std::unique_ptr<MoeRouteTrace> route_trace;
     if (!route_trace_path.empty()) route_trace = std::make_unique<MoeRouteTrace>(route_trace_path);
     ctx.moe_route_trace = route_trace.get();
@@ -747,7 +815,11 @@ int cmd_bench_model(int argc, char** argv) {
 int cmd_run(int argc, char** argv) {
     std::string arch = "hybrid";
     std::string dtype_s = "f32";
+#if defined(FUSIONRT_ENABLE_VULKAN) && !defined(FUSIONRT_ENABLE_CUDA)
+    std::string backend_s = "vulkan";
+#else
     std::string backend_s = "cuda";
+#endif
     std::string model_path;
     std::string mmproj;
     std::vector<std::string> image_paths;
@@ -761,7 +833,7 @@ int cmd_run(int argc, char** argv) {
     CudaPlacementOptions placement;
     SamplingParams sampling;
     std::string profile, profile_ops, layer_trace, route_trace_path;
-    bool stream = false, sampling_set = false, json_grammar = false, trace_moe = false, cpu_moe_f32 = false;
+    bool stream = false, json_grammar = false, trace_moe = false, cpu_moe_f32 = false;
     bool use_fused = true;
     bool chat_mode = false;
     bool ignore_eos = false;
@@ -775,7 +847,7 @@ int cmd_run(int argc, char** argv) {
         else if (a == "--backend" && i + 1 < argc) backend_s = argv[++i];
         else if (a == "--vk-device" && i + 1 < argc) vk_dev = parse_integer(a, argv[++i]);
         else if (a == "--model" && i + 1 < argc) model_path = argv[++i];
-        else if (a == "--json-grammar") json_grammar = true;
+        else if (a == "--json" || a == "--json-grammar") json_grammar = true;
         else if (a == "--spec-mtp") speculative.mtp = true;
         else if (i + 1 < argc && speculative.parse(a, argv[i + 1])) ++i;
         else if (a == "--mmproj" && i + 1 < argc) mmproj = argv[++i];
@@ -801,7 +873,6 @@ int cmd_run(int argc, char** argv) {
         else if (i + 1 < argc && placement.parse(a, argv[i + 1])) ++i;
         else if (i + 1 < argc && parse_sampling(a, argv[i + 1], sampling)) {
             ++i;
-            sampling_set = true;
         } else throw std::invalid_argument("Unknown or incomplete run option: " + a);
     }
     const int steps = steps_option.value_or(model_path.empty() ? 16 : 512);
@@ -813,14 +884,14 @@ int cmd_run(int argc, char** argv) {
         throw std::invalid_argument("--slots, --warmup, --trace-moe and --cpu-moe-f32 require non-interactive CUDA run");
     if (trace_moe && speculative.enabled()) throw std::invalid_argument("--trace-moe requires standard decoding");
     if (!image_paths.empty() && mmproj.empty()) throw std::invalid_argument("--image requires --mmproj");
-    if (!mmproj.empty() && (backend_s != "cuda" || chat_mode))
-        throw std::invalid_argument("--mmproj requires non-interactive CUDA run");
+    if (!mmproj.empty() && chat_mode)
+        throw std::invalid_argument("--mmproj requires non-interactive run");
     if (!image_paths.empty() && speculative.enabled())
         throw std::invalid_argument("Image input requires standard decoding");
     speculative.validate(!model_path.empty());
-    if ((json_grammar || speculative.enabled()) && (backend_s != "cuda" || chat_mode)) {
-        throw std::invalid_argument("JSON grammar and speculative decoding require non-interactive CUDA run");
-    }
+    if (json_grammar && chat_mode) throw std::invalid_argument("JSON grammar requires non-interactive run");
+    if (speculative.enabled() && (backend_s != "cuda" || chat_mode))
+        throw std::invalid_argument("Speculative decoding requires non-interactive CUDA run");
 
     DType wdt = DType::F32;
     if (dtype_s == "q8") wdt = DType::Q8_0;
@@ -854,14 +925,10 @@ int cmd_run(int argc, char** argv) {
         model.set_num_slots(slots);
         ctx.set_kv_dtype(kv_dtype);
         std::vector<int32_t> text_ids;
-        auto format_text = [&] {
-            return use_chatml && tok.has_chatml()
-                ? "<|im_start|>user\n" + prompt + "<|im_end|>\n<|im_start|>assistant\n" : prompt;
-        };
         if (!model_path.empty()) {
             load_tokenizer(tok, model_path);
             if (image_paths.empty() && !chat_mode) {
-                text_ids = tok.encode(format_text(), true);
+                text_ids = tok.encode(format_run_prompt(prompt, tok, use_chatml, 0, {}), true);
                 const auto requested = std::max(size_t{1}, text_ids.size()) + std::max(steps, warmup);
                 model.set_kv_commitment_tokens(static_cast<int>(std::min(requested, static_cast<size_t>(max_seq))));
             }
@@ -882,26 +949,16 @@ int cmd_run(int argc, char** argv) {
             return interactive_chat(ctx, model, tok, "", sampling, steps, use_fused, graph_option, stop_on_eos);
         }
 
-        if (!image_paths.empty() && prompt.find(image_placeholder) == std::string::npos) {
-            std::string prefix;
-            for (size_t i = 0; i < image_paths.size(); ++i) prefix += image_placeholder;
-            prompt = prefix + prompt;
-        }
-        std::string final_prompt = prompt;
-        if (!image_paths.empty() && model.config().model_architecture == "gemma4" && !prompt.starts_with("<|turn>"))
-            final_prompt = tok.format_chat_messages({{"user", prompt}});
-        else if (use_chatml && tok.has_chatml())
-            final_prompt = "<|im_start|>user\n" + prompt + "<|im_end|>\n<|im_start|>assistant\n";
+        const auto final_prompt = format_run_prompt(prompt, tok, use_chatml, image_paths.size(),
+                                                    model.config().model_architecture);
         VisionPrompt prepared;
         double vision_ms = 0;
         if (image_paths.empty()) prepared.tokens = text_ids.empty() ? tok.encode(final_prompt, true) : std::move(text_ids);
         else {
             const auto image_start = std::chrono::steady_clock::now();
-            std::vector<Image> images;
-            std::vector<const Image*> refs;
-            for (const auto& path : image_paths) images.push_back(load_image(path));
-            for (const auto& image : images) refs.push_back(&image);
-            prepared = encode_vision_prompt(ctx, *vision, tok, final_prompt, refs, model.config().dense.max_seq_len);
+            const auto images = load_images(image_paths);
+            prepared = encode_vision_prompt(ctx, *vision, tok, final_prompt, image_refs(images),
+                                            model.config().dense.max_seq_len);
             vision_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - image_start).count();
         }
         auto& prompt_ids = prepared.tokens;
@@ -1031,8 +1088,8 @@ int cmd_run(int argc, char** argv) {
         std::cerr << "Vulkan backend was not enabled in this build.\n";
         return 1;
 #else
-        if (sampling_set || stream || !profile_ops.empty() || !layer_trace.empty()) {
-            throw std::invalid_argument("Sampling, streaming and operator/layer tracing require the CUDA backend");
+        if (!profile_ops.empty() || !layer_trace.empty()) {
+            throw std::invalid_argument("Operator/layer tracing requires the CUDA backend for run");
         }
         if (vk_dev < 0) throw std::invalid_argument("Expected --vk-device >= 0");
         VkContext ctx(static_cast<uint32_t>(vk_dev), 0, 0);
@@ -1046,11 +1103,23 @@ int cmd_run(int argc, char** argv) {
         }
         if (graph_option.value_or(false))
             std::clog << "--graph requested, using eager decoding because the backend is Vulkan\n";
-        int32_t eos_stop = (!model_path.empty() && !ignore_eos) ? tok.eos_id() : -1;
-        auto format_chatml_turn = [&](const std::string& msg) {
-            return (tok.has_chatml())
-                ? ("<|im_start|>user\n" + msg + "<|im_end|>\n<|im_start|>assistant\n")
-                : msg;
+        const bool stop_on_eos = !model_path.empty() && !ignore_eos;
+        const int32_t eos_stop = stop_on_eos ? tok.eos_id() : -1;
+        Utf8StreamDecoder utf8;
+        std::optional<JsonConstraint> constraint;
+        if (json_grammar) constraint.emplace(tok, model.config().vocab_size);
+        GenerationOptions options;
+        options.sampling = sampling;
+        options.json_constraint = constraint ? &*constraint : nullptr;
+        if (stream || stop_on_eos) {
+            options.on_token = [&](int32_t id) {
+                if (stop_on_eos && tok.is_end_of_generation(id)) return false;
+                if (stream) std::cerr << utf8.push(tok.decode_token(id)) << std::flush;
+                return true;
+            };
+        }
+        auto finish_stream = [&] {
+            if (stream) std::cerr << utf8.finish() << '\n';
         };
 
         if (chat_mode) {
@@ -1061,9 +1130,10 @@ int cmd_run(int argc, char** argv) {
                       << ", backend=vulkan:" << vk_dev << ", type 'exit' to quit)\n> " << std::flush;
             while (std::getline(std::cin, line)) {
                 if (line == "exit" || line == "quit") break;
-                auto p_ids = tok.encode(format_chatml_turn(line), cur_pos == 0);
+                auto p_ids = tok.encode(format_run_prompt(line, tok, true, 0, {}), cur_pos == 0);
                 GenerationStats st;
-                auto out_ids = model.generate_vulkan(ctx, p_ids, steps, &st, true, cur_pos, eos_stop);
+                auto out_ids = model.generate_vulkan(ctx, p_ids, steps, &st, true, cur_pos, eos_stop, options);
+                finish_stream();
                 cur_pos += static_cast<int>(out_ids.size());
                 std::vector<int32_t> gen_only(out_ids.end() - st.generated_tokens, out_ids.end());
                 std::cout << tok.decode(gen_only)
@@ -1072,11 +1142,28 @@ int cmd_run(int argc, char** argv) {
             return 0;
         }
 
-        std::string final_prompt = use_chatml ? format_chatml_turn(prompt) : prompt;
-        auto prompt_ids = tok.encode(final_prompt, true);
+        const auto final_prompt = format_run_prompt(prompt, tok, use_chatml, image_paths.size(),
+                                                    model.config().model_architecture);
+        VulkanVisionPrompt prepared;
+        std::unique_ptr<VulkanVisionEncoder> vision;
+        if (!mmproj.empty())
+            vision = std::make_unique<VulkanVisionEncoder>(ctx, mmproj, model.config().dense.hidden_size);
+        double vision_ms = 0;
+        if (image_paths.empty()) prepared.tokens = tok.encode(final_prompt, true);
+        else {
+            const auto image_start = std::chrono::steady_clock::now();
+            const auto images = load_images(image_paths);
+            prepared = encode_vision_prompt_vulkan(ctx, *vision, tok, final_prompt, image_refs(images),
+                                                   model.config().dense.max_seq_len);
+            vision_ms = std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - image_start).count();
+        }
+        options.inputs_embeds = prepared.inputs_embeds;
+        const auto& prompt_ids = prepared.tokens;
         GenerationStats st;
-        auto out_ids = model.generate_vulkan(ctx, prompt_ids, steps, &st, false, 0, eos_stop);
-        const bool eos = st.generated_tokens > 0 && out_ids.back() == eos_stop;
+        auto out_ids = model.generate_vulkan(ctx, prompt_ids, steps, &st, false, 0, eos_stop, options);
+        finish_stream();
+        const bool eos = st.generated_tokens > 0 && (stop_on_eos || constraint) && tok.is_end_of_generation(out_ids.back());
         std::cout << "backend=vulkan:" << vk_dev << " device=\"" << ctx.info().name << "\""
                   << " arch=" << model.config().arch
                   << " dtype=" << dtype_name(model.config().dense.weight_dtype)
@@ -1087,12 +1174,20 @@ int cmd_run(int argc, char** argv) {
                   << " prefill_ms=" << st.prefill_ms
                   << " prefill_tok/s=" << st.prefill_tok_per_s
                   << " decode_ms=" << st.decode_ms
-                  << " decode_tok/s=" << st.decode_tok_per_s << "\n";
+                  << " decode_tok/s=" << st.decode_tok_per_s;
+        if (!prepared.inputs_embeds.empty()) {
+            int64_t image_tokens = 0;
+            for (const auto& embedding : prepared.inputs_embeds) image_tokens += embedding.host_rows.desc.shape[0];
+            std::cout << " image_tokens=" << image_tokens << " vision_ms=" << vision_ms;
+        }
+        std::cout << '\n';
         std::cout << "output_ids:";
         for (int32_t id : out_ids) std::cout << " " << id;
         std::cout << "\n";
         std::vector<int32_t> gen_only(out_ids.end() - st.generated_tokens, out_ids.end());
-        std::cout << "output_text: " << tok.decode(gen_only) << "\n";
+        const auto output_text = tok.decode(gen_only);
+        if (constraint) (void)JsonValue::parse(output_text);
+        std::cout << "output_text: " << output_text << "\n";
         return 0;
 #endif
     } else {

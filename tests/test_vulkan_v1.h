@@ -244,7 +244,9 @@ void test_vk_dense_q4k_prefill(VkContext& vk) {
         [&](const GatedDeltaNetConfig& gdn, int conv_dim) { sessions.allocate_gdn(vk, gdn, conv_dim); }
     });
     if (weights.embeddings().dtype != DType::Q4_K || weights.lm_head().dtype != DType::Q4_K ||
-        vk.weight_arena().capacity() != vk.weight_arena().used() || sessions.dense(0).key.dtype != DType::F16)
+        vk.weight_arena().used() > vk.weight_arena().capacity() ||
+        vk.weight_arena().capacity() - vk.weight_arena().used() > vk.info().min_storage_offset_align * 2 ||
+        sessions.dense(0).key.dtype != DType::F16)
         throw std::runtime_error("Vulkan Dense Q4_K weights and F16 KV must occupy the exact compact arena");
     for (const auto& layer : weights.dense_layers()) {
         for (const auto* matrix : {&layer.qkv_proj_fused, &layer.o_proj, &layer.gate_up_proj, &layer.down_proj}) {

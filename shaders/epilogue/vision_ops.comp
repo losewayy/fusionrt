@@ -1,0 +1,137 @@
+#version 450
+
+// Set 0, std430, float arrays: 0:x, 1:weight[C] or bias[C], 2:bias[C] or pos_emb[M,C], 3:y.
+// Push (40 bytes): int mode@0, M@4, C@8, width@12, height@16, heads@20, merge@24,
+// flags@28; float eps@32, theta@36. All rows are contiguous, channels last.
+// 0 LayerNorm: (M,1,1), x/y[M,C], 1:weight, optional 2:bias (flag 1).
+// 1 activation: (ceil(M*C/64),1,1), flags & 3 selects 0 GELU-tanh, 1 GELU-erf,
+//   2 QuickGELU, 3 SiLU. x/y[M,C].
+// 2 2D RoPE: (heads,M,1), x/y[M,heads,C/heads], M=width*height, C/heads divisible by 4.
+//   Flag 1 selects Qwen vision pairing (otherwise Gemma pairing, as CUDA rope_2d_f32).
+// 3 bias/position add: (ceil(M*C/64),1,1), x/y[M,C], flags 1 bias (1), 2 pos_emb (2).
+// 4 spatial merge/pool: (ceil(output_elements/64),1,1), x[height,width,C].
+//   Merge divides both axes. Output row-major [height/merge,width/merge,merge*merge*C]
+//   (patches in row-major order within a cell) or [...,C] with flag 1 (average pool).
+// x/y may alias in modes 0..3.
+layout(local_size_x = 64) in;
+layout(std430, binding = 0) readonly buffer X { float x[]; };
+layout(std430, binding = 1) readonly buffer W { float weight[]; };
+layout(std430, binding = 2) readonly buffer B { float bias[]; };
+layout(std430, binding = 3) writeonly buffer Y { float y[]; };
+
+layout(push_constant) uniform Push {
+    int mode, M, C, width, height, heads, merge, flags;
+    float eps, theta;
+} pc;
+
+shared float sums[64];
+
+float sum_group(float value) {
+    uint lane = gl_LocalInvocationIndex;
+    sums[lane] = value;
+    barrier();
+    for (uint step = 32u; step > 0u; step >>= 1u) {
+        if (lane < step) sums[lane] += sums[lane + step];
+        barrier();
+    }
+    float result = sums[0];
+    barrier();
+    return result;
+}
+
+void layer_norm() {
+    int row = int(gl_WorkGroupID.x);
+    if (row >= pc.M) return;
+    int lane = int(gl_LocalInvocationIndex);
+    int base = row * pc.C;
+    float sum = 0.0;
+    for (int c = lane; c < pc.C; c += 64) sum += x[base + c];
+    float mean = sum_group(sum) / float(pc.C);
+    float sq = 0.0;
+    for (int c = lane; c < pc.C; c += 64) {
+        float d = x[base + c] - mean;
+        sq = fma(d, d, sq);
+    }
+    float inv = inversesqrt(sum_group(sq) / float(pc.C) + pc.eps);
+    for (int c = lane; c < pc.C; c += 64) {
+        float b = (pc.flags & 1) != 0 ? bias[c] : 0.0;
+        y[base + c] = (x[base + c] - mean) * inv * weight[c] + b;
+    }
+}
+
+float activation(float value) {
+    int kind = pc.flags & 3;
+    if (kind >= 2) return value / (1.0 + exp(-(kind == 2 ? 1.702 : 1.0) * value));
+    if (kind == 0) {
+        float arg = 0.7978845608028654 * value * (1.0 + 0.044715 * value * value);
+        return (0.5 * value) * (1.0 + tanh(clamp(arg, -10.0, 10.0)));
+    }
+
+    // A&S 7.1.26 for erfc, evaluated directly in the negative GELU tail.
+    float a = abs(value) * 0.7071067811865476;
+    float t = 1.0 / (1.0 + 0.3275911 * a);
+    float p = (((((1.061405429 * t - 1.453152027) * t) + 1.421413741) * t
+                - 0.284496736) * t + 0.254829592) * t;
+    float tail = 0.5 * p * exp(-a * a);
+    return value * (value < 0.0 ? tail : 1.0 - tail);
+}
+
+void rotary_2d() {
+    int row = int(gl_WorkGroupID.y);
+    int head = int(gl_WorkGroupID.x);
+    if (row >= pc.M || head >= pc.heads) return;
+    int dim = pc.C / pc.heads;
+    int half_dim = dim / 2, quarter = dim / 4;
+    int base = row * pc.C + head * dim;
+    bool vision_layout = (pc.flags & 1) != 0;
+    for (int pair = int(gl_LocalInvocationIndex); pair < half_dim; pair += 64) {
+        bool row_axis = pair >= quarter;
+        int pos = row_axis != vision_layout ? row / pc.width : row % pc.width;
+        float theta = float(pos) * pow(pc.theta, -float(pair % quarter) / float(quarter));
+        float c = cos(theta), s = sin(theta);
+        int lo = base + (vision_layout ? pair : pair + (row_axis ? quarter : 0));
+        int hi = lo + (vision_layout ? half_dim : quarter);
+        float a = x[lo], b = x[hi];
+        y[lo] = a * c - b * s;
+        y[hi] = a * s + b * c;
+    }
+}
+
+void merge_pool(int i) {
+    int side = pc.merge;
+    int cells_x = pc.width / side;
+    int cells_y = pc.height / side;
+    bool average = (pc.flags & 1) != 0;
+    int stride = pc.C * (average ? 1 : side * side);
+    if (i >= cells_x * cells_y * stride) return;
+
+    int cell = i / stride, c = i % stride;
+    int base = (cell / cells_x * pc.width + cell % cells_x) * side;
+    if (!average) {
+        int tile = c / pc.C;
+        y[i] = x[(base + tile / side * pc.width + tile % side) * pc.C + c % pc.C];
+        return;
+    }
+    float sum = 0.0;
+    for (int r = 0; r < side; ++r)
+        for (int col = 0; col < side; ++col)
+            sum += x[(base + r * pc.width + col) * pc.C + c];
+    y[i] = sum / float(side * side);
+}
+
+void main() {
+    int i = int(gl_GlobalInvocationID.x);
+    if (pc.mode == 0) layer_norm();
+    else if (pc.mode == 2) rotary_2d();
+    else if (pc.mode == 4) merge_pool(i);
+    else if (i < pc.M * pc.C) {
+        if (pc.mode == 1) {
+            y[i] = activation(x[i]);
+        } else if (pc.mode == 3) {
+            float v = x[i];
+            if ((pc.flags & 1) != 0) v += weight[i % pc.C];
+            if ((pc.flags & 2) != 0) v += bias[i];
+            y[i] = v;
+        }
+    }
+}

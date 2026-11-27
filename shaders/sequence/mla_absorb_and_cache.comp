@@ -1,0 +1,191 @@
+#version 450
+
+// Set 0, std430. 0:primary and 1:positional, float RW; 2:kv_latent_cache uint RW;
+// 3:o_latent float[M,num_q_heads,kv_lora_rank]; 4:rope_factors float[qk_rope_head_dim/2];
+// 5:kv_norm_w float[kv_lora_rank] (optional, mode 0).
+// Push (52 bytes): int mode@0, M@4, num_q_heads@8, kv_lora_rank@12, qk_rope_head_dim@16,
+// start_pos@20, window@24, cache_dtype@28, flags@32; float scale@36, theta@40,
+// rope_amplitude@44; float eps@48.
+// Modes and dispatch:
+// 0 append (M,1,1): primary=c_kv[M,rank], positional=k_pe[M,rope] (already rotated).
+// 1 attention (num_q_heads,M,1): primary=q_nope_abs[M,heads,rank],
+//   positional=q_pe[M,heads,rope] (already rotated). Window <=0 means full causal.
+// 2 rotate (num_q_heads+1,M,1): primary=q_pe[M,heads,rope], positional=k_pe[M,rope],
+//   both updated in place. Adjacent pairs, rope_amplitude multiplies both rotated components.
+// Flags: 1 packed (modes 0/1: primary includes trailing positional channels, binding 1 unused;
+//   mode 2: both inputs have rank leading latent channels), 2 divide base frequencies by factors,
+//   4 use precomputed frequencies
+//   (CUDA/YaRN, overrides 2), 8 RMSNorm c_kv in mode 0.
+// Cache [tokens,rank+rope] contiguous, dtype 0 F32 or 1 F16, padded to a full uint.
+// Mode 1 supports latent rank 1..1024. RoPE dim must be even.
+layout(local_size_x = 64) in;
+layout(std430, binding = 0) buffer Primary { float primary[]; };
+layout(std430, binding = 1) buffer Positional { float positional[]; };
+layout(std430, binding = 2) buffer Cache { uint kv_latent_cache[]; };
+layout(std430, binding = 3) writeonly buffer Out { float o_latent[]; };
+layout(std430, binding = 4) readonly buffer Factors { float rope_factors[]; };
+layout(std430, binding = 5) readonly buffer Norm { float kv_norm_w[]; };
+
+layout(push_constant) uniform Push {
+    int mode, M, num_q_heads, kv_lora_rank, qk_rope_head_dim, start_pos, window, cache_dtype, flags;
+    float scale, theta, rope_amplitude, eps;
+} pc;
+
+shared float sums[64];
+
+float sum_group(float value) {
+    uint lane = gl_LocalInvocationIndex;
+    sums[lane] = value;
+    barrier();
+    for (uint step = 32u; step > 0u; step >>= 1u) {
+        if (lane < step) sums[lane] += sums[lane + step];
+        barrier();
+    }
+    float result = sums[0];
+    barrier();
+    return result;
+}
+
+uint pack_half_rte(float value) {
+    uint bits = floatBitsToUint(value);
+    uint magnitude = bits & 0x7fffffffu;
+    uint sign_bit = (bits >> 16) & 0x8000u;
+    if (magnitude < 0x38800000u) return sign_bit | uint(roundEven(abs(value) * 16777216.0));
+    if (magnitude >= 0x477ff000u) return sign_bit | (magnitude > 0x7f800000u ? 0x7e00u : 0x7c00u);
+    uint rounded = bits + 0xfffu + ((bits >> 13) & 1u);
+    return packHalf2x16(vec2(uintBitsToFloat(rounded & 0xffffe000u), 0.0));
+}
+
+float cache_value(uint index) {
+    if (pc.cache_dtype == 0) return uintBitsToFloat(kv_latent_cache[index]);
+    return unpackHalf2x16(kv_latent_cache[index >> 1u])[index & 1u];
+}
+
+float source_value(int row, int i) {
+    int rank = pc.kv_lora_rank;
+    int rope = pc.qk_rope_head_dim;
+    if ((pc.flags & 1) != 0) return primary[row * (rank + rope) + i];
+    return i < rank ? primary[row * rank + i] : positional[row * rope + i - rank];
+}
+
+float append_value(int row, int i, float inv) {
+    float value = source_value(row, i);
+    if ((pc.flags & 8) != 0 && i < pc.kv_lora_rank) value = value * inv * kv_norm_w[i];
+    return value;
+}
+
+void append_cache() {
+    int row = int(gl_WorkGroupID.x);
+    if (row >= pc.M) return;
+    uint lane = gl_LocalInvocationIndex;
+    uint width = uint(pc.kv_lora_rank + pc.qk_rope_head_dim);
+    uint begin = uint(pc.start_pos + row) * width;
+    uint end = begin + width;
+    float inv = 1.0;
+    if ((pc.flags & 8) != 0) {
+        float sq = 0.0;
+        for (int i = int(lane); i < pc.kv_lora_rank; i += 64) {
+            float value = source_value(row, i);
+            sq += value * value;
+        }
+        inv = inversesqrt(sum_group(sq) / float(pc.kv_lora_rank) + pc.eps);
+    }
+    if (pc.cache_dtype == 0) {
+        for (uint i = lane; i < width; i += 64u)
+            kv_latent_cache[begin + i] = floatBitsToUint(append_value(row, int(i), inv));
+        return;
+    }
+
+    for (uint word = (begin >> 1u) + lane; word < ((end + 1u) >> 1u); word += 64u) {
+        uint lo = word * 2u;
+        uint hi = lo + 1u;
+        if (lo >= begin && hi < end) {
+            kv_latent_cache[word] = pack_half_rte(append_value(row, int(lo - begin), inv)) |
+                                    (pack_half_rte(append_value(row, int(hi - begin), inv)) << 16u);
+        } else {
+            // Preserve the neighboring token at either end of an odd-width row.
+            uint shift = lo < begin ? 16u : 0u;
+            uint index = lo + (shift >> 4u);
+            uint packed = pack_half_rte(append_value(row, int(index - begin), inv)) << shift;
+            uint mask = 0xffffu << shift;
+            uint old = 0u;
+            for (;;) {
+                uint current = atomicCompSwap(kv_latent_cache[word], old, (old & ~mask) | packed);
+                if (current == old) break;
+                old = current;
+            }
+        }
+    }
+}
+
+void attention() {
+    int head = int(gl_WorkGroupID.x);
+    int row = int(gl_WorkGroupID.y);
+    if (head >= pc.num_q_heads || row >= pc.M) return;
+    int lane = int(gl_LocalInvocationIndex);
+    int rank = pc.kv_lora_rank;
+    int width = rank + pc.qk_rope_head_dim;
+    int q_row = row * pc.num_q_heads + head;
+    int last = pc.start_pos + row;
+    int first = pc.window > 0 ? max(0, last - pc.window + 1) : 0;
+    float accum[16];
+    for (int i = lane; i < rank; i += 64) accum[i / 64] = 0.0;
+    float peak = uintBitsToFloat(0xff800000u);
+    float mass = 0.0;
+
+    for (int token = first; token <= last; ++token) {
+        uint base = uint(token) * uint(width);
+        float dot_qk = 0.0;
+        for (int i = lane; i < width; i += 64)
+            dot_qk = fma(source_value(q_row, i), cache_value(base + uint(i)), dot_qk);
+        float score = sum_group(dot_qk) * pc.scale;
+        if (score == uintBitsToFloat(0xff800000u)) continue;
+        float next_peak = max(peak, score);
+        float keep = exp(peak - next_peak);
+        float add = exp(score - next_peak);
+        for (int i = lane; i < rank; i += 64)
+            accum[i / 64] = fma(add, cache_value(base + uint(i)), keep * accum[i / 64]);
+        mass = keep * mass + add;
+        peak = next_peak;
+    }
+    for (int i = lane; i < rank; i += 64)
+        o_latent[q_row * rank + i] = mass == 0.0 ? 0.0 : accum[i / 64] / mass;
+}
+
+void rotary_split() {
+    int head = int(gl_WorkGroupID.x);
+    int row = int(gl_WorkGroupID.y);
+    if (head > pc.num_q_heads || row >= pc.M) return;
+    bool is_q = head < pc.num_q_heads;
+    int rope = pc.qk_rope_head_dim;
+    int prefix = (pc.flags & 1) != 0 ? pc.kv_lora_rank : 0;
+    int base = (is_q ? row * pc.num_q_heads + head : row) * (prefix + rope) + prefix;
+
+    for (int pair = int(gl_LocalInvocationIndex); pair < rope / 2; pair += 64) {
+        float freq;
+        if ((pc.flags & 4) != 0) {
+            freq = rope_factors[pair];
+        } else {
+            freq = pow(pc.theta, -float(2 * pair) / float(rope));
+            if ((pc.flags & 2) != 0) freq /= rope_factors[pair];
+        }
+        float angle = float(pc.start_pos + row) * freq;
+        float c = cos(angle), s = sin(angle);
+        int i = base + 2 * pair;
+        vec2 v = is_q ? vec2(primary[i], primary[i + 1]) : vec2(positional[i], positional[i + 1]);
+        vec2 rotated = vec2(v.x * c - v.y * s, v.x * s + v.y * c) * pc.rope_amplitude;
+        if (is_q) {
+            primary[i] = rotated.x;
+            primary[i + 1] = rotated.y;
+        } else {
+            positional[i] = rotated.x;
+            positional[i + 1] = rotated.y;
+        }
+    }
+}
+
+void main() {
+    if (pc.mode == 0) append_cache();
+    else if (pc.mode == 1) attention();
+    else if (pc.mode == 2) rotary_split();
+}

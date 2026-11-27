@@ -101,7 +101,7 @@ public:
     std::vector<int32_t> generate_vulkan(VkContext& ctx, const std::vector<int32_t>& prompt_ids,
                                          int max_new_tokens, GenerationStats* stats = nullptr,
                                          bool keep_state = false, int start_pos = 0,
-                                         int32_t stop_eos_id = -1);
+                                         int32_t stop_eos_id = -1, const GenerationOptions& options = {});
 #endif
 
 private:

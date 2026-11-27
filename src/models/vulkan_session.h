@@ -5,7 +5,8 @@
 namespace fusionrt {
 
 struct VulkanDenseKv {
-    Tensor key, value;
+    Tensor key, value, latent;
+    bool owns = true;
 };
 
 struct VulkanGdnState {
@@ -14,7 +15,7 @@ struct VulkanGdnState {
 
 class VulkanSessionManager {
 public:
-    void allocate_dense(VkContext&, const DenseGQAConfig&, DType dtype = DType::F32);
+    void allocate_dense(VkContext&, const DenseGQAConfig&, DType dtype = DType::F32, int source = -1);
     void allocate_gdn(VkContext&, const GatedDeltaNetConfig&, int conv_dim);
     void reset_kv_and_state_vulkan(VkContext&) const;
 

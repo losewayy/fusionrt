@@ -1,0 +1,260 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+
+// Set 0, std430: 0:x/logits float[], 1:ids int[M,top_k] RW, 2:routes float[M,top_k] RW,
+// 3:aux_a float[], 4:expert_to_slot int[num_experts], 5:w uint[] (packed weights),
+// 6:intermediate float[M,top_k,I] RW, 7:y float[M,H], 8:aux_b float[].
+// Push (72 bytes): int mode@0, M@4, H@8, I@12, num_experts@16, top_k@20, flags@24,
+// num_groups@28, groups_used@32, gate_dtype@36, up_dtype@40, down_dtype@44,
+// resident@48, first_expert@52; uint gate_offset@56, up_offset@60, down_offset@64;
+// float route_scale@68. Expert matrices use fusionrt DType IDs and tight native rows.
+// Each matrix starts at a 4-byte-aligned byte offset in binding 5 (rebind per mode);
+// pad the buffer end to a full uint. Weight storage is compact, including separate
+// gate/up regions with independently typed rows.
+// 0 router (M,1,1): x=logits[M,num_experts]. Flags: 1 sigmoid (otherwise softmax),
+// 2 selection bias (aux_a[num_experts]), 4 renormalize, 8 per-expert route multiplier
+// (aux_b[num_experts]). Apply route_scale after renorm. Groups <=1 disables grouping;
+// otherwise 1<=groups_used<=num_groups<=128, with equally sized contiguous groups.
+// 1 gate+up (I,top_k,M): x[M,H]. Flags: 1 mapped slots, 2 separate gate/up regions
+// (otherwise gate region [resident,2,I,H] with gate then up), 4 GeGLU (else SwiGLU),
+// 8 gate scale (aux_a[num_experts]), 16 up scale (aux_b[num_experts]).
+// 2 down+combine (H,M,1): down region [resident,H,I]. Flags: 1 mapped slots,
+// 2 residual (aux_a[M,H]), 4 shared expert (aux_b[M,H]).
+// Weight rows in modes 1/2 use (mapped_slot or expert_id) - first_expert within resident.
+// Nonresident slots contribute zero. y may alias the residual or shared expert.
+layout(local_size_x = 64) in;
+layout(std430, binding = 0) readonly buffer X { float x[]; };
+layout(std430, binding = 1) buffer Ids { int ids[]; };
+layout(std430, binding = 2) buffer Routes { float routes[]; };
+layout(std430, binding = 3) readonly buffer AuxA { float aux_a[]; };
+layout(std430, binding = 4) readonly buffer SlotMap { int expert_to_slot[]; };
+layout(std430, binding = 5) readonly buffer W { uint w[]; };
+layout(std430, binding = 6) buffer Intermediate { float intermediate[]; };
+layout(std430, binding = 7) writeonly buffer Out { float y[]; };
+layout(std430, binding = 8) readonly buffer AuxB { float aux_b[]; };
+
+layout(push_constant) uniform Push {
+    int mode, M, H, I, num_experts, top_k, flags, num_groups, groups_used;
+    int gate_dtype, up_dtype, down_dtype, resident, first_expert;
+    uint gate_offset, up_offset, down_offset;
+    float route_scale;
+} pc;
+
+#include "../epilogue/codec_common.glsl"
+
+shared float values[64];
+shared int indices[64];
+shared float group_scores[128];
+shared bool selected_groups[128];
+
+float neg_inf() {
+    return uintBitsToFloat(0xff800000u);
+}
+
+float reduce_float(float value, bool maximum) {
+    uint lane = gl_LocalInvocationIndex;
+    values[lane] = value;
+    barrier();
+    for (uint step = 32u; step > 0u; step >>= 1u) {
+        if (lane < step) {
+            float other = values[lane + step];
+            values[lane] = maximum ? max(values[lane], other) : values[lane] + other;
+        }
+        barrier();
+    }
+    float result = values[0];
+    barrier();
+    return result;
+}
+
+bool better(float score, int expert, float other, int other_expert) {
+    return expert >= 0 && (other_expert < 0 || score > other || (score == other && expert < other_expert));
+}
+
+void reduce_best(inout float score, inout int expert) {
+    uint lane = gl_LocalInvocationIndex;
+    values[lane] = score;
+    indices[lane] = expert;
+    barrier();
+    for (uint step = 32u; step > 0u; step >>= 1u) {
+        if (lane < step && better(values[lane + step], indices[lane + step], values[lane], indices[lane])) {
+            values[lane] = values[lane + step];
+            indices[lane] = indices[lane + step];
+        }
+        barrier();
+    }
+    score = values[0];
+    expert = indices[0];
+    barrier();
+}
+
+float probability(int base, int e, float peak, float mass) {
+    return (pc.flags & 1) != 0 ? 1.0 / (1.0 + exp(-x[base + e])) : exp(x[base + e] - peak) / mass;
+}
+
+float selection_score(int base, int e, float peak, float mass) {
+    float p = probability(base, e, peak, mass);
+    return (pc.flags & 2) != 0 ? p + aux_a[e] : p;
+}
+
+void select_groups(int base, int width, float peak, float mass) {
+    int lane = int(gl_LocalInvocationIndex);
+    for (int g = lane; g < pc.num_groups; g += 64) {
+        float first = neg_inf(), second = neg_inf();
+        for (int e = g * width; e < (g + 1) * width; ++e) {
+            float score = selection_score(base, e, peak, mass);
+            second = max(second, min(first, score));
+            first = max(first, score);
+        }
+        group_scores[g] = first + second;
+        selected_groups[g] = false;
+    }
+    barrier();
+    if (lane == 0) {
+        for (int i = 0; i < pc.groups_used; ++i) {
+            int best = -1;
+            for (int g = 0; g < pc.num_groups; ++g)
+                if (!selected_groups[g] && (best < 0 || group_scores[g] > group_scores[best])) best = g;
+            selected_groups[best] = true;
+        }
+    }
+    barrier();
+}
+
+void router() {
+    int m = int(gl_WorkGroupID.x);
+    if (m >= pc.M) return;
+    int lane = int(gl_LocalInvocationIndex);
+    int base = m * pc.num_experts;
+    float peak = 0.0, mass = 1.0;
+    if ((pc.flags & 1) == 0) {
+        float partial = neg_inf();
+        for (int e = lane; e < pc.num_experts; e += 64) partial = max(partial, x[base + e]);
+        peak = reduce_float(partial, true);
+        partial = 0.0;
+        for (int e = lane; e < pc.num_experts; e += 64) partial += exp(x[base + e] - peak);
+        mass = reduce_float(partial, false);
+    }
+
+    bool grouped = pc.num_groups > 1 && pc.groups_used < pc.num_groups;
+    int width = pc.num_experts / max(pc.num_groups, 1);
+    if (grouped) select_groups(base, width, peak, mass);
+
+    int out_base = m * pc.top_k;
+    float previous_score = 0.0;
+    int previous_id = -1;
+    float weight_sum = 0.0;
+    for (int slot = 0; slot < pc.top_k; ++slot) {
+        int best = -1;
+        float best_score = neg_inf();
+        for (int e = lane; e < pc.num_experts; e += 64) {
+            if (grouped && !selected_groups[e / width]) continue;
+            float score = selection_score(base, e, peak, mass);
+            if (slot != 0 && !better(previous_score, previous_id, score, e)) continue;
+            if (better(score, e, best_score, best)) {
+                best = e;
+                best_score = score;
+            }
+        }
+        reduce_best(best_score, best);
+        if (lane == 0) {
+            float p = best >= 0 ? probability(base, best, peak, mass) : 0.0;
+            ids[out_base + slot] = best;
+            routes[out_base + slot] = p;
+            weight_sum += p;
+        }
+        previous_score = best_score;
+        previous_id = best;
+    }
+    if (lane == 0) {
+        float divisor = (pc.flags & 4) != 0 ? max(weight_sum, 0.00006103515625) : 1.0;
+        for (int slot = 0; slot < pc.top_k; ++slot) {
+            int index = out_base + slot;
+            int expert = ids[index];
+            float scale = (pc.flags & 8) != 0 && expert >= 0 ? aux_b[expert] : 1.0;
+            routes[index] = (routes[index] / divisor) * pc.route_scale * scale;
+        }
+    }
+}
+
+int resident_slot(int expert) {
+    if (expert < 0 || expert >= pc.num_experts) return -1;
+    int slot = (pc.flags & 1) != 0 ? expert_to_slot[expert] : expert;
+    return slot < 0 ? -1 : slot - pc.first_expert;
+}
+
+float packed_dot(int dtype, uint offset, int row, int cols, int x_base, bool down) {
+    uint stride = row_bytes_for_dtype(dtype, cols);
+    uvec2 block = weight_block_layout(dtype);
+    uint start = offset + uint(row) * stride;
+    float sum = 0.0;
+    for (uint k = gl_LocalInvocationIndex; stride != 0u && k < uint(cols); k += 64u) {
+        float value = down ? intermediate[x_base + k] : x[x_base + k];
+        sum = fma(value, dequantize_weight(dtype, start, k, block), sum);
+    }
+    return reduce_float(sum, false);
+}
+
+void gate_up() {
+    int i = int(gl_WorkGroupID.x);
+    int slot = int(gl_WorkGroupID.y);
+    int m = int(gl_WorkGroupID.z);
+    if (i >= pc.I || slot >= pc.top_k || m >= pc.M) return;
+    int route = m * pc.top_k + slot;
+    int expert = ids[route];
+    int resident = resident_slot(expert);
+    bool separate = (pc.flags & 2) != 0;
+    if (resident < 0 || resident >= pc.resident) {
+        if (gl_LocalInvocationIndex == 0u) intermediate[route * pc.I + i] = 0.0;
+        return;
+    }
+
+    int gate_row = (separate ? resident : 2 * resident) * pc.I + i;
+    load_codec_grid(pc.gate_dtype);
+    float gate = packed_dot(pc.gate_dtype, pc.gate_offset, gate_row, pc.H, m * pc.H, false);
+    int up_dtype = separate ? pc.up_dtype : pc.gate_dtype;
+    uint up_offset = separate ? pc.up_offset : pc.gate_offset;
+    int up_row = separate ? gate_row : gate_row + pc.I;
+    if (up_dtype != pc.gate_dtype) load_codec_grid(up_dtype);
+    float up = packed_dot(up_dtype, up_offset, up_row, pc.H, m * pc.H, false);
+    if (gl_LocalInvocationIndex == 0u) {
+        if ((pc.flags & 8) != 0) gate *= aux_a[expert];
+        if ((pc.flags & 16) != 0) up *= aux_b[expert];
+        float act;
+        if ((pc.flags & 4) != 0) {
+            float arg = 0.7978845608028654 * gate * (1.0 + 0.044715 * gate * gate);
+            // The FP32 tanh result is saturated here, before driver exp implementations can overflow.
+            act = (0.5 * gate) * (1.0 + tanh(clamp(arg, -10.0, 10.0)));
+        } else {
+            act = gate / (1.0 + exp(-gate));
+        }
+        intermediate[route * pc.I + i] = act * up;
+    }
+}
+
+void down_combine() {
+    int h = int(gl_WorkGroupID.x);
+    int m = int(gl_WorkGroupID.y);
+    if (h >= pc.H || m >= pc.M) return;
+    load_codec_grid(pc.down_dtype);
+    float result = 0.0;
+    for (int slot = 0; slot < pc.top_k; ++slot) {
+        int route = m * pc.top_k + slot;
+        int resident = resident_slot(ids[route]);
+        if (resident < 0 || resident >= pc.resident) continue;
+        float value = packed_dot(pc.down_dtype, pc.down_offset, resident * pc.H + h, pc.I, route * pc.I, true);
+        result += routes[route] * value;
+    }
+    if (gl_LocalInvocationIndex == 0u) {
+        int index = m * pc.H + h;
+        if ((pc.flags & 2) != 0) result += aux_a[index];
+        if ((pc.flags & 4) != 0) result += aux_b[index];
+        y[index] = result;
+    }
+}
+
+void main() {
+    if (pc.mode == 0) router();
+    else if (pc.mode == 1) gate_up();
+    else if (pc.mode == 2) down_combine();
+}

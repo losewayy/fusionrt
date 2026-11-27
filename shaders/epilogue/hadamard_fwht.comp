@@ -1,0 +1,93 @@
+#version 450
+
+// Set 0, std430: 0:x float[M,N], 1:y float[M,N] (may alias x), 2:weight float[N]
+// (mode 1), 3:signs uint[], four signed int8 values per little-endian word (+1/-1).
+// Push (32 bytes): int mode@0, M@4, N@8, block_size@12, flags@16, head_dim@20,
+// key_heads@24; float eps@28. Flags: 1 signs present, 2 inverse (mode 0 only).
+// Dispatch 0 (FWHT): (N/block_size,M,1). Nonzero key_heads reorders repeat-major
+// V heads to key-head-major (forward, separate x/y, N divisible by head_dim*key_heads).
+// Dispatch 1 (RMSNorm+FWHT): (1,M,1), normalize across N before transforming blocks.
+// N is a multiple of block_size in {64,128,256,512,1024}.
+layout(local_size_x = 64) in;
+layout(std430, binding = 0) readonly buffer X { float x[]; };
+layout(std430, binding = 1) writeonly buffer Y { float y[]; };
+layout(std430, binding = 2) readonly buffer Weight { float weight[]; };
+layout(std430, binding = 3) readonly buffer Signs { uint signs[]; };
+
+layout(push_constant) uniform Push {
+    int mode, M, N, block_size, flags, head_dim, key_heads;
+    float eps;
+} pc;
+
+shared float values[1024];
+shared float sums[64];
+
+float channel_sign(int col) {
+    return float(bitfieldExtract(int(signs[col / 4]), 8 * (col % 4), 8));
+}
+
+void main() {
+    int lane = int(gl_LocalInvocationIndex);
+    int row = int(gl_WorkGroupID.y);
+    int group = int(gl_WorkGroupID.x);
+    int groups = pc.N / pc.block_size;
+    bool normalize = pc.mode == 1;
+    if (row >= pc.M || group >= (normalize ? 1 : groups)) return;
+
+    int base = row * pc.N;
+    float inv = 1.0;
+    if (normalize) {
+        float sq = 0.0;
+        for (int i = lane; i < pc.N; i += 64) {
+            float value = x[base + i];
+            sq += value * value;
+        }
+        sums[lane] = sq;
+        barrier();
+        for (int stride = 32; stride > 0; stride >>= 1) {
+            if (lane < stride) sums[lane] += sums[lane + stride];
+            barrier();
+        }
+        inv = inversesqrt(sums[0] / float(pc.N) + pc.eps);
+    }
+
+    bool inverse = !normalize && (pc.flags & 2) != 0;
+    bool has_signs = (pc.flags & 1) != 0;
+    float scale = inversesqrt(float(pc.block_size));
+    int end = normalize ? groups : group + 1;
+    for (; group < end; ++group) {
+        int start = group * pc.block_size;
+        for (int i = lane; i < pc.block_size; i += 64) {
+            int col = start + i;
+            int src = col;
+            if (!normalize && pc.key_heads > 0) {
+                int repeats = pc.N / pc.head_dim / pc.key_heads;
+                int head = col / pc.head_dim;
+                src = (head % repeats * pc.key_heads + head / repeats) * pc.head_dim + col % pc.head_dim;
+            }
+            float value = x[base + src];
+            if (normalize) value = value * inv * weight[col];
+            if (has_signs && !inverse) value *= channel_sign(col);
+            values[i] = value;
+        }
+        barrier();
+
+        for (int span = 1; span < pc.block_size; span *= 2) {
+            for (int pair = lane; pair < pc.block_size / 2; pair += 64) {
+                int lo = 2 * (pair / span) * span + pair % span;
+                float a = values[lo];
+                float b = values[lo + span];
+                values[lo] = a + b;
+                values[lo + span] = a - b;
+            }
+            barrier();
+        }
+
+        for (int i = lane; i < pc.block_size; i += 64) {
+            int col = start + i;
+            float sign_out = has_signs && inverse ? channel_sign(col) : 1.0;
+            y[base + col] = values[i] * (scale * sign_out);
+        }
+        barrier();
+    }
+}

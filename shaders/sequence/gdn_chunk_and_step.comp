@@ -1,0 +1,153 @@
+#version 450
+
+// Set 0, std430, float arrays. Mode 0 uses 0:qkv_in[M,C], 4:conv_w[C,kernel_size],
+// 5:conv_bias[C], 9:conv_state[C,kernel_size-1] (oldest first, RW), 12:qkv_conv[M,C] (RW).
+// Mode 1 uses 12:qkv_conv, 1:z[M,num_v_heads,dv], 2:a and 3:b[M,num_v_heads],
+// 6:a_log and 7:dt_bias[num_v_heads], 8:norm_w[dv], 10:ssm_state[num_v_heads,dk,dv]
+// (RW), 11:y[M,num_v_heads,dv]. C = 2*num_k_heads*dk + num_v_heads*dv, Q/K/V packed.
+// Push (40 bytes): int mode@0, M@4, num_k_heads@8, num_v_heads@12, dk@16, dv@20,
+// kernel_size@24, flags@28; float eps@32, q_scale@36.
+// Flags: 1 conv bias, 2 repeat-major V heads, 4 multiply the SiLU gate by z again.
+// Dispatch 0 (causal conv+SiLU): (ceil(C/64),1,1), taps 1..4, qkv_in may alias qkv_conv.
+// Dispatch 1 (recurrence+gated RMSNorm): (num_v_heads,1,1), dk 1..128, dv 1..256.
+layout(local_size_x = 64) in;
+layout(std430, binding = 0) readonly buffer QkvIn { float qkv_in[]; };
+layout(std430, binding = 1) readonly buffer Gate { float z[]; };
+layout(std430, binding = 2) readonly buffer A { float a[]; };
+layout(std430, binding = 3) readonly buffer B { float b[]; };
+layout(std430, binding = 4) readonly buffer ConvW { float conv_w[]; };
+layout(std430, binding = 5) readonly buffer ConvBias { float conv_bias[]; };
+layout(std430, binding = 6) readonly buffer ALog { float a_log[]; };
+layout(std430, binding = 7) readonly buffer DtBias { float dt_bias[]; };
+layout(std430, binding = 8) readonly buffer NormW { float norm_w[]; };
+layout(std430, binding = 9) buffer ConvState { float conv_state[]; };
+layout(std430, binding = 10) buffer SsmState { float ssm_state[]; };
+layout(std430, binding = 11) writeonly buffer Y { float y[]; };
+layout(std430, binding = 12) buffer QkvConv { float qkv_conv[]; };
+
+layout(push_constant) uniform Push {
+    int mode, M, num_k_heads, num_v_heads, dk, dv, kernel_size, flags;
+    float eps, q_scale;
+} pc;
+
+shared vec2 sums[64];
+shared float query[128];
+shared float key[128];
+
+vec2 sum_group(vec2 value) {
+    uint lane = gl_LocalInvocationIndex;
+    sums[lane] = value;
+    barrier();
+    for (uint stride = 32u; stride > 0u; stride >>= 1u) {
+        if (lane < stride) sums[lane] += sums[lane + stride];
+        barrier();
+    }
+    vec2 result = sums[0];
+    barrier();
+    return result;
+}
+
+float silu(float x) {
+    return x / (1.0 + exp(-x));
+}
+
+float softplus(float x) {
+    if (x > 20.0) return x;
+    float e = exp(x);
+    float u = 1.0 + e;
+    // Correct the loss from adding a small e to 1, as in CUDA's log1pf.
+    return u == 1.0 ? e : log(u) * (e / (u - 1.0));
+}
+
+void causal_conv(int channels) {
+    int ch = int(gl_GlobalInvocationID.x);
+    if (ch >= channels) return;
+
+    int history = pc.kernel_size - 1;
+    int state = ch * history;
+    int filter_base = ch * pc.kernel_size;
+    float previous[3];
+    float coeff[4];
+    for (int i = 0; i < history; ++i) previous[i] = conv_state[state + i];
+    for (int i = 0; i < pc.kernel_size; ++i) coeff[i] = conv_w[filter_base + i];
+    float bias = (pc.flags & 1) != 0 ? conv_bias[ch] : 0.0;
+    for (int t = 0; t < pc.M; ++t) {
+        int index = t * channels + ch;
+        float current = qkv_in[index];
+        float value = 0.0;
+        for (int i = 0; i < history; ++i) value += previous[i] * coeff[i];
+        value += current * coeff[history];
+        for (int i = 1; i < history; ++i) previous[i - 1] = previous[i];
+        if (history > 0) previous[history - 1] = current;
+        qkv_conv[index] = silu(value + bias);
+    }
+    for (int i = 0; i < history; ++i) conv_state[state + i] = previous[i];
+}
+
+void recurrence(int q_dim, int channels) {
+    int vh = int(gl_WorkGroupID.x);
+    if (vh >= pc.num_v_heads) return;
+    int lane = int(gl_LocalInvocationIndex);
+    int kh = (pc.flags & 2) != 0 ? vh % pc.num_k_heads : vh / (pc.num_v_heads / pc.num_k_heads);
+    int state = vh * pc.dk * pc.dv;
+    float rate = exp(a_log[vh]);
+    float dt = dt_bias[vh];
+
+    for (int t = 0; t < pc.M; ++t) {
+        int q_base = t * channels + kh * pc.dk;
+        int v_base = t * channels + 2 * q_dim + vh * pc.dv;
+        int gate = t * pc.num_v_heads + vh;
+
+        vec2 sq = vec2(0.0);
+        for (int i = lane; i < pc.dk; i += 64) {
+            vec2 v = vec2(qkv_conv[q_base + i], qkv_conv[q_base + q_dim + i]);
+            query[i] = v.x;
+            key[i] = v.y;
+            sq += v * v;
+        }
+        vec2 inv = inversesqrt(sum_group(sq) + vec2(1e-6));
+        for (int i = lane; i < pc.dk; i += 64) {
+            query[i] *= inv.x * pc.q_scale;
+            key[i] *= inv.y;
+        }
+        barrier();
+
+        float decay = exp(-rate * softplus(a[gate] + dt));
+        float beta = 1.0 / (1.0 + exp(-b[gate]));
+        float out_col[4];
+        float ss = 0.0;
+        for (int j = lane; j < pc.dv; j += 64) {
+            float kv = 0.0;
+            for (int i = 0; i < pc.dk; ++i) {
+                int index = state + i * pc.dv + j;
+                float decayed = ssm_state[index] * decay;
+                kv += decayed * key[i];
+            }
+            float delta = (qkv_conv[v_base + j] - kv) * beta;
+            float result = 0.0;
+            for (int i = 0; i < pc.dk; ++i) {
+                int index = state + i * pc.dv + j;
+                float next = ssm_state[index] * decay + key[i] * delta;
+                ssm_state[index] = next;
+                result += next * query[i];
+            }
+            out_col[j / 64] = result;
+            ss += result * result;
+        }
+        float y_inv = inversesqrt(sum_group(vec2(ss, 0.0)).x / float(pc.dv) + pc.eps);
+        for (int j = lane; j < pc.dv; j += 64) {
+            int index = gate * pc.dv + j;
+            float zv = z[index];
+            float g = silu(zv);
+            if ((pc.flags & 4) != 0) g *= zv;
+            y[index] = out_col[j / 64] * y_inv * norm_w[j] * g;
+        }
+    }
+}
+
+void main() {
+    int q_dim = pc.num_k_heads * pc.dk;
+    int channels = 2 * q_dim + pc.num_v_heads * pc.dv;
+    if (pc.mode == 0) causal_conv(channels);
+    else if (pc.mode == 1) recurrence(q_dim, channels);
+}
