@@ -135,11 +135,6 @@ __global__ void k_gemm_wmma(const float* __restrict__ x,
     }
 }
 
-struct MmqWeight {
-    unsigned lo, hi;
-    float scale, other;
-};
-
 template <class WC>
 struct MmqCodecBlock {
     using Codec = WC;
@@ -154,14 +149,15 @@ constexpr bool mmq_packed_q4 =
     std::is_same_v<W, BlockQ4_A> || std::is_same_v<W, BlockQ4_K> || std::is_same_v<W, BlockQ4_KA>;
 
 template <typename W>
-constexpr bool mmq_async = mmq_packed_q4<W> || std::is_same_v<W, BlockQ6_A> || std::is_same_v<W, BlockQ5_K>;
-
-template <typename W>
 constexpr bool mmq_has_min =
     std::is_same_v<W, BlockQ4_K> || std::is_same_v<W, BlockQ4_KA> || std::is_same_v<W, BlockQ5_K>;
 
 template <typename W>
 constexpr bool mmq_split_scale = std::is_same_v<W, BlockQ6_K> || std::is_same_v<W, BlockQ6_A>;
+
+template <typename W>
+constexpr bool mmq_async = mmq_packed_q4<W> || mmq_split_scale<W> ||
+                           std::is_same_v<W, BlockQ5_K> || std::is_same_v<W, BlockQ8_A>;
 
 template <typename W>
 __device__ __forceinline__ float2 mmq_k_scales(const W& w, int sub) {
@@ -170,33 +166,12 @@ __device__ __forceinline__ float2 mmq_k_scales(const W& w, int sub) {
                       -half_bits_to_f32(w.dmin) * (scale_min >> 8));
 }
 
-__device__ __forceinline__ unsigned load_word_unaligned(const uint8_t* p) {
-    auto address = reinterpret_cast<uintptr_t>(p);
-    auto* aligned = reinterpret_cast<const unsigned*>(address & ~uintptr_t{3});
-    return __funnelshift_r(__ldg(aligned), __ldg(aligned + 1), (address & 2) * 8);
-}
-
 __device__ __forceinline__ unsigned mmq_signed_q4(unsigned q) {
     return ((q & kNibbleMask) + 0x78787878u) ^ 0x80808080u;
 }
 
-__device__ __forceinline__ MmqWeight load_raw_q6_mmq_weight(const BlockQ6_K& w, int sub, int word) {
-    MmqWeight v;
-    int part = sub & 3;
-    auto* ql = w.ql + (sub >> 2) * 64 + (part & 1) * 32 + 4 * word;
-    auto* qh = w.qh + (sub >> 2) * 32 + 4 * word;
-    unsigned lo = load_word_unaligned(ql);
-    unsigned hi = load_word_unaligned(ql + 16);
-    unsigned h0 = load_word_unaligned(qh);
-    unsigned h1 = load_word_unaligned(qh + 16);
-    v.lo = ((((lo >> ((part >> 1) * 4)) & kNibbleMask) |
-             (((h0 >> (part * 2)) & 0x03030303u) << 4)) + 0x60606060u) ^ 0x80808080u;
-    v.hi = ((((hi >> ((part >> 1) * 4)) & kNibbleMask) |
-             (((h1 >> (part * 2)) & 0x03030303u) << 4)) + 0x60606060u) ^ 0x80808080u;
-    float d = half_bits_to_f32(__ldg(&w.d));
-    v.scale = d * __ldg(w.scales + 2 * sub);
-    v.other = d * __ldg(w.scales + 2 * sub + 1);
-    return v;
+__device__ __forceinline__ unsigned mmq_signed_q6(unsigned q) {
+    return (q + 0x60606060u) ^ 0x80808080u;
 }
 
 __device__ __forceinline__ int4 mma_s8(unsigned a0, unsigned a1, unsigned a2, unsigned a3,
@@ -218,11 +193,11 @@ __device__ __forceinline__ int4 mma_s8_k16(unsigned a0, unsigned a1, unsigned b0
     return c;
 }
 
-template <int Rows, int BK, int Words, bool Other>
+template <int Rows, int BK, int Words, bool Other, bool Split = false>
 struct MmqTile {
     // One extra 16-byte segment disjoins the eight rows of an ldmatrix across banks.
     alignas(16) unsigned qs[Rows][BK * Words + 4];
-    float scale[BK][Rows + 32 / BK];
+    alignas(16) float scale[BK][(Split ? 2 : 1) * (Rows + 32 / BK)];
     float other[Other ? BK : 1][Other ? Rows + 32 / BK : 1];
 };
 
@@ -232,17 +207,61 @@ __device__ __forceinline__ void mmq_copy_async(void* dst, const void* src) {
     asm volatile("cp.async.ca.shared.global [%0], [%1], %2;" :: "r"(smem), "l"(src), "n"(Bytes) : "memory");
 }
 
-template <typename W, int BM, int BN, int BK>
+__device__ __forceinline__ unsigned load_raw_q6_word(const uint8_t* p) {
+    // Consecutive 210-byte blocks alternate between 32-bit and 16-bit alignment.
+    const auto* halves = reinterpret_cast<const uint16_t*>(p);
+    return __ldg(halves) | (static_cast<unsigned>(__ldg(halves + 1)) << 16);
+}
+
+template <int BN, int BK, int Threads>
+__device__ __forceinline__ void load_raw_q6_tile(const BlockQ6_K* w, MmqTile<BN, BK, 8, false, true>& ws,
+                                                int n0, int N, int K, int kb) {
+    static_assert(BK == 4 || BK == 8);
+    constexpr int groups = BK / 4;
+    // Eight lanes share each 128-value half-block. The two low planes and
+    // the high plane each contribute to multiple 32-value groups.
+    const int lane = threadIdx.x % 8;
+    const int half = lane / 4;
+    const int word = lane % 4;
+    const int group = (threadIdx.x / 8) % groups;
+    const int sub = (kb + group * 4) % 8;
+    const int part = sub / 4;
+    const int stride = K / 256;
+    constexpr int rows_per_pass = Threads / (8 * groups);
+    const int row = threadIdx.x / (8 * groups);
+    #pragma unroll
+    for (int base = 0; base < BN; base += rows_per_pass) {
+        const int n = base + row;
+        if (BN % rows_per_pass != 0 && n >= BN) break;
+        const auto* src = w + static_cast<int64_t>(min(n0 + n, N - 1)) * stride + kb / 8;
+        const auto* low = src->ql + part * 64 + half * 16 + word * 4;
+        const auto* high = src->qh + part * 32 + half * 16 + word * 4;
+        const unsigned ql0 = load_raw_q6_word(low);
+        const unsigned ql1 = load_raw_q6_word(low + 32);
+        const unsigned qh = load_raw_q6_word(high);
+        #pragma unroll
+        for (int q = 0; q < 4; ++q) {
+            const unsigned lo = ((q % 2 ? ql1 : ql0) >> (q / 2 * 4)) & kNibbleMask;
+            const unsigned hi = ((qh >> (q * 2)) & 0x03030303u) << 4;
+            ws.qs[n][(group * 4 + q) * 8 + half * 4 + word] = mmq_signed_q6(lo | hi);
+        }
+        const float d = half_bits_to_f32(__ldg(&src->d));
+        const float scale = d * __ldg(src->scales + 2 * (sub + word) + half);
+        ws.scale[group * 4 + word][n + (n & ~1) + half * 2] = scale;
+    }
+}
+
+template <typename W, int BM, int BN, int BK, int Threads>
 __device__ __forceinline__ void load_mmq_tile(
     const BlockQ8_1* x, const W* w,
     MmqTile<BM, BK, 8, mmq_has_min<W>>& xs,
-    MmqTile<BN, BK, mmq_packed_q4<W> ? 4 : 8, mmq_has_min<W> || mmq_split_scale<W>>& ws,
+    MmqTile<BN, BK, mmq_packed_q4<W> ? 4 : 8, mmq_has_min<W>, mmq_split_scale<W>>& ws,
     int m0, int n0, int M, int N, int K, int kb) {
     constexpr bool async = mmq_async<W>;
-    int slot = threadIdx.x % BK;
+    const int slot = threadIdx.x % BK;
     int xstride = K / 32;
     const int xsub = mmq_codec<W> ? min(kb + slot, xstride - 1) : kb + slot;
-    int sub = (kb + slot) % 8;
+    const int sub = (kb + slot) % 8;
     for (int m = threadIdx.x / BK; m < BM; m += blockDim.x / BK) {
         const auto* src = reinterpret_cast<const uint4*>(x + static_cast<int64_t>(min(m0 + m, M - 1)) * xstride + xsub);
         auto* dst = reinterpret_cast<uint4*>(xs.qs[m] + slot * 8);
@@ -261,66 +280,73 @@ __device__ __forceinline__ void load_mmq_tile(
             else xs.other[slot][m] = __uint_as_float(__ldg(&src[2].w));
         }
     }
-    for (int n = threadIdx.x / BK; n < BN; n += blockDim.x / BK) {
-        constexpr int block_elems = [] {
-            if constexpr (mmq_codec<W>) return W::Codec::kBlockSize;
-            else return 256;
-        }();
-        const W& src = w[static_cast<int64_t>(min(n0 + n, N - 1)) * (K / block_elems) + xsub / (block_elems / 32)];
-        constexpr int words = mmq_packed_q4<W> ? 4 : 8;
-        auto* dst = reinterpret_cast<uint4*>(ws.qs[n] + slot * words);
-        if constexpr (mmq_codec<W>) {
-            using Codec = typename W::Codec;
-            const int part = xsub % (block_elems / 32);
-            dst[0] = make_uint4(Codec::int8_word(src.packed, part, 0), Codec::int8_word(src.packed, part, 1),
-                                Codec::int8_word(src.packed, part, 2), Codec::int8_word(src.packed, part, 3));
-            dst[1] = make_uint4(Codec::int8_word(src.packed, part, 4), Codec::int8_word(src.packed, part, 5),
-                                Codec::int8_word(src.packed, part, 6), Codec::int8_word(src.packed, part, 7));
-            ws.scale[slot][n] = Codec::int8_scale(src.packed, part);
-        } else if constexpr (TileQ4_144<W>) {
-            using Tile = TileQ4Trait<W>;
-            mmq_copy_async<16>(dst, Tile::nibbles(src, sub));
-            if constexpr (Tile::symmetric) {
-                const auto* scale = reinterpret_cast<const unsigned*>(src.d) + sub / 2;
-                mmq_copy_async<4>(&ws.scale[slot][n], scale);
-            } else {
-                const float2 scales = Tile::scales(src, sub);
+    if constexpr (std::is_same_v<W, BlockQ6_K>) {
+        load_raw_q6_tile<BN, BK, Threads>(w, ws, n0, N, K, kb);
+    } else {
+        for (int n = threadIdx.x / BK; n < BN; n += blockDim.x / BK) {
+            constexpr int block_elems = [] {
+                if constexpr (mmq_codec<W>) return W::Codec::kBlockSize;
+                else return 256;
+            }();
+            const W& src = w[static_cast<int64_t>(min(n0 + n, N - 1)) * (K / block_elems) + xsub / (block_elems / 32)];
+            constexpr int words = mmq_packed_q4<W> ? 4 : 8;
+            auto* dst = reinterpret_cast<uint4*>(ws.qs[n] + slot * words);
+            if constexpr (mmq_codec<W>) {
+                using Codec = typename W::Codec;
+                const int part = xsub % (block_elems / 32);
+                dst[0] = make_uint4(Codec::int8_word(src.packed, part, 0), Codec::int8_word(src.packed, part, 1),
+                                    Codec::int8_word(src.packed, part, 2), Codec::int8_word(src.packed, part, 3));
+                dst[1] = make_uint4(Codec::int8_word(src.packed, part, 4), Codec::int8_word(src.packed, part, 5),
+                                    Codec::int8_word(src.packed, part, 6), Codec::int8_word(src.packed, part, 7));
+                ws.scale[slot][n] = Codec::int8_scale(src.packed, part);
+            } else if constexpr (TileQ4_144<W>) {
+                using Tile = TileQ4Trait<W>;
+                mmq_copy_async<16>(dst, Tile::nibbles(src, sub));
+                if constexpr (Tile::symmetric) {
+                    const auto* scale = reinterpret_cast<const unsigned*>(src.d) + sub / 2;
+                    mmq_copy_async<4>(&ws.scale[slot][n], scale);
+                } else {
+                    const float2 scales = Tile::scales(src, sub);
+                    ws.scale[slot][n] = scales.x;
+                    ws.other[slot][n] = -scales.y;
+                }
+            } else if constexpr (std::is_same_v<W, BlockQ4_K>) {
+                // Adjacent slots stage the two aligned halves of a packed Q4_K pair.
+                mmq_copy_async<16>(dst, reinterpret_cast<const uint4*>(src.qs) + sub);
+                const float2 scales = mmq_k_scales(src, sub);
                 ws.scale[slot][n] = scales.x;
-                ws.other[slot][n] = -scales.y;
+                ws.other[slot][n] = scales.y;
+            } else if constexpr (std::is_same_v<W, BlockQ6_A>) {
+                if constexpr (BM >= 128) {
+                    const auto low = __ldg(reinterpret_cast<const uint4*>(src.ql[sub]));
+                    const auto high = __ldg(reinterpret_cast<const uint4*>(src.qh[sub / 2]));
+                    #pragma unroll
+                    for (int half = 0; half < 2; ++half) {
+                        const uint4 q = unpack_q6_a(low, high, half, sub % 2);
+                        dst[half] = make_uint4(mmq_signed_q6(q.x), mmq_signed_q6(q.y),
+                                               mmq_signed_q6(q.z), mmq_signed_q6(q.w));
+                    }
+                } else {
+                    mmq_copy_async<16>(dst, src.ql[sub]);
+                    mmq_copy_async<16>(dst + 1, src.qh[sub / 2]);
+                }
+                const float d = half_bits_to_f32(src.d);
+                const int column = n + (n & ~1);
+                ws.scale[slot][column] = d * src.scale[2 * sub];
+                ws.scale[slot][column + 2] = d * src.scale[2 * sub + 1];
+            } else if constexpr (std::is_same_v<W, BlockQ5_K>) {
+                // Adjacent slots stage the low/high halves consumed by each 32-element dot.
+                mmq_copy_async<16>(dst, reinterpret_cast<const uint4*>(src.qs) + sub);
+                mmq_copy_async<16>(dst + 1, reinterpret_cast<const uint4*>(src.qh) + sub % 2);
+                const float2 scales = mmq_k_scales(src, sub);
+                ws.scale[slot][n] = scales.x;
+                ws.other[slot][n] = scales.y;
+            } else if constexpr (std::is_same_v<W, BlockQ8_A>) {
+                auto* ptr = reinterpret_cast<const uint4*>(src.qs) + 2 * sub;
+                mmq_copy_async<16>(dst, ptr);
+                mmq_copy_async<16>(dst + 1, ptr + 1);
+                ws.scale[slot][n] = half_bits_to_f32(__ldg(src.d + sub));
             }
-        } else if constexpr (std::is_same_v<W, BlockQ4_K>) {
-            // Adjacent slots stage the two aligned halves of a packed Q4_K pair.
-            mmq_copy_async<16>(dst, reinterpret_cast<const uint4*>(src.qs) + sub);
-            const float2 scales = mmq_k_scales(src, sub);
-            ws.scale[slot][n] = scales.x;
-            ws.other[slot][n] = scales.y;
-        } else if constexpr (std::is_same_v<W, BlockQ6_A>) {
-            mmq_copy_async<16>(dst, src.ql[sub]);
-            mmq_copy_async<16>(dst + 1, src.qh[sub / 2]);
-            const float d = half_bits_to_f32(src.d);
-            ws.scale[slot][n] = d * src.scale[2 * sub];
-            ws.other[slot][n] = d * src.scale[2 * sub + 1];
-        } else if constexpr (std::is_same_v<W, BlockQ5_K>) {
-            // Adjacent slots stage the low/high halves consumed by each 32-element dot.
-            mmq_copy_async<16>(dst, reinterpret_cast<const uint4*>(src.qs) + sub);
-            mmq_copy_async<16>(dst + 1, reinterpret_cast<const uint4*>(src.qh) + sub % 2);
-            const float2 scales = mmq_k_scales(src, sub);
-            ws.scale[slot][n] = scales.x;
-            ws.other[slot][n] = scales.y;
-        } else if constexpr (std::is_same_v<W, BlockQ8_A>) {
-            auto* ptr = reinterpret_cast<const uint4*>(src.qs) + 2 * sub;
-            dst[0] = __ldg(ptr);
-            dst[1] = __ldg(ptr + 1);
-            ws.scale[slot][n] = half_bits_to_f32(__ldg(src.d + sub));
-        } else {
-            MmqWeight a = load_raw_q6_mmq_weight(src, sub, 0);
-            MmqWeight b = load_raw_q6_mmq_weight(src, sub, 1);
-            MmqWeight c = load_raw_q6_mmq_weight(src, sub, 2);
-            MmqWeight d = load_raw_q6_mmq_weight(src, sub, 3);
-            dst[0] = make_uint4(a.lo, b.lo, c.lo, d.lo);
-            dst[1] = make_uint4(a.hi, b.hi, c.hi, d.hi);
-            ws.scale[slot][n] = a.scale;
-            ws.other[slot][n] = a.other;
         }
     }
     if constexpr (async) asm volatile("cp.async.commit_group;" ::: "memory");
@@ -356,13 +382,14 @@ struct MmqBuffers {
     static constexpr int weight_words = mmq_packed_q4<W> ? 4 : 8;
 
     MmqTile<BM, BK, 8, min_scale> xs[2];
-    MmqTile<BN, BK, weight_words, split_scale || min_scale> ws[2];
+    MmqTile<BN, BK, weight_words, min_scale, split_scale> ws[2];
 };
 
 template <typename W, int BM, int BN, int WN, int BK, int WM = BM / 16>
 __device__ __forceinline__ void mmq_q8_1_tile(const BlockQ8_1* __restrict__ x, const W* __restrict__ w,
     float* __restrict__ y, int M, int N, int K, int m0, int n0, MmqBuffers<W, BM, BN, BK>& storage) {
     constexpr int warps_n = BN / (WN * 8);
+    constexpr int threads = (BM / (WM * 16)) * warps_n * 32;
     constexpr bool split_scale = MmqBuffers<W, BM, BN, BK>::split_scale;
     constexpr bool min_scale = MmqBuffers<W, BM, BN, BK>::min_scale;
     auto& xs = storage.xs;
@@ -373,38 +400,50 @@ __device__ __forceinline__ void mmq_q8_1_tile(const BlockQ8_1* __restrict__ x, c
     int lane = threadIdx.x % 32, group = lane / 4, word = lane % 4;
     float4 acc[WM][WN] = {};
 
-    load_mmq_tile<W, BM, BN, BK>(x, w, xs[0], ws[0], m0, n0, M, N, K, 0);
+    load_mmq_tile<W, BM, BN, BK, threads>(x, w, xs[0], ws[0], m0, n0, M, N, K, 0);
     if constexpr (mmq_async<W>) asm volatile("cp.async.wait_group 0;" ::: "memory");
     __syncthreads();
     for (int kb = 0; kb < K / 32; kb += BK) {
         const auto& a = xs[(kb / BK) & 1];
         const auto& b = ws[(kb / BK) & 1];
         if (kb + BK < K / 32) {
-            load_mmq_tile<W, BM, BN, BK>(x, w, xs[1 - ((kb / BK) & 1)], ws[1 - ((kb / BK) & 1)],
-                                      m0, n0, M, N, K, kb + BK);
+            const int next = 1 - ((kb / BK) & 1);
+            load_mmq_tile<W, BM, BN, BK, threads>(x, w, xs[next], ws[next], m0, n0, M, N, K, kb + BK);
         }
 
         #pragma unroll
         for (int slot = 0; slot < BK; ++slot) {
             uint2 weights[WN];
             float2 scales[WN], other[WN];
+            constexpr bool load_weight_pairs = split_scale && BM >= 128 && WN % 2 == 0;
+            if constexpr (load_weight_pairs) {
+                #pragma unroll
+                for (int ni = 0; ni < WN; ni += 2) {
+                    const int j = warp_n + ni * 8 + lane % 8 + lane / 16 * 8;
+                    const auto q = mmq_load_a(b.qs[j] + slot * 8 + (lane / 8) % 2 * 4);
+                    weights[ni] = make_uint2(q.x, q.y);
+                    weights[ni + 1] = make_uint2(q.z, q.w);
+                }
+            }
             #pragma unroll
             for (int ni = 0; ni < WN; ++ni) {
                 int j = warp_n + ni * 8;
                 int j0 = j + word * 2, j1 = j0 + 1;
                 uint2 bv;
-                if constexpr (TileQ4_144<W>) {
+                if constexpr (load_weight_pairs) {
+                    bv = weights[ni];
+                } else if constexpr (TileQ4_144<W>) {
                     const unsigned packed = mmq_load_packed_q4(b.qs[j + lane % 8] + slot * 4);
                     if constexpr (TileQ4Trait<W>::symmetric)
                         bv = make_uint2(mmq_signed_q4(packed), mmq_signed_q4(packed >> 4));
                     else
                         bv = make_uint2(unpack_q4_words(packed, 0), unpack_q4_words(packed, 4));
-                } else if constexpr (std::is_same_v<W, BlockQ6_A>) {
+                } else if constexpr (std::is_same_v<W, BlockQ6_A> && BM < 128) {
                     const unsigned* row = b.qs[j + lane % 8] + slot * 8;
                     const auto low = mmq_load_packed_q4(row);
                     const auto high = mmq_load_packed_q4(row + 4);
-                    bv = make_uint2((unpack_q6_a(low, high, 0, slot % 2) + 0x60606060u) ^ 0x80808080u,
-                                    (unpack_q6_a(low, high, 1, slot % 2) + 0x60606060u) ^ 0x80808080u);
+                    bv = make_uint2(mmq_signed_q6(unpack_q6_a(low, high, 0, slot % 2)),
+                                    mmq_signed_q6(unpack_q6_a(low, high, 1, slot % 2)));
                 } else if constexpr (std::is_same_v<W, BlockQ4_K>) {
                     const auto* row = b.qs[j + lane % 8] + (slot & ~1) * 4;
                     const uint2 packed = mmq_load_b(row + ((lane / 8) % 2) * 4);
@@ -427,10 +466,17 @@ __device__ __forceinline__ void mmq_q8_1_tile(const BlockQ8_1* __restrict__ x, c
                     scales[ni] = make_float2(
                         half_bits_to_f32(static_cast<uint16_t>(__float_as_uint(b.scale[slot][j0]) >> shift)),
                         half_bits_to_f32(static_cast<uint16_t>(__float_as_uint(b.scale[slot][j1]) >> shift)));
+                } else if constexpr (split_scale) {
+                    // Keep the two K16 scales for each of two adjacent columns together.
+                    const auto pair = *reinterpret_cast<const float4*>(&b.scale[slot][2 * j0]);
+                    scales[ni] = make_float2(pair.x, pair.y);
+                    other[ni] = make_float2(pair.z, pair.w);
+                } else if constexpr (std::is_same_v<W, BlockQ8_A>) {
+                    scales[ni] = *reinterpret_cast<const float2*>(&b.scale[slot][j0]);
                 } else {
                     scales[ni] = make_float2(b.scale[slot][j0], b.scale[slot][j1]);
                 }
-                if constexpr (split_scale || min_scale) {
+                if constexpr (min_scale) {
                     other[ni] = make_float2(b.other[slot][j0], b.other[slot][j1]);
                 }
             }
@@ -450,13 +496,12 @@ __device__ __forceinline__ void mmq_q8_1_tile(const BlockQ8_1* __restrict__ x, c
                     const uint2 bv = weights[ni];
                     const float bx = scales[ni].x, by = scales[ni].y;
                     int4 c;
-                    if constexpr (std::is_same_v<W, BlockQ6_A>) c = mma_s8_k16(av.x, av.y, bv.x);
-                    else c = mma_s8(av.x, av.y, av.z, av.w, bv.x, split_scale ? 0u : bv.y);
+                    // Q6 scales each 16-value dot separately.
+                    if constexpr (split_scale) c = mma_s8_k16(av.x, av.y, bv.x);
+                    else c = mma_s8(av.x, av.y, av.z, av.w, bv.x, bv.y);
                     auto& f = acc[mi][ni];
                     if constexpr (split_scale) {
-                        int4 hi;
-                        if constexpr (std::is_same_v<W, BlockQ6_A>) hi = mma_s8_k16(av.z, av.w, bv.y);
-                        else hi = mma_s8(0, 0, av.z, av.w, 0, bv.y);
+                        const int4 hi = mma_s8_k16(av.z, av.w, bv.y);
                         float hx = other[ni].x, hy = other[ni].y;
                         f.x = fmaf(ax, fmaf(hx, hi.x, bx * c.x), f.x);
                         f.y = fmaf(ax, fmaf(hy, hi.y, by * c.y), f.y);
@@ -488,6 +533,13 @@ __device__ __forceinline__ void mmq_q8_1_tile(const BlockQ8_1* __restrict__ x, c
         for (int ni = 0; ni < WN; ++ni) {
             int j0 = n0 + warp_n + ni * 8 + word * 2, j1 = j0 + 1;
             const auto& f = acc[mi][ni];
+            if constexpr (BM == 128 && (split_scale || std::is_same_v<W, BlockQ8_A>)) {
+                if (N % 2 == 0 && reinterpret_cast<uintptr_t>(y) % alignof(float2) == 0) {
+                    if (i0 < M && j0 < N) *reinterpret_cast<float2*>(y + static_cast<int64_t>(i0) * N + j0) = make_float2(f.x, f.y);
+                    if (i1 < M && j0 < N) *reinterpret_cast<float2*>(y + static_cast<int64_t>(i1) * N + j0) = make_float2(f.z, f.w);
+                    continue;
+                }
+            }
             if (i0 < M && j0 < N) y[static_cast<int64_t>(i0) * N + j0] = f.x;
             if (i0 < M && j1 < N) y[static_cast<int64_t>(i0) * N + j1] = f.y;
             if (i1 < M && j0 < N) y[static_cast<int64_t>(i1) * N + j0] = f.z;
@@ -499,13 +551,24 @@ __device__ __forceinline__ void mmq_q8_1_tile(const BlockQ8_1* __restrict__ x, c
 template <typename W, int BM, int BN, int WN, int BK = 4, int WM = BM / 16>
 __global__ void k_mmq_q8_1(const BlockQ8_1* x, const W* w, float* y, int M, int N, int K) {
     using Buffers = MmqBuffers<W, BM, BN, BK>;
+    int mt = blockIdx.y;
+    int nt = blockIdx.x;
+    if constexpr (BM == 128 && (mmq_split_scale<W> || std::is_same_v<W, BlockQ8_A>)) {
+        // Schedule nearby CTAs on the same weight rows before advancing across N.
+        constexpr int rows_per_group = 4;
+        const int first = mt / rows_per_group * rows_per_group;
+        const int rows = min(rows_per_group, static_cast<int>(gridDim.y) - first);
+        const int tile = (mt - first) * gridDim.x + nt;
+        mt = first + tile % rows;
+        nt = tile / rows;
+    }
     if constexpr (sizeof(Buffers) > 48 * 1024) {
         extern __shared__ __align__(16) unsigned char mmq_smem[];
         auto& storage = *reinterpret_cast<Buffers*>(mmq_smem);
-        mmq_q8_1_tile<W, BM, BN, WN, BK, WM>(x, w, y, M, N, K, blockIdx.y * BM, blockIdx.x * BN, storage);
+        mmq_q8_1_tile<W, BM, BN, WN, BK, WM>(x, w, y, M, N, K, mt * BM, nt * BN, storage);
     } else {
         __shared__ Buffers storage;
-        mmq_q8_1_tile<W, BM, BN, WN, BK, WM>(x, w, y, M, N, K, blockIdx.y * BM, blockIdx.x * BN, storage);
+        mmq_q8_1_tile<W, BM, BN, WN, BK, WM>(x, w, y, M, N, K, mt * BM, nt * BN, storage);
     }
 }
 
@@ -559,10 +622,11 @@ void launch_mmq_tile(const BlockQ8_1* x, const W* w, float* y, int M, int N, int
 template <typename W, MmqTileConfig Config>
 constexpr bool mmq_tile_compiled() {
     using enum MmqTileConfig;
-    constexpr bool scaled = std::is_same_v<W, BlockQ4_KA> || std::is_same_v<W, BlockQ5_K>;
+    constexpr bool wide = std::is_same_v<W, BlockQ4_KA> || std::is_same_v<W, BlockQ5_K> ||
+                          mmq_split_scale<W> || std::is_same_v<W, BlockQ8_A>;
     switch (Config) {
-        case M128N96: case M128N128: return scaled;
-        case M128N64: case M64N64: return scaled || std::is_same_v<W, BlockQ6_A>;
+        case M128N96: case M128N128: return wide;
+        case M128N64: case M64N64: return wide;
         case M64N128: return std::is_same_v<W, BlockQ4_A>;
         case M64N64K256: return std::is_same_v<W, BlockQ8_A>;
         case M64N64W1: return std::is_same_v<W, BlockQ4_K>;

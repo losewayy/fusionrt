@@ -84,6 +84,7 @@ if(FUSIONRT_ENABLE_CUDA)
         src/cuda/matmul/gemv_decode.cu
         src/cuda/matmul/mmq_prefill.cu
         src/cuda/matmul/dit_linear_ops.cu
+        src/cuda/matmul/nvfp4_gemm.cu
         src/cuda/sequence/flash_attention.cu
         src/cuda/sequence/mla.cu
         src/cuda/sequence/linear_recurrence.cu
@@ -92,7 +93,7 @@ if(FUSIONRT_ENABLE_CUDA)
         src/cuda/epilogue/codec_moe_ops.cu
     )
     target_compile_definitions(fusionrt_ops PUBLIC FUSIONRT_ENABLE_CUDA=1)
-    target_link_libraries(fusionrt_ops PUBLIC CUDA::cudart CUDA::cuda_driver CUDA::cublas)
+    target_link_libraries(fusionrt_ops PUBLIC CUDA::cudart CUDA::cuda_driver CUDA::cublas CUDA::cublasLt)
     if(TARGET CUDA::nvml)
         target_link_libraries(fusionrt_ops PUBLIC CUDA::nvml)
         target_compile_definitions(fusionrt_ops PUBLIC FUSIONRT_HAS_NVML=1)
@@ -210,6 +211,7 @@ if(FUSIONRT_BUILD_TESTS)
         tests/test_spec_and_protocols.cpp
         tests/test_wave1.cpp
         tests/test_dit_ops.cpp
+        tests/test_nvfp4_ops.cpp
     )
     target_include_directories(fusionrt_tests PRIVATE src/server)
     target_link_libraries(fusionrt_tests PRIVATE fusionrt_core)

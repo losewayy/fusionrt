@@ -5,6 +5,7 @@
 
 #ifdef FUSIONRT_ENABLE_CUDA
 void run_dit_ops_tests();
+void run_nvfp4_ops_tests();
 #endif
 
 using namespace fusionrt;
@@ -48,6 +49,7 @@ int main() {
         test_cuda_wave1_decode(cuda_ctx);
         test_repacked_quants(cuda_ctx);
         run_dit_ops_tests();
+        run_nvfp4_ops_tests();
         test_cuda_wave2_prefill(cuda_ctx);
         test_cuda_sliding_window(cuda_ctx);
         test_cuda_gemma_epilogues(cuda_ctx);
