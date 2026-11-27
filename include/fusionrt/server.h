@@ -14,6 +14,7 @@ struct ServeSpeculation {
     int draft_tokens = 4;
     bool mtp = false;
     float p_min = 0.1f;
+    bool auto_draft_tokens = false;
 
     const char* mode() const { return mtp ? "mtp" : draft ? "draft" : ngram > 0 ? "ngram" : "none"; }
     bool enabled() const { return mtp || draft || ngram > 0; }
@@ -26,6 +27,7 @@ struct ServeSpeculation {
             options.spec_mtp = mtp;
             options.draft_model = draft;
             options.draft_tokens = draft_tokens;
+            options.auto_draft_tokens = auto_draft_tokens;
             options.spec_p_min = p_min;
         }
         return options;

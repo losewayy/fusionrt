@@ -6,6 +6,34 @@ namespace fusionrt::cuda_ops {
 
 namespace {
 
+template <bool Value, typename Cache>
+__device__ __forceinline__ const auto* attention_kv_row(const Cache* contiguous, CudaKvView cache,
+                                                         int token, int head, int heads, int dim) {
+    if constexpr (std::is_same_v<Cache, BlockQ8_0>)
+        return detail::k8v4_row<Value>(cache, token, head, heads, dim);
+    else
+        return kv_row<Value>(contiguous, cache, token, head, heads, dim);
+}
+
+__device__ __forceinline__ int attention_quant(const BlockQ8_0& block, int lane) {
+    return block.qs[lane];
+}
+
+__device__ __forceinline__ int attention_quant(const BlockQ4_0& block, int lane) {
+    return ((block.qs[lane % 16] >> (lane < 16 ? 0 : 4)) & 15) - 8;
+}
+
+template <bool Value, typename Cache>
+__device__ __forceinline__ float attention_kv_value(const Cache* row, CudaKvView cache,
+                                                    int token, int head, int heads, int dim, int d) {
+    if constexpr (std::is_same_v<Cache, BlockQ8_0> || std::is_same_v<Cache, BlockQ4_0>) {
+        const auto& block = row[d / 32];
+        return attention_quant(block, d % 32) * half_bits_to_f32(block.d);
+    } else {
+        return kv_value<Value>(row, cache, token, head, heads, dim, d);
+    }
+}
+
 // Split-K pass 1: grid = (num_q_heads, num_splits), blockDim = 128 (4 warps).
 // Each thread computes dot product for one KV step across head_dim? Better:
 // 1 CTA per (q_head, split), blockDim.x = head_dim (up to 256, or multiple of 32 >= head_dim).
@@ -50,10 +78,10 @@ __global__ void k_gqa_splitk_part1(
     float o_j = 0.0f;
 
     for (int t = t_start; t < t_end; ++t) {
-        const auto* keys = kv_row<false>(k_cache, cache, t, kvh, num_kv_heads, head_dim);
-        const auto* values = kv_row<true>(v_cache, cache, t, kvh, num_kv_heads, head_dim);
+        const auto* keys = attention_kv_row<false>(k_cache, cache, t, kvh, num_kv_heads, head_dim);
+        const auto* values = attention_kv_row<true>(v_cache, cache, t, kvh, num_kv_heads, head_dim);
         const float qk_part = tid < head_dim
-            ? q_sh[tid] * kv_value<false>(keys, cache, t, kvh, num_kv_heads, head_dim, tid) : 0.0f;
+            ? q_sh[tid] * attention_kv_value<false>(keys, cache, t, kvh, num_kv_heads, head_dim, tid) : 0.0f;
         float score = block_reduce_sum(qk_part, red_buf);
 
         float m_new = fmaxf(m_i, score);
@@ -61,7 +89,7 @@ __global__ void k_gqa_splitk_part1(
         float p = expf(score - m_new);
         l_i = l_i * alpha + p;
         if (tid < head_dim) {
-            o_j = o_j * alpha + p * kv_value<true>(values, cache, t, kvh, num_kv_heads, head_dim, tid);
+            o_j = o_j * alpha + p * attention_kv_value<true>(values, cache, t, kvh, num_kv_heads, head_dim, tid);
         }
         m_i = m_new;
         __syncthreads();
@@ -170,10 +198,10 @@ __global__ void k_gqa_prefill_causal(
     float o_j = 0.0f;
 
     for (int t = first_key; t < kv_end; ++t) {
-        const auto* keys = kv_row<false>(k_cache, cache, t, kvh, num_kv_heads, head_dim);
-        const auto* values = kv_row<true>(v_cache, cache, t, kvh, num_kv_heads, head_dim);
+        const auto* keys = attention_kv_row<false>(k_cache, cache, t, kvh, num_kv_heads, head_dim);
+        const auto* values = attention_kv_row<true>(v_cache, cache, t, kvh, num_kv_heads, head_dim);
         const float qk_part = tid < head_dim
-            ? q_sh[tid] * kv_value<false>(keys, cache, t, kvh, num_kv_heads, head_dim, tid) : 0.0f;
+            ? q_sh[tid] * attention_kv_value<false>(keys, cache, t, kvh, num_kv_heads, head_dim, tid) : 0.0f;
         float score = block_reduce_sum(qk_part, red_buf);
 
         float m_new = fmaxf(m_i, score);
@@ -181,7 +209,7 @@ __global__ void k_gqa_prefill_causal(
         float p = expf(score - m_new);
         l_i = l_i * alpha + p;
         if (tid < head_dim) {
-            o_j = o_j * alpha + p * kv_value<true>(values, cache, t, kvh, num_kv_heads, head_dim, tid);
+            o_j = o_j * alpha + p * attention_kv_value<true>(values, cache, t, kvh, num_kv_heads, head_dim, tid);
         }
         m_i = m_new;
         __syncthreads();
@@ -201,6 +229,7 @@ __global__ void k_gqa_prefill_tiled(
     int start_pos, float scale, const int* kv_len_dev = nullptr, int splits = 1,
     float* partial_ml = nullptr, CudaKvView cache = {}, int sliding_window = 0)
 {
+    constexpr bool Mixed = std::is_same_v<Cache, BlockQ8_0>;
     constexpr int BKV = HD == 512 || std::is_same_v<Cache, float> ? 8 : 16, DP = HD / 32;
     constexpr int TokensPerWarp = Decode ? 4 : 1;
     constexpr int ScoreLanes = 32 / TokensPerWarp;
@@ -216,7 +245,7 @@ __global__ void k_gqa_prefill_tiled(
     int qh = kvh * group + query % group;
     int lane = threadIdx.x & 31;
     const int kv_len = Decode ? (kv_len_dev ? *kv_len_dev : start_pos) : 0;
-    if constexpr (FirstPage || (Decode && !std::is_same_v<Cache, int8_t>)) {
+    if constexpr (!Mixed && (FirstPage || (Decode && !std::is_same_v<Cache, int8_t>))) {
         if (FirstPage || (cache.pages && kv_len <= kKvPageTokens)) {
             const auto* page = cache.pages[0];
             k_cache = reinterpret_cast<const Cache*>(page);
@@ -253,13 +282,23 @@ __global__ void k_gqa_prefill_tiled(
 
     float max_score = -INFINITY, sum = 0.0f;
     for (int base = tile_start; base < tile_end; base += BKV) {
-        constexpr int V = (Decode || FirstPage || std::is_same_v<Cache, int8_t>) ? 16 / sizeof(Cache) : 1;
+        constexpr int V = Mixed ? 8 :
+            (Decode || FirstPage || std::is_same_v<Cache, int8_t>) ? 16 / sizeof(Cache) : 1;
         for (int i = threadIdx.x; i < BKV * HD / V; i += Warps * 32) {
             const int t = (V * i) / HD, d = (V * i) % HD;
             const int pos = min(base + t, tile_end - 1);
-            const auto* kr = kv_row<false>(k_cache, cache, pos, kvh, num_kv_heads, HD);
-            const auto* vr = kv_row<true>(v_cache, cache, pos, kvh, num_kv_heads, HD);
-            if constexpr (std::is_same_v<Cache, int8_t>) {
+            const auto* kr = attention_kv_row<false>(k_cache, cache, pos, kvh, num_kv_heads, HD);
+            const auto* vr = attention_kv_row<true>(v_cache, cache, pos, kvh, num_kv_heads, HD);
+            if constexpr (Mixed) {
+                const auto& k = kr[d / 32];
+                const auto& v = vr[d / 32];
+                const float dk = half_bits_to_f32(k.d), dv = half_bits_to_f32(v.d);
+                #pragma unroll
+                for (int j = 0; j < V; ++j) {
+                    keys[t][d + j] = attention_quant(k, d % 32 + j) * dk;
+                    values[t][d + j] = attention_quant(v, d % 32 + j) * dv;
+                }
+            } else if constexpr (std::is_same_v<Cache, int8_t>) {
                 const uint4 k = *reinterpret_cast<const uint4*>(kr + d);
                 const uint4 v = *reinterpret_cast<const uint4*>(vr + d);
                 const float dk = __half2float(kv_scales<false>(cache, pos, kvh, num_kv_heads, HD)[d / 32]);
@@ -392,7 +431,7 @@ __device__ __forceinline__ AttentionQ8Pairs attention_dequantize_q8(unsigned byt
             __hmul2(__hsub2(reinterpret_cast<const half2&>(hi), bias), scale)};
 }
 
-template <typename Cache, int HD>
+template <int HD, typename Cache>
 __device__ __forceinline__ void attention_stage_kv_row(half* tile, int r, const Cache* row, int d, half scale) {
     half* dst = tile + attention_offset<HD>(r, d);
     if constexpr (std::is_same_v<Cache, half>) {
@@ -419,6 +458,14 @@ __device__ __forceinline__ void attention_stage_kv_row(half* tile, int r, const 
                 pair[1] = value.hi;
             }
         }
+    } else if constexpr (std::is_same_v<Cache, BlockQ8_0> || std::is_same_v<Cache, BlockQ4_0>) {
+        const auto& block = row[d / 32];
+        const float delta = half_bits_to_f32(block.d);
+        #pragma unroll
+        for (int i = 0; i < 8; i += 2) {
+            reinterpret_cast<half2*>(dst)[i / 2] = __floats2half2_rn(
+                attention_quant(block, d % 32 + i) * delta, attention_quant(block, d % 32 + i + 1) * delta);
+        }
     } else {
         #pragma unroll
         for (int i = 0; i < 8; i += 2) {
@@ -430,12 +477,12 @@ __device__ __forceinline__ void attention_stage_kv_row(half* tile, int r, const 
 template <bool Value, typename Cache, int HD>
 __device__ __forceinline__ void attention_stage_kv(half* tile, int r, CudaKvView cache, int token,
                                                     int head, int heads, int d) {
-    const auto* row = kv_row<Value>(static_cast<const Cache*>(nullptr), cache, token, head, heads, HD);
+    const auto* row = attention_kv_row<Value>(static_cast<const Cache*>(nullptr), cache, token, head, heads, HD);
     half scale{};
     if constexpr (std::is_same_v<Cache, int8_t>) {
         scale = kv_scales<Value>(cache, token, head, heads, HD)[d / 32];
     }
-    attention_stage_kv_row<Cache, HD>(tile, r, row, d, scale);
+    attention_stage_kv_row<HD>(tile, r, row, d, scale);
 }
 
 template <typename Cache, int HD, int K, int Warps>
@@ -458,8 +505,8 @@ __device__ __forceinline__ void attention_stage_kv_tile(half* sk, half* sv, Cuda
             k_scale = reinterpret_cast<const half*>(keys + cache.elements)[i];
             v_scale = reinterpret_cast<const half*>(values + cache.elements)[i];
         }
-        attention_stage_kv_row<Cache, HD>(sk, r, reinterpret_cast<const Cache*>(keys) + row, d, k_scale);
-        attention_stage_kv_row<Cache, HD>(sv, r, reinterpret_cast<const Cache*>(values) + row, d, v_scale);
+        attention_stage_kv_row<HD>(sk, r, reinterpret_cast<const Cache*>(keys) + row, d, k_scale);
+        attention_stage_kv_row<HD>(sv, r, reinterpret_cast<const Cache*>(values) + row, d, v_scale);
     }
 }
 
@@ -562,7 +609,7 @@ __device__ __forceinline__ void gqa_prefill_online(const float* q, int q_stride,
     const int first1 = Windowed ? max(0, last1 + 1 - sliding_window) : 0;
     const int start_tile = Windowed ? max(0, first + 1 - sliding_window) / K * K : 0;
     for (int base = start_tile; base <= last; base += K) {
-        if constexpr (HD == 256) {
+        if constexpr (HD == 256 && !std::is_same_v<Cache, BlockQ8_0>) {
             attention_stage_kv_tile<Cache, HD, K, Warps>(sk, sv, cache, base, last, head, nkv);
         } else {
             constexpr int V = std::is_same_v<Cache, int8_t> ? 16 : 8;
@@ -756,7 +803,8 @@ void gqa_splitk_decode_f32(
             q, keys, values, num_splits == 1 ? out : partial_out, partial_ml,
             num_q_heads, num_kv_heads, head_dim, kv_len_dev, kv_len_host, scale, num_splits, cache, sliding_window);
     };
-    if (kv_dtype == DType::Q8_0) launch.template operator()<int8_t>();
+    if (kv_dtype == DType::K8V4) launch.template operator()<BlockQ8_0>();
+    else if (kv_dtype == DType::Q8_0) launch.template operator()<int8_t>();
     else if (kv_dtype == DType::F16) launch.template operator()<half>();
     else launch.template operator()<float>();
     if (q8_out) {
@@ -794,7 +842,7 @@ void gqa_prefill_causal_f32(
                         nullptr, 1, nullptr, cache, sliding_window);
                     return;
                 }
-                if constexpr (!std::is_same_v<Cache, int8_t>) {
+                if constexpr (std::is_same_v<Cache, float> || std::is_same_v<Cache, half>) {
                     if (cache.pages && start_pos + M <= kKvPageTokens) {
                         k_gqa_prefill_tiled<HD, Cache, false, 8, true><<<grid, 256, 0, stream>>>(
                             q, qs, keys, values, out, M, num_q_heads, num_kv_heads, start_pos, scale,
@@ -824,7 +872,8 @@ void gqa_prefill_causal_f32(
                 cache, causal ? sliding_window : 0, causal, nullptr);
         }
     };
-    if (kv_dtype == DType::Q8_0) launch.template operator()<int8_t>();
+    if (kv_dtype == DType::K8V4) launch.template operator()<BlockQ8_0>();
+    else if (kv_dtype == DType::Q8_0) launch.template operator()<int8_t>();
     else if (kv_dtype == DType::F16) launch.template operator()<half>();
     else launch.template operator()<float>();
 }
@@ -847,7 +896,8 @@ void gqa_prefill_online_f32(const float* q, int q_stride, CudaKvView cache, floa
         }
     };
     auto dispatch = [&]<int HD, int Warps>() {
-        if (cache.dtype == DType::Q8_0) launch.template operator()<HD, Warps, int8_t>();
+        if (cache.dtype == DType::K8V4) launch.template operator()<HD, Warps, BlockQ8_0>();
+        else if (cache.dtype == DType::Q8_0) launch.template operator()<HD, Warps, int8_t>();
         else if (cache.dtype == DType::F16) launch.template operator()<HD, Warps, half>();
         else launch.template operator()<HD, Warps, float>();
     };

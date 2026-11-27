@@ -632,8 +632,8 @@ static size_t place_cuda_experts(CudaContext& ctx, LoadedModelRaw& raw, int over
             q8_compatible &= dim % 32 == 0;
             kv_page_bytes += mla ?
                 kKvPageTokens * static_cast<size_t>(d.mla.latent_width()) * sizeof(float) :
-                2 * row_nbytes(dtype, elements);
-            if (q8_compatible) q8_page_bytes += 2 * row_nbytes(DType::Q8_0, elements);
+                kv_row_nbytes(dtype, elements);
+            if (q8_compatible) q8_page_bytes += kv_row_nbytes(DType::Q8_0, elements);
             session_bytes += align(max_pages * sizeof(uint8_t*));
         } else if (layer.kind == 1) {
             const auto& g = raw.cfg.gdn;
@@ -658,8 +658,8 @@ static size_t place_cuda_experts(CudaContext& ctx, LoadedModelRaw& raw, int over
         const size_t pages = requested_kv_bytes ? requested_kv_bytes / page : 1 + (active_tokens - 1) / kKvPageTokens;
         return pages * page;
     };
-    if (dtype == DType::Q8_0 && !q8_compatible)
-        throw std::invalid_argument("Q8_0 KV requires head dimensions divisible by 32");
+    if (kv_key_dtype(dtype) == DType::Q8_0 && !q8_compatible)
+        throw std::invalid_argument(std::string(dtype_name(dtype)) + " KV requires head dimensions divisible by 32");
     size_t kv_bytes = bytes_for(kv_page_bytes);
     session_bytes *= static_cast<size_t>(slots);
     auto log_kv = [&] {

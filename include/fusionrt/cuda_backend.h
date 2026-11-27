@@ -207,13 +207,16 @@ public:
 
 struct CudaKvView {
     uint8_t** pages = nullptr;
-    size_t plane_bytes = 0;   // K or V in one page, including the Q8 scale plane.
+    size_t plane_bytes = 0;   // Key plane size and byte offset of the value plane.
     int elements = 0;         // Elements in one plane before quantization.
     int max_pages = 0;
     DType dtype = DType::F32;
     bool latent = false;
 
-    size_t page_bytes() const { return (latent ? 1 : 2) * plane_bytes; }
+    size_t page_bytes() const {
+        if (latent) return plane_bytes;
+        return plane_bytes + (dtype == DType::K8V4 ? row_nbytes(kv_value_dtype(dtype), elements) : plane_bytes);
+    }
 };
 
 CudaKvView make_cuda_kv_view(CudaArena& arena, DType dtype, int max_tokens, int kv_heads, int head_dim,

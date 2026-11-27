@@ -188,7 +188,7 @@ void test_cuda_session_slots() {
     const auto mark = ctx.weight_arena().mark();
     int prefilled = 0;
 
-    {
+    auto verify_dense_fork = [&] {
         FusionModel model(cfg);
         model.set_num_slots(2);
         model.init_synthetic(ctx);
@@ -215,9 +215,14 @@ void test_cuda_session_slots() {
         if (prefilled != 1 || resumed != cold) {
             throw std::runtime_error("Dense slot A decode after the fork must match cold logits exactly");
         }
+    };
+    for (const auto dtype : {DType::Q8_0, DType::K8V4}) {
+        ctx.set_kv_dtype(dtype);
+        verify_dense_fork();
+        ctx.weight_arena().reset(mark);
     }
-    ctx.weight_arena().reset(mark);
 
+    ctx.set_kv_dtype(DType::Q8_0);
     {
         auto hybrid = cfg;
         hybrid.arch = "hybrid";
@@ -278,7 +283,6 @@ void test_cuda_session_slots() {
 
 void test_tiered_cuda_kv() {
     CudaContext ctx(0, 32, 32);
-    ctx.set_kv_dtype(DType::Q8_0);
     HybridModelConfig cfg;
     cfg.num_layers = 2;
     cfg.vocab_size = 64;
@@ -286,16 +290,19 @@ void test_tiered_cuda_kv() {
     cfg.dense.num_attention_heads = cfg.dense.num_key_value_heads = 2;
     cfg.dense.head_dim = 64;
     cfg.dense.max_seq_len = 384;
-    const size_t page_bytes = 2 * cfg.num_layers * row_nbytes(DType::Q8_0,
-        kKvPageTokens * cfg.dense.num_key_value_heads * cfg.dense.head_dim);
-    const size_t vram_budget = 3 * page_bytes;
+    const auto elements = kKvPageTokens * cfg.dense.num_key_value_heads * cfg.dense.head_dim;
+    const size_t q8 = cfg.num_layers * kv_row_nbytes(DType::Q8_0, elements);
+    const size_t f16 = cfg.num_layers * kv_row_nbytes(DType::F16, elements);
+    const size_t mixed = cfg.num_layers * kv_row_nbytes(DType::K8V4, elements);
+    if (mixed * 68 != q8 * 52 || mixed * 128 != f16 * 52)
+        throw std::runtime_error("K8V4 KV must save 23.5% vs Q8_0 and 59.4% vs F16");
     const std::vector<int32_t> a(300, 1);
     auto b = a;
     std::fill(b.begin() + kKvPageTokens, b.end(), 2);
     auto resumed_prompt = a;
     resumed_prompt.push_back(3);
 
-    auto run = [&](size_t budget, size_t host_budget) {
+    auto run = [&](size_t page_bytes, size_t budget, size_t host_budget) {
         const auto mark = ctx.weight_arena().mark();
         FusionModel model(cfg);
         model.set_num_slots(2);
@@ -321,14 +328,18 @@ void test_tiered_cuda_kv() {
         ctx.weight_arena().reset(mark);
         return logits;
     };
-    const auto unspilled = run(0, 0);
-    const auto spilled = run(vram_budget, 4 * page_bytes);
-    const auto full_host = run(vram_budget, 2 * page_bytes);
-    if (spilled != unspilled || full_host != unspilled) {
-        throw std::runtime_error("Tiered KV decode logits differ after restore");
+    for (const auto dtype : {DType::Q8_0, DType::K8V4}) {
+        ctx.set_kv_dtype(dtype);
+        const size_t page_bytes = cfg.num_layers * kv_row_nbytes(dtype, elements);
+        const size_t vram_budget = 3 * page_bytes;
+        const auto unspilled = run(page_bytes, 0, 0);
+        const auto spilled = run(page_bytes, vram_budget, 4 * page_bytes);
+        const auto full_host = run(page_bytes, vram_budget, 2 * page_bytes);
+        if (spilled != unspilled || full_host != unspilled)
+            throw std::runtime_error("Tiered KV decode logits differ after restore");
+        std::cout << "  [PASS] Tiered " << dtype_name(dtype) << " KV: GPU " << vram_budget
+                  << " B, pinned host " << 2 * page_bytes << " B (2 pages), reused 300 tokens, max_abs=0\n";
     }
-    std::cout << "  [PASS] Tiered KV: GPU " << vram_budget << " B, pinned host " << 2 * page_bytes
-              << " B (2 pages), reused 300 tokens, max_abs=0\n";
 }
 
 HostTensor moe_test_weights(std::vector<int64_t> shape, DType dtype, std::mt19937_64& rng) {
@@ -710,6 +721,17 @@ void test_dense_auto_kv_fallback() {
         model.cuda_kv_dtype() != DType::Q8_0 || model.cuda_max_active_tokens() != context)
         throw std::runtime_error("Dense auto KV must use Q8_0 under a profile between the F16 and Q8_0 footprints");
     std::cout << "  [PASS] Dense auto KV uses Q8_0 when F16 cannot fit the full context\n";
+
+    const size_t mixed = kv_row_nbytes(DType::K8V4, context * (H / 2));
+    ctx.set_kv_dtype(DType::K8V4);
+    model.set_kv_vram_budget_bytes(mixed);
+    if (!model.load_gguf(ctx, fixture.path.string(), &error, context) ||
+        model.cuda_kv_dtype() != DType::K8V4 || model.cuda_max_active_tokens() != context)
+        throw std::runtime_error("Explicit K8V4 KV must fit two pages within its byte budget: " + error);
+    model.forward_prefill_cuda(ctx, std::vector<int32_t>(context, 1), 0);
+    if (model.cuda_cache_memory().kv_reserved_bytes != mixed)
+        throw std::runtime_error("K8V4 KV allocation must match its loader budget");
+    std::cout << "  [PASS] Explicit K8V4 loader and session agree on the two-page budget\n";
 }
 
 void test_cpu_quantized_moe_speed() {

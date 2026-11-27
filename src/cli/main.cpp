@@ -39,10 +39,11 @@ namespace {
 void print_usage(std::string_view command = {}) {
     const auto show = [&](std::string_view name) { return command.empty() || command == name; };
     const auto sampling = "  [--temp N] [--top-k N] [--top-p N] [--min-p N] [--repeat-penalty N] [--seed N]\n";
-    const auto placement = "  CUDA: [--kv-dtype auto|f32|f16|q8_0] [--profile FILE] [--threads N] [--cpu-affinity spread]\n"
+    const auto placement = "  CUDA: [--kv-dtype auto|f32|f16|q8_0|k8v4] [--profile FILE] [--threads N] [--cpu-affinity spread]\n"
                            "  CUDA: [--kv-vram-mb MiB] [--host-kv-mb MiB] [--moe-gpu-experts N]\n"
                            "  CUDA: [--moe-route-profile FILE] [--moe-dynamic-cache]\n";
-    const auto speculative = "  CUDA: [--spec-ngram K | --draft-model GGUF | --spec-mtp] [--draft-tokens N] [--spec-p-min N]\n";
+    const auto speculative = "  CUDA: [--spec-ngram K | --draft-model GGUF | --spec-mtp] [--draft-tokens N|auto] [--spec-p-min N]\n"
+                             "  CUDA: --draft-tokens auto (or 0) requires --spec-mtp.\n";
     if (command.empty()) std::cout << "fusionrt " << FUSIONRT_VERSION
         << "\nUsage: fusionrt <info|run|chat|serve|inspect|bench-model|bench> [options]\n"
         << "Use fusionrt <command> --help for details. generate is an alias for run.\n";
@@ -107,8 +108,28 @@ std::optional<DType> parse_kv_type(const std::string& value) {
     if (value == "f16") return DType::F16;
     if (value == "f32") return DType::F32;
     if (value == "q8_0") return DType::Q8_0;
-    throw std::invalid_argument("Expected auto, f32, f16 or q8_0 for --kv-dtype");
+    if (value == "k8v4") return DType::K8V4;
+    throw std::invalid_argument("Expected auto, f32, f16, q8_0 or k8v4 for --kv-dtype");
 }
+
+struct SpeculativeArgs : cli::SpeculativeArgs {
+    bool parse(std::string_view option, std::string_view value) {
+        return cli::SpeculativeArgs::parse(option, option == "--draft-tokens" && value == "auto" ? "0" : value);
+    }
+
+    bool auto_draft_tokens() const { return draft_tokens == 0; }
+
+    void validate(bool has_target) const {
+        if (!auto_draft_tokens()) {
+            cli::SpeculativeArgs::validate(has_target);
+            return;
+        }
+        if (!mtp) throw std::invalid_argument("--draft-tokens auto (or 0) requires --spec-mtp");
+        auto fixed_depth = static_cast<const cli::SpeculativeArgs&>(*this);
+        fixed_depth.draft_tokens = 1;
+        fixed_depth.validate(has_target);
+    }
+};
 
 struct CudaPlacementOptions {
     static constexpr size_t mib = 1024 * 1024;
@@ -337,7 +358,7 @@ int cmd_daily(const std::string& cmd, int argc, char** argv) {
     sampling.repeat_penalty = 1.1f;
     std::optional<DType> kv_dtype;
     CudaPlacementOptions placement;
-    cli::SpeculativeArgs speculative;
+    SpeculativeArgs speculative;
     for (int i = 2; i < argc; ++i) {
         const std::string arg = argv[i];
         if (placement.parse_flag(arg)) continue;
@@ -549,7 +570,8 @@ int cmd_daily(const std::string& cmd, int argc, char** argv) {
     if (!route_trace_path.empty()) route_trace = std::make_unique<MoeRouteTrace>(route_trace_path);
     ctx.moe_route_trace = route_trace.get();
     serve_http(ctx, model, tokenizer, model_filename(path), host, port, graph, vision.get(), preset_images,
-               {speculative.ngram, draft.get(), speculative.draft_tokens, speculative.mtp, speculative.p_min});
+               {speculative.ngram, draft.get(), speculative.draft_tokens, speculative.mtp, speculative.p_min,
+                speculative.auto_draft_tokens()});
     return 0;
 #endif
 }
@@ -644,7 +666,7 @@ int cmd_run(int argc, char** argv) {
     std::vector<std::string> image_paths;
     std::string prompt = "Hello fusionrt";
     std::optional<int> steps_option;
-    cli::SpeculativeArgs speculative;
+    SpeculativeArgs speculative;
     int max_seq = 4096, slots = 1, warmup = 0;
     int vk_dev = 0;
     std::optional<bool> graph_option;
@@ -815,6 +837,7 @@ int cmd_run(int argc, char** argv) {
         options.spec_p_min = speculative.p_min;
         options.draft_model = draft.get();
         options.draft_tokens = speculative.draft_tokens;
+        options.auto_draft_tokens = speculative.auto_draft_tokens();
         options.inputs_embeds = prepared.inputs_embeds;
         options.op_trace = profile_ops.empty() ? nullptr : &op_trace;
         options.layer_trace = layer_trace.empty() ? nullptr : &trace;

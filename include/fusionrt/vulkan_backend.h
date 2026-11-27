@@ -5,6 +5,7 @@
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <span>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -113,6 +114,8 @@ public:
 
     Tensor upload(const HostTensor& ht, bool persistent = true);
     HostTensor download(const Tensor& t);
+    // Clear nonempty, 4-byte-aligned tensor ranges in a single synchronous submission.
+    void zero_buffers(std::span<const Tensor> tensors);
     void synchronize();
 
     // Load SPIR-V shader pipeline on demand (with descriptor pool caching)
@@ -136,6 +139,8 @@ public:
 
 private:
     void create_instance_and_device(uint32_t device_index);
+    VkCommandBuffer begin_one_time_commands();
+    void submit_and_wait(VkCommandBuffer cmd);
     void copy_buffer(VkBuffer src, VkDeviceSize src_off, VkBuffer dst, VkDeviceSize dst_off, VkDeviceSize bytes);
 
     VkInstance instance_ = VK_NULL_HANDLE;

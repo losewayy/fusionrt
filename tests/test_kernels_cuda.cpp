@@ -602,6 +602,122 @@ void test_cuda_wave1_decode(CudaContext& ctx) {
 #endif
 
 #ifdef FUSIONRT_ENABLE_CUDA
+static void test_cuda_k8v4_attention(CudaContext& ctx) {
+    constexpr int seq = kKvPageTokens + 8, nq = 8, nkv = 2, splits = 8, window = 32;
+    constexpr int start = kKvPageTokens - 1;
+    auto& arena = ctx.scratch_arena();
+    const auto mark = arena.mark();
+    std::mt19937_64 rng(787);
+    for (const int hd : {64, 128}) {
+        const int qs = nq * hd, ks = nkv * hd;
+        const float scale = 1.0f / std::sqrt(static_cast<float>(hd));
+        const auto q = ctx.upload(rand_f32({seq, qs}, rng, 1.0f), false);
+        const auto k = ctx.upload(rand_f32({seq, ks}, rng, 1.0f), false);
+        const auto hv = rand_f32({seq, ks}, rng, 0.25f);
+        const auto v = ctx.upload(hv, false);
+        const auto out = arena.alloc_tensor({seq, qs}, DType::F32);
+        const auto partial = arena.alloc_tensor({nq, splits, hd}, DType::F32);
+        const auto stats = arena.alloc_tensor({nq, splits, 2}, DType::F32);
+        const auto lengths = arena.alloc_tensor({4}, DType::I32);
+        const int verify_lengths[] = {start + 1, start + 2, start + 3, start + 4};
+        FUSIONRT_CUDA_CHECK(cudaMemcpyAsync(lengths.ptr(), verify_lengths, sizeof(verify_lengths),
+                                            cudaMemcpyHostToDevice, ctx.stream()));
+        {
+            constexpr auto dtype = DType::K8V4;
+            const auto cache = make_cuda_kv_view(arena, dtype, seq, nkv, hd);
+            CudaKvPool pool;
+            CudaKvPool::Table pages;
+            pool.ensure(ctx, std::span(&cache, 1), pages, 0, seq);
+            const auto blocks = kKvPageTokens * ks / 32;
+            if (cache.plane_bytes != blocks * sizeof(BlockQ8_0) ||
+                pool.bytes() != 2 * blocks * (sizeof(BlockQ8_0) + sizeof(BlockQ4_0)))
+                throw std::runtime_error("K8V4 page layout");
+
+            cuda_ops::batched_qk_norm_rope_kv_append_f32(q.ptr<float>(), k.ptr<float>(), v.ptr<float>(),
+                nullptr, nullptr, nullptr, nullptr, seq - 1, nq, nkv, hd, 0, 0, seq, 10000.f, 1e-6f, true,
+                ctx.stream(), qs, ks, ks, nullptr, dtype, cache);
+            cuda_ops::fused_qk_norm_rope_kv_append_f32(q.ptr<float>() + (seq - 1) * qs,
+                k.ptr<float>() + (seq - 1) * ks, v.ptr<float>() + (seq - 1) * ks, nullptr, nullptr,
+                nullptr, nullptr, nq, nkv, hd, 0, nullptr, seq - 1, seq, 10000.f, 1e-6f, true,
+                ctx.stream(), nullptr, dtype, cache);
+
+            double min_cosine = 1.0, max_rmse = 0.0;
+            auto compare = [&](const HostTensor& reference, int rows, const char* path) {
+                const auto packed = ctx.download(out);
+                const int count = rows * qs;
+                const auto* expected = reference.data<float>();
+                const auto* actual = packed.data<float>();
+                const double dot = std::inner_product(actual, actual + count, expected, 0.0);
+                const double aa = std::inner_product(actual, actual + count, actual, 0.0);
+                const double bb = std::inner_product(expected, expected + count, expected, 0.0);
+                double sse = 0.0;
+                for (int j = 0; j < count; ++j) {
+                    const double error = actual[j] - expected[j];
+                    sse += error * error;
+                }
+                const double cosine = dot / std::sqrt(aa * bb), rmse = std::sqrt(sse / count);
+                min_cosine = std::min(min_cosine, cosine);
+                max_rmse = std::max(max_rmse, rmse);
+                if (!(cosine > 0.995 && rmse < 0.03))
+                    throw std::runtime_error(std::string("K8V4 ") + path + " hd=" + std::to_string(hd) +
+                        " rows=" + std::to_string(rows) + " cosine=" + std::to_string(cosine) +
+                        " RMSE=" + std::to_string(rmse));
+                return packed;
+            };
+            auto reference = [&](int pos, int rows, int sw, bool causal) {
+                cuda_ops::gqa_prefill_causal_f32(q.ptr<float>() + pos * qs, k.ptr(), v.ptr(), out.ptr<float>(),
+                    rows, nq, nkv, hd, pos, seq, scale, ctx.stream(), qs, DType::F32, {}, sw, causal);
+                return ctx.download(out);
+            };
+            const auto causal = reference(0, seq, 0, true);
+            cuda_ops::gqa_prefill_online_f32(q.ptr<float>(), qs, cache, out.ptr<float>(), seq, nq, nkv,
+                                            hd, 0, scale, ctx.stream());
+            const auto online = compare(causal, seq, "online prefill");
+            // The first causal query sees one token, so its output must match the standard Q4_0 decode.
+            std::vector<BlockQ4_0> blocks_v(ks / 32);
+            std::vector<float> first_value(ks);
+            quantize_row_q4_0(hv.data<float>(), blocks_v.data(), ks);
+            dequantize_row_q4_0(blocks_v.data(), first_value.data(), ks);
+            for (int h = 0; h < nkv; ++h) {
+                const auto* expected = first_value.data() + h * hd;
+                const auto* actual = online.data<float>() + h * (nq / nkv) * hd;
+                expect_close({actual, actual + hd}, {expected, expected + hd}, 4e-4, 1e-3, "K8V4 standard Q4_0");
+            }
+
+            auto* query = q.ptr<float>() + start * qs;
+            for (int rows = 1; rows <= 8; ++rows) {
+                const auto sw = reference(start, rows, window, true);
+                cuda_ops::gqa_prefill_causal_f32(query, nullptr, nullptr, out.ptr<float>(), rows,
+                    nq, nkv, hd, start, seq, scale, ctx.stream(), qs, dtype, cache, window);
+                compare(sw, rows, "tiled SWA");
+            }
+            const auto bidirectional = reference(0, seq, 0, false);
+            cuda_ops::gqa_prefill_causal_f32(q.ptr<float>(), nullptr, nullptr, out.ptr<float>(), seq,
+                nq, nkv, hd, 0, seq, scale, ctx.stream(), qs, dtype, cache, 0, false);
+            compare(bidirectional, seq, "bidirectional prefill");
+
+            const auto verify = reference(start, 4, window, true);
+            cuda_ops::batched_qk_norm_rope_kv_append_f32(query, nullptr, nullptr,
+                nullptr, nullptr, nullptr, nullptr, 4, nq, 0, hd, 0, start, seq, 10000.f, 1e-6f, true,
+                ctx.stream(), qs, 0, 0, nullptr, dtype, cache);
+            cuda_ops::gqa_prefill_online_f32(query, qs, cache, out.ptr<float>(), 4, nq, nkv,
+                                            hd, start, scale, ctx.stream(), window);
+            compare(verify, 4, "online SWA with shared KV");
+            for (const int count : {1, splits}) {
+                for (int row = 0; row < 4; ++row) {
+                    cuda_ops::gqa_splitk_decode_f32(query + row * qs, nullptr, nullptr, out.ptr<float>() + row * qs,
+                        partial.ptr<float>(), stats.ptr<float>(), nq, nkv, hd, lengths.ptr<int>() + row,
+                        verify_lengths[row], seq, scale, count, ctx.stream(), true, dtype, nullptr, nullptr, cache, window);
+                }
+                compare(verify, 4, "decode and M=4 verify");
+            }
+            std::cout << "  [PASS] K8V4 attention vs FP32 hd=" << hd
+                      << " min_cosine=" << min_cosine << " max_RMSE=" << max_rmse << '\n';
+        }
+        arena.reset(mark);
+    }
+}
+
 void test_cuda_sliding_window(CudaContext& ctx) {
     constexpr int seq = 192, window = 32, nq = 4, nkv = 2, splits = 8;
     std::mt19937_64 rng(343);
@@ -672,6 +788,7 @@ void test_cuda_sliding_window(CudaContext& ctx) {
         arena.reset(mark);
     }
     std::cout << "  [PASS] SWA window 32, 192 tokens, online/tiled prefill and Split-KV decode vs FP32\n";
+    test_cuda_k8v4_attention(ctx);
 }
 
 void test_cuda_gemma_epilogues(CudaContext& ctx) {

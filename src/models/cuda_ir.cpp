@@ -108,7 +108,7 @@ static OpTiming operator_work(const IRNode& node, int rows, int pos, const CudaC
             const int64_t hd = node.attention.head_dim;
             const int64_t pairs = m * pos + m * (m + 1) / 2;
             work.flops = n * pairs * (4 * hd + 4) + 3 * m * (n + k) * node.attention.rotary_dims;
-            work.bytes = f32 * hd * 2 * m * (n + k) + row_nbytes(kv_dtype, hd) * 2 * (m + pairs) * k;
+            work.bytes = f32 * hd * 2 * m * (n + k) + kv_row_nbytes(kv_dtype, hd) * (m + pairs) * k;
             if (node.attention.query_norm) norm(hd, m * n, false);
             if (node.attention.key_norm) norm(hd, m * k, false);
             if (node.attention.gated) {

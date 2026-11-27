@@ -200,6 +200,10 @@ if(FUSIONRT_ENABLE_VULKAN)
 
     add_custom_target(fusionrt_shaders ALL DEPENDS ${SHADER_SPV_OUTPUTS})
     list(APPEND FUSIONRT_SOURCES
+        src/models/vulkan_weights.cpp
+        src/models/vulkan_session.cpp
+        src/models/vulkan_executor.cpp
+        src/models/vulkan_dispatch.cpp
         src/vulkan/vulkan_backend.cpp
         src/vulkan/vulkan_ops.cpp
     )

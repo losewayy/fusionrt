@@ -46,6 +46,7 @@ enum class DType : uint8_t {
 #define FUSIONRT_CODEC_ENUM(name, id, block, bytes) name,
     FUSIONRT_WEIGHT_CODEC_FORMATS(FUSIONRT_CODEC_ENUM)
 #undef FUSIONRT_CODEC_ENUM
+    K8V4,      // KV policy: Q8_0 keys and Q4_0 values.
 };
 
 enum class Backend : uint8_t {
@@ -208,6 +209,7 @@ inline constexpr size_t dtype_type_size(DType dt) {
         case DType::F16:  return 2;
         case DType::BF16: return 2;
         case DType::Q8_0: return sizeof(BlockQ8_0);
+        case DType::K8V4: return 0;
         case DType::Q4_0: return sizeof(BlockQ4_0);
         case DType::I32:  return 4;
         case DType::U8:   return 1;
@@ -237,12 +239,25 @@ inline size_t row_nbytes(DType dt, int64_t cols) {
     return static_cast<size_t>(cols / static_cast<int64_t>(bs)) * ts;
 }
 
+inline constexpr DType kv_key_dtype(DType dtype) {
+    return dtype == DType::K8V4 ? DType::Q8_0 : dtype;
+}
+
+inline constexpr DType kv_value_dtype(DType dtype) {
+    return dtype == DType::K8V4 ? DType::Q4_0 : dtype;
+}
+
+inline size_t kv_row_nbytes(DType dtype, int64_t cols) {
+    return row_nbytes(kv_key_dtype(dtype), cols) + row_nbytes(kv_value_dtype(dtype), cols);
+}
+
 inline const char* dtype_name(DType dt) {
     switch (dt) {
         case DType::F32:  return "F32";
         case DType::F16:  return "F16";
         case DType::BF16: return "BF16";
         case DType::Q8_0: return "Q8_0";
+        case DType::K8V4: return "K8V4";
         case DType::Q4_0: return "Q4_0";
         case DType::I32:  return "I32";
         case DType::U8:   return "U8";

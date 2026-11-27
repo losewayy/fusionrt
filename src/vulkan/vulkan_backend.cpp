@@ -493,7 +493,7 @@ VkContext::~VkContext() {
     }
 }
 
-void VkContext::copy_buffer(VkBuffer src, VkDeviceSize src_off, VkBuffer dst, VkDeviceSize dst_off, VkDeviceSize bytes) {
+VkCommandBuffer VkContext::begin_one_time_commands() {
     VkCommandBufferAllocateInfo cbai{};
     cbai.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
     cbai.commandPool = cmd_pool_;
@@ -506,13 +506,10 @@ void VkContext::copy_buffer(VkBuffer src, VkDeviceSize src_off, VkBuffer dst, Vk
     cbbi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
     cbbi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
     FUSIONRT_VK_CHECK(vkBeginCommandBuffer(cmd, &cbbi));
+    return cmd;
+}
 
-    VkBufferCopy region{};
-    region.srcOffset = src_off;
-    region.dstOffset = dst_off;
-    region.size = bytes;
-    vkCmdCopyBuffer(cmd, src, dst, 1, &region);
-
+void VkContext::submit_and_wait(VkCommandBuffer cmd) {
     FUSIONRT_VK_CHECK(vkEndCommandBuffer(cmd));
     VkSubmitInfo si{};
     si.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
@@ -521,6 +518,18 @@ void VkContext::copy_buffer(VkBuffer src, VkDeviceSize src_off, VkBuffer dst, Vk
     FUSIONRT_VK_CHECK(vkResetFences(device_, 1, &fence_));
     FUSIONRT_VK_CHECK(vkQueueSubmit(queue_, 1, &si, fence_));
     FUSIONRT_VK_CHECK(vkWaitForFences(device_, 1, &fence_, VK_TRUE, UINT64_MAX));
+}
+
+void VkContext::copy_buffer(VkBuffer src, VkDeviceSize src_off, VkBuffer dst, VkDeviceSize dst_off, VkDeviceSize bytes) {
+    VkCommandBuffer cmd = begin_one_time_commands();
+
+    VkBufferCopy region{};
+    region.srcOffset = src_off;
+    region.dstOffset = dst_off;
+    region.size = bytes;
+    vkCmdCopyBuffer(cmd, src, dst, 1, &region);
+
+    submit_and_wait(cmd);
     vkFreeCommandBuffers(device_, cmd_pool_, 1, &cmd);
 }
 
@@ -556,6 +565,29 @@ HostTensor VkContext::download(const Tensor& t) {
         std::memcpy(ht.storage.data() + off, static_cast<uint8_t*>(staging_arena_.mapped()) + st_off, chunk);
     }
     return ht;
+}
+
+void VkContext::zero_buffers(std::span<const Tensor> tensors) {
+    if (tensors.empty()) return;
+
+    VkCommandBuffer cmd = begin_one_time_commands();
+    constexpr auto compute_and_transfer = VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT;
+    VkMemoryBarrier barrier{};
+    barrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+    barrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
+    barrier.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    vkCmdPipelineBarrier(cmd, compute_and_transfer, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                         0, 1, &barrier, 0, nullptr, 0, nullptr);
+    for (const auto& tensor : tensors) {
+        const auto bytes = tensor.nbytes();
+        if (bytes) vkCmdFillBuffer(cmd, reinterpret_cast<VkBuffer>(tensor.vk_buffer), tensor.vk_offset, bytes, 0);
+    }
+    barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT;
+    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, compute_and_transfer,
+                         0, 1, &barrier, 0, nullptr, 0, nullptr);
+    submit_and_wait(cmd);
+    vkFreeCommandBuffers(device_, cmd_pool_, 1, &cmd);
 }
 
 void VkContext::synchronize() {
@@ -678,18 +710,7 @@ double VkContext::dispatch_batched(const std::vector<VkBatchDispatch>& dispatche
         dsets.push_back(ds);
     }
 
-    VkCommandBufferAllocateInfo cbai{};
-    cbai.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
-    cbai.commandPool = cmd_pool_;
-    cbai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
-    cbai.commandBufferCount = 1;
-    VkCommandBuffer cmd = VK_NULL_HANDLE;
-    FUSIONRT_VK_CHECK(vkAllocateCommandBuffers(device_, &cbai, &cmd));
-
-    VkCommandBufferBeginInfo cbbi{};
-    cbbi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
-    cbbi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-    FUSIONRT_VK_CHECK(vkBeginCommandBuffer(cmd, &cbbi));
+    VkCommandBuffer cmd = begin_one_time_commands();
 
     if (measure_timestamp) {
         vkCmdResetQueryPool(cmd, query_pool_, 0, 2);
@@ -722,14 +743,7 @@ double VkContext::dispatch_batched(const std::vector<VkBatchDispatch>& dispatche
         vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, query_pool_, 1);
     }
 
-    FUSIONRT_VK_CHECK(vkEndCommandBuffer(cmd));
-    VkSubmitInfo si{};
-    si.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
-    si.commandBufferCount = 1;
-    si.pCommandBuffers = &cmd;
-    FUSIONRT_VK_CHECK(vkResetFences(device_, 1, &fence_));
-    FUSIONRT_VK_CHECK(vkQueueSubmit(queue_, 1, &si, fence_));
-    FUSIONRT_VK_CHECK(vkWaitForFences(device_, 1, &fence_, VK_TRUE, UINT64_MAX));
+    submit_and_wait(cmd);
 
     double gpu_ms = 0.0;
     if (measure_timestamp) {
@@ -753,28 +767,9 @@ double VkContext::dispatch_unbatched(const std::vector<VkBatchDispatch>& dispatc
 }
 
 void VkContext::flush_l2() {
-    VkCommandBufferAllocateInfo cbai{};
-    cbai.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
-    cbai.commandPool = cmd_pool_;
-    cbai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
-    cbai.commandBufferCount = 1;
-    VkCommandBuffer cmd = VK_NULL_HANDLE;
-    FUSIONRT_VK_CHECK(vkAllocateCommandBuffers(device_, &cbai, &cmd));
-
-    VkCommandBufferBeginInfo cbbi{};
-    cbbi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
-    cbbi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-    FUSIONRT_VK_CHECK(vkBeginCommandBuffer(cmd, &cbbi));
+    VkCommandBuffer cmd = begin_one_time_commands();
     vkCmdFillBuffer(cmd, l2_flush_buf_.buffer, 0, l2_flush_bytes_, 0x5A5A5A5Au);
-    FUSIONRT_VK_CHECK(vkEndCommandBuffer(cmd));
-
-    VkSubmitInfo si{};
-    si.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
-    si.commandBufferCount = 1;
-    si.pCommandBuffers = &cmd;
-    FUSIONRT_VK_CHECK(vkResetFences(device_, 1, &fence_));
-    FUSIONRT_VK_CHECK(vkQueueSubmit(queue_, 1, &si, fence_));
-    FUSIONRT_VK_CHECK(vkWaitForFences(device_, 1, &fence_, VK_TRUE, UINT64_MAX));
+    submit_and_wait(cmd);
     vkFreeCommandBuffers(device_, cmd_pool_, 1, &cmd);
 }
 

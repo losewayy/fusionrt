@@ -38,20 +38,20 @@ void check_cu(CUresult err, const char* expr, const char* file, int line) {
 }
 
 void CudaContext::set_kv_dtype(std::optional<DType> dtype) {
-    if (dtype && dtype != DType::F16 && dtype != DType::F32 && dtype != DType::Q8_0) {
-        throw std::invalid_argument("CUDA KV cache supports F16, F32 and Q8_0");
+    if (dtype && dtype != DType::F16 && dtype != DType::F32 && kv_key_dtype(*dtype) != DType::Q8_0) {
+        throw std::invalid_argument("CUDA KV cache supports F16, F32, Q8_0 and K8V4");
     }
     kv_request_ = dtype;
 }
 
 CudaKvView make_cuda_kv_view(CudaArena& arena, DType dtype, int max_tokens, int kv_heads, int head_dim,
                              bool latent) {
-    if (dtype == DType::Q8_0 && head_dim % 32 != 0) {
-        throw std::invalid_argument("Q8_0 KV requires a head dimension divisible by 32");
+    if (kv_key_dtype(dtype) == DType::Q8_0 && head_dim % 32 != 0) {
+        throw std::invalid_argument(std::string(dtype_name(dtype)) + " KV requires a head dimension divisible by 32");
     }
     const int pages = 1 + (max_tokens - 1) / kKvPageTokens;
     const int elements = kKvPageTokens * kv_heads * head_dim;
-    const size_t plane = size_t(elements) / dtype_block_size(dtype) * dtype_type_size(dtype);
+    const size_t plane = row_nbytes(kv_key_dtype(dtype), elements);
     auto* table = static_cast<uint8_t**>(arena.alloc(pages * sizeof(uint8_t*)));
     return {table, plane, elements, pages, dtype, latent};
 }

@@ -251,6 +251,19 @@ __global__ void k_argmax_f32(const float* __restrict__ x, int n, int32_t* __rest
     }
 }
 
+__device__ __forceinline__ void kv_quantize_q4(float value, BlockQ4_0& block, int lane) {
+    constexpr unsigned mask = 0xffffffffu;
+    const int magnitude = __float_as_int(fabsf(value));
+    const int amax = __reduce_max_sync(mask, magnitude);
+    const int peak_lane = __ffs(__ballot_sync(mask, magnitude == amax)) - 1;
+    const float d = __shfl_sync(mask, value, peak_lane) * (-1.0f / 8.0f);
+    const float scaled = d != 0.0f ? __fdividef(value, d) : 0.0f;
+    const int q = min(15, max(0, __float2int_rz(scaled + 8.5f)));
+    const int hi = __shfl_xor_sync(mask, q, 16);
+    if (lane < 16) block.qs[lane] = static_cast<uint8_t>(q | (hi << 4));
+    if (lane == 0) block.d = __half_as_ushort(__float2half_rn(d));
+}
+
 template <typename Cache, bool ValueNorm>
 __global__ void k_qk_norm_rope_kv_append(
     float* __restrict__ q,
@@ -321,8 +334,14 @@ __global__ void k_qk_norm_rope_kv_append(
         for (int i = tid; i < head_dim; i += blockDim.x) vec[i] = h_buf[i];
         return;
     }
-    auto* keys = kv_row<false>(k_cache, cache, pos, kh, num_kv_heads, head_dim);
-    auto* values = kv_row<true>(v_cache, cache, pos, kh, num_kv_heads, head_dim);
+    auto rows = [&]<bool Value>(Cache* contiguous) {
+        if constexpr (std::is_same_v<Cache, BlockQ8_0>)
+            return detail::k8v4_row<Value>(cache, pos, kh, num_kv_heads, head_dim);
+        else
+            return kv_row<Value>(contiguous, cache, pos, kh, num_kv_heads, head_dim);
+    };
+    auto* keys = rows.template operator()<false>(k_cache);
+    auto* values = rows.template operator()<true>(v_cache);
     const auto* src_v = ValueNorm && !v ? vec : v + m * v_stride + kh * head_dim;
     float v_inv = 1.0f;
     if constexpr (ValueNorm) {
@@ -336,6 +355,11 @@ __global__ void k_qk_norm_rope_kv_append(
         if constexpr (std::is_same_v<Cache, int8_t>) {
             kv_quantize(h_buf[i], keys, kv_scales<false>(cache, pos, kh, num_kv_heads, head_dim), i);
             kv_quantize(value, values, kv_scales<true>(cache, pos, kh, num_kv_heads, head_dim), i);
+        } else if constexpr (std::is_same_v<Cache, BlockQ8_0>) {
+            const int lane = i % 32;
+            auto& key = keys[i / 32];
+            kv_quantize(h_buf[i], key.qs, reinterpret_cast<half*>(&key.d), lane);
+            kv_quantize_q4(value, values[i / 32], lane);
         } else {
             keys[i] = h_buf[i];
             values[i] = value;
@@ -545,7 +569,8 @@ void fused_qk_norm_rope_kv_append_f32(
         if (v_norm) run.template operator()<true>();
         else run.template operator()<false>();
     };
-    if (kv_dtype == DType::Q8_0) launch.template operator()<int8_t>();
+    if (kv_dtype == DType::K8V4) launch.template operator()<BlockQ8_0>();
+    else if (kv_dtype == DType::Q8_0) launch.template operator()<int8_t>();
     else if (kv_dtype == DType::F16) launch.template operator()<half>();
     else launch.template operator()<float>();
 }
@@ -575,7 +600,8 @@ void batched_qk_norm_rope_kv_append_f32(
         if (v_norm) run.template operator()<true>();
         else run.template operator()<false>();
     };
-    if (kv_dtype == DType::Q8_0) launch.template operator()<int8_t>();
+    if (kv_dtype == DType::K8V4) launch.template operator()<BlockQ8_0>();
+    else if (kv_dtype == DType::Q8_0) launch.template operator()<int8_t>();
     else if (kv_dtype == DType::F16) launch.template operator()<half>();
     else launch.template operator()<float>();
 }

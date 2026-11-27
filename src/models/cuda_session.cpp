@@ -138,8 +138,7 @@ void CudaSessionManager::promote_cuda_expert_slabs(CudaContext& ctx, int budgete
         ctx.synchronize();
         cuda_kv_pool_.release_unused_tail();
     }
-    size_t per_page = 0;
-    for (const auto& layer : active().kv) per_page += layer.page_bytes();
+    const auto per_page = cuda_kv_page_bytes();
     const auto pages = 1 + (budgeted_tokens - 1) / kKvPageTokens;
     const auto required = std::max(cuda_kv_pool_.reserved_bytes(), per_page * pages);
     const auto commitment = cuda_kv_pool_.vram_budget_bytes();

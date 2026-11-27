@@ -3,7 +3,25 @@
 #include "fusionrt/cuda_backend.h"
 #include "fusionrt/tensor.h"
 
+#ifdef __CUDACC__
+#include <type_traits>
+#endif
+
 namespace fusionrt::cuda_ops {
+
+#ifdef __CUDACC__
+namespace detail {
+
+template <bool Value>
+__device__ __forceinline__ auto* k8v4_row(CudaKvView cache, int token, int head, int heads, int dim) {
+    using Block = std::conditional_t<Value, BlockQ4_0, BlockQ8_0>;
+    auto* page = cache.pages[token / kKvPageTokens];
+    const int row = (token % kKvPageTokens) * heads + head;
+    return reinterpret_cast<Block*>(page + (Value ? cache.plane_bytes : 0)) + row * (dim / 32);
+}
+
+}  // namespace detail
+#endif
 
 void layernorm_f32(const float* x, const float* weight, const float* bias, float* out,
                    int rows, int cols, float eps, cudaStream_t stream);

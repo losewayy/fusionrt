@@ -12,6 +12,10 @@ class CudaSessionManager;
 class CudaExecutor;
 #endif
 
+#ifdef FUSIONRT_ENABLE_VULKAN
+struct VulkanModelRuntime;
+#endif
+
 class FusionModel;
 
 struct GenerationOptions {
@@ -102,8 +106,6 @@ public:
 
 private:
     HybridModelConfig cfg_;
-    std::vector<int> layer_kinds_;
-    std::vector<size_t> layer_indices_;
 
 #ifdef FUSIONRT_ENABLE_CUDA
     std::unique_ptr<CudaModelWeights> weights_;
@@ -113,18 +115,7 @@ private:
 #endif
 
 #ifdef FUSIONRT_ENABLE_VULKAN
-    Tensor vk_tok_embeddings_;
-    Tensor vk_final_norm_w_;
-    Tensor vk_lm_head_w_;
-    Tensor vk_hidden_a_;
-    Tensor vk_hidden_b_;
-    Tensor vk_logits_;
-    Tensor vk_tok_id_;
-    Tensor vk_dummy_norm_;
-
-    std::vector<VkDenseGQALayer> vk_dense_layers_;
-    std::vector<VkGatedDeltaNetLayer> vk_gdn_layers_;
-    std::vector<VkSparseMoELayer> vk_moe_layers_;
+    std::shared_ptr<VulkanModelRuntime> vulkan_;
 #endif
 };
 

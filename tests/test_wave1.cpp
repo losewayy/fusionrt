@@ -2,8 +2,12 @@
 #include "../src/server/http_transport.h"
 #include "../src/models/cuda_dispatch.h"
 #endif
+#ifdef FUSIONRT_ENABLE_VULKAN
+#include "../src/models/vulkan_session.h"
+#endif
 #include "test_support.h"
 #include <future>
+#include <tuple>
 
 namespace fusionrt::test {
 namespace {
@@ -16,6 +20,61 @@ struct TestFile {
     std::string path;
     ~TestFile() { std::filesystem::remove(path); }
 };
+
+#ifdef FUSIONRT_ENABLE_VULKAN
+void test_vulkan_dense_kv_reset() {
+    VkContext vk(0, 32, 32);
+    HybridModelConfig cfg;
+    cfg.vocab_size = 32;
+    cfg.num_layers = 2;
+    cfg.dense.hidden_size = cfg.dense.intermediate_size = 64;
+    cfg.dense.num_attention_heads = 2;
+    cfg.dense.num_key_value_heads = 1;
+    cfg.dense.head_dim = 32;
+    cfg.dense.max_seq_len = 16;
+
+    VulkanSessionManager sessions;
+    const std::vector<int64_t> shape{cfg.dense.max_seq_len, cfg.dense.num_key_value_heads, cfg.dense.head_dim};
+    const Tensor ones = vk.upload(make_ones_f32(shape), false);
+    const vk_ops::PushResidual fill{static_cast<int>(ones.numel())};
+    const auto groups = static_cast<uint32_t>((fill.n + 255) / 256);
+    for (int layer = 0; layer < cfg.num_layers; ++layer) {
+        sessions.allocate_dense(vk, cfg.dense);
+        const auto& kv = sessions.dense(layer);
+        for (const auto* cache : {&kv.key, &kv.value}) {
+            vk.dispatch_single({"add_residual.comp", groups, 1, 1, {ones, ones, *cache}, &fill, sizeof(fill)});
+        }
+    }
+    sessions.reset_kv_and_state_vulkan(vk);
+    for (int layer = 0; layer < cfg.num_layers; ++layer) {
+        const auto& kv = sessions.dense(layer);
+        for (const auto* cache : {&kv.key, &kv.value}) {
+            const auto cleared = vk.download(*cache);
+            require(std::all_of(cleared.data<float>(), cleared.data<float>() + fill.n,
+                                [](float value) { return value == 0.0f; }),
+                    "Vulkan reset must zero every element of both Dense KV caches");
+        }
+    }
+
+    FusionModel model(cfg);
+    model.init_synthetic_vulkan(vk, 781);
+    const auto after_reset = [&](int32_t old_token) {
+        for (int pos = 0; pos < 3; ++pos) {
+            (void)model.forward_token_vulkan(vk, old_token + pos, pos);
+        }
+        model.reset_kv_and_state_vulkan(vk);
+        // Probe without overwriting the prior slots, so any stale KV can affect the logits.
+        const auto probe = model.forward_token_vulkan(vk, 9, 3);
+        const auto first = model.generate_vulkan(vk, {1, 5}, 2, nullptr, true);
+        const auto second = model.generate_vulkan(vk, {7}, 2, nullptr, true, static_cast<int>(first.size()));
+        return std::tuple{probe, first, second};
+    };
+    const auto first_run = after_reset(2);
+    const auto second_run = after_reset(17);
+    require(first_run == second_run, "Vulkan Dense KV reset must isolate repeat turns from old histories");
+    std::cout << "  [PASS] Vulkan Dense KV reset clears K and V and isolates repeat turns\n";
+}
+#endif
 
 }  // namespace
 
@@ -110,6 +169,9 @@ void test_wave1_inputs() {
             cancelled.body().as_object().at("status").as_string() == "incomplete",
             "A cancelled response was reported as completed");
     std::cout << "  [PASS] Wave 1 CPU quantization, metadata validation and terminal protocol contracts\n";
+#ifdef FUSIONRT_ENABLE_VULKAN
+    test_vulkan_dense_kv_reset();
+#endif
 }
 
 #ifdef FUSIONRT_ENABLE_CUDA
