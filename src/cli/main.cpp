@@ -50,6 +50,7 @@ void print_usage() {
               << "  fusionrt chat --model <path> [--system <text>] [--temp 0.7] [--max-tokens 512]\n"
               << "  fusionrt serve --model <path> [--mmproj <gguf>] [--image <preset> ...]\n"
               << "                 [--host 127.0.0.1] [--port 8080] [--max-seq 4096] [--slots 1] [--profile <json>]\n"
+              << "                 [--spec-ngram <k> | --draft-model <gguf> [--draft-tokens 4]]\n"
               << "  fusionrt bench-model --model <path> [--pp 128] [--tg 64] [--decode-prefix 0] [--ubatch 512] [--reps 5] [--graph] [--profile-ops <json>]\n"
               << "  CUDA run, chat, serve, inspect and bench-model accept --kv-type {f32|f16|q8_0}.\n"
               << "  CUDA placement options: --kv-vram-mb <MiB> (0: auto), --host-kv-mb <MiB> (0: disabled),\n"
@@ -205,6 +206,20 @@ const char* stop_reason(int generated, int steps, bool eos, bool context_full) {
 #endif
 
 #ifdef FUSIONRT_ENABLE_CUDA
+std::unique_ptr<FusionModel> load_draft_model(CudaContext& ctx, const BpeTokenizer& target,
+                                              const cli::SpeculativeArgs& args, int max_seq) {
+    if (args.draft_path.empty()) return {};
+    BpeTokenizer tokenizer;
+    load_tokenizer(tokenizer, args.draft_path);
+    if (!target.has_compatible_vocab(tokenizer))
+        throw std::invalid_argument("Draft tokenizer must have the same vocabulary and EOS as the target");
+    auto draft = std::make_unique<FusionModel>(HybridModelConfig{});
+    std::string error;
+    if (!draft->load_gguf(ctx, args.draft_path, &error, max_seq, true))
+        throw std::runtime_error("Error loading draft model: " + error);
+    return draft;
+}
+
 void load_cuda_model(CudaContext& ctx, FusionModel& model, const std::string& path, int max_seq,
                      const std::string& profile) {
     model.set_device_profile(ctx, DeviceProfile::load(profile));
@@ -291,6 +306,7 @@ int cmd_daily(const std::string& cmd, int argc, char** argv) {
     sampling.repeat_penalty = 1.1f;
     DType kv_dtype = DType::F32;
     CudaPlacementOptions placement;
+    cli::SpeculativeArgs speculative;
     for (int i = 2; i < argc; ++i) {
         const std::string arg = argv[i];
         if (arg == "--graph" || arg == "--no-graph") {
@@ -312,6 +328,7 @@ int cmd_daily(const std::string& cmd, int argc, char** argv) {
         else if (cmd == "serve" && arg == "--port") port = parse_integer(arg, value);
         else if (cmd == "serve" && arg == "--mmproj") mmproj = value;
         else if (cmd == "serve" && arg == "--image") image_paths.push_back(value);
+        else if (cmd == "serve" && speculative.parse(arg, value)) continue;
         else if (cmd == "serve" && arg == "--slots") {
             slots = parse_integer(arg, value);
             if (slots < 1) throw std::invalid_argument("Expected --slots >= 1");
@@ -326,6 +343,7 @@ int cmd_daily(const std::string& cmd, int argc, char** argv) {
         throw std::invalid_argument("Expected --model and positive context, generation length and port");
     }
     sampling.validate();
+    speculative.validate(!path.empty());
     if (!image_paths.empty() && mmproj.empty()) throw std::invalid_argument("--image requires --mmproj");
     GgufFile header;
     const bool inspect_gguf = cmd == "inspect" && is_gguf(path);
@@ -480,9 +498,11 @@ int cmd_daily(const std::string& cmd, int argc, char** argv) {
     if (cmd == "chat") return interactive_chat(ctx, model, tokenizer, system, sampling, steps, true, graph, true);
     std::unique_ptr<VisionEncoder> vision;
     if (!mmproj.empty()) vision = std::make_unique<VisionEncoder>(ctx, mmproj, model.config().dense.hidden_size);
+    auto draft = load_draft_model(ctx, tokenizer, speculative, max_seq);
     std::vector<Image> preset_images;
     for (const auto& image_path : image_paths) preset_images.push_back(load_image(image_path));
-    serve_http(ctx, model, tokenizer, model_filename(path), host, port, graph, vision.get(), preset_images);
+    serve_http(ctx, model, tokenizer, model_filename(path), host, port, graph, vision.get(), preset_images,
+               {speculative.ngram, draft.get(), speculative.draft_tokens});
     return 0;
 #endif
 }
@@ -563,12 +583,11 @@ int cmd_run(int argc, char** argv) {
     std::string dtype_s = "f32";
     std::string backend_s = "cuda";
     std::string model_path;
-    std::string draft_path;
     std::string mmproj;
     std::vector<std::string> image_paths;
     std::string prompt = "Hello fusionrt";
     std::optional<int> steps_option;
-    int spec_ngram = 0, draft_tokens = 4;
+    cli::SpeculativeArgs speculative;
     int max_seq = 4096;
     int vk_dev = 0;
     std::optional<bool> graph_option;
@@ -576,7 +595,7 @@ int cmd_run(int argc, char** argv) {
     CudaPlacementOptions placement;
     SamplingParams sampling;
     std::string profile, profile_ops, layer_trace;
-    bool stream = false, sampling_set = false, json_grammar = false, draft_tokens_set = false;
+    bool stream = false, sampling_set = false, json_grammar = false;
     bool use_fused = true;
     bool chat_mode = false;
     bool ignore_eos = false;
@@ -590,14 +609,9 @@ int cmd_run(int argc, char** argv) {
         else if (a == "--vk-device" && i + 1 < argc) vk_dev = parse_integer(a, argv[++i]);
         else if (a == "--model" && i + 1 < argc) model_path = argv[++i];
         else if (a == "--json-grammar") json_grammar = true;
-        else if (a == "--spec-ngram" && i + 1 < argc) spec_ngram = parse_integer(a, argv[++i]);
-        else if (a == "--draft-model" && i + 1 < argc) draft_path = argv[++i];
+        else if (i + 1 < argc && speculative.parse(a, argv[i + 1])) ++i;
         else if (a == "--mmproj" && i + 1 < argc) mmproj = argv[++i];
         else if (a == "--image" && i + 1 < argc) image_paths.push_back(argv[++i]);
-        else if (a == "--draft-tokens" && i + 1 < argc) {
-            draft_tokens = parse_integer(a, argv[++i]);
-            draft_tokens_set = true;
-        }
         else if (a == "--prompt" && i + 1 < argc) prompt = argv[++i];
         else if (a == "--steps" && i + 1 < argc) steps_option = parse_integer(a, argv[++i]);
         else if (a == "--max-seq" && i + 1 < argc) max_seq = parse_integer(a, argv[++i]);
@@ -625,15 +639,10 @@ int cmd_run(int argc, char** argv) {
     if (!image_paths.empty() && mmproj.empty()) throw std::invalid_argument("--image requires --mmproj");
     if (!mmproj.empty() && (backend_s != "cuda" || chat_mode))
         throw std::invalid_argument("--mmproj requires non-interactive CUDA run");
-    if (!image_paths.empty() && (spec_ngram > 0 || !draft_path.empty()))
+    if (!image_paths.empty() && speculative.enabled())
         throw std::invalid_argument("Image input requires standard decoding");
-    if (spec_ngram < 0 || draft_tokens <= 0 || (draft_tokens_set && draft_path.empty())) {
-        throw std::invalid_argument("Expected --spec-ngram >= 0 and --draft-tokens > 0 with --draft-model");
-    }
-    if (!draft_path.empty() && (!is_gguf(draft_path) || model_path.empty() || spec_ngram > 0)) {
-        throw std::invalid_argument("--draft-model requires a GGUF draft, a target model, and no --spec-ngram");
-    }
-    if ((json_grammar || spec_ngram > 0 || !draft_path.empty()) && (backend_s != "cuda" || chat_mode)) {
+    speculative.validate(!model_path.empty());
+    if ((json_grammar || speculative.enabled()) && (backend_s != "cuda" || chat_mode)) {
         throw std::invalid_argument("JSON grammar and speculative decoding require non-interactive CUDA run");
     }
 
@@ -676,19 +685,7 @@ int cmd_run(int argc, char** argv) {
         }
         std::unique_ptr<VisionEncoder> vision;
         if (!mmproj.empty()) vision = std::make_unique<VisionEncoder>(ctx, mmproj, model.config().dense.hidden_size);
-        std::unique_ptr<FusionModel> draft;
-        if (!draft_path.empty()) {
-            BpeTokenizer draft_tok;
-            load_tokenizer(draft_tok, draft_path);
-            if (!tok.has_compatible_vocab(draft_tok)) {
-                throw std::invalid_argument("Draft tokenizer must have the same vocabulary and EOS as the target");
-            }
-            draft = std::make_unique<FusionModel>(HybridModelConfig{});
-            std::string error;
-            if (!draft->load_gguf(ctx, draft_path, &error, max_seq, true)) {
-                throw std::runtime_error("Error loading draft model: " + error);
-            }
-        }
+        auto draft = load_draft_model(ctx, tok, speculative, max_seq);
         const bool use_graph = graph_option.value_or(model.recommended_cuda_graph());
         const bool stop_on_eos = !model_path.empty() && !ignore_eos;
         const double load_ms = std::chrono::duration<double, std::milli>(
@@ -702,17 +699,22 @@ int cmd_run(int argc, char** argv) {
             for (size_t i = 0; i < image_paths.size(); ++i) prefix += image_placeholder;
             prompt = prefix + prompt;
         }
-        std::string final_prompt = use_chatml && tok.has_chatml()
-            ? "<|im_start|>user\n" + prompt + "<|im_end|>\n<|im_start|>assistant\n"
-            : prompt;
+        std::string final_prompt = prompt;
+        if (!image_paths.empty() && model.config().model_architecture == "gemma4" && !prompt.starts_with("<|turn>"))
+            final_prompt = tok.format_chat_messages({{"user", prompt}});
+        else if (use_chatml && tok.has_chatml())
+            final_prompt = "<|im_start|>user\n" + prompt + "<|im_end|>\n<|im_start|>assistant\n";
         VisionPrompt prepared;
+        double vision_ms = 0;
         if (image_paths.empty()) prepared.tokens = tok.encode(final_prompt, true);
         else {
+            const auto image_start = std::chrono::steady_clock::now();
             std::vector<Image> images;
             std::vector<const Image*> refs;
             for (const auto& path : image_paths) images.push_back(load_image(path));
             for (const auto& image : images) refs.push_back(&image);
             prepared = encode_vision_prompt(ctx, *vision, tok, final_prompt, refs, model.config().dense.max_seq_len);
+            vision_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - image_start).count();
         }
         auto& prompt_ids = prepared.tokens;
         if (prompt_ids.empty()) prompt_ids.push_back(1);
@@ -724,9 +726,9 @@ int cmd_run(int argc, char** argv) {
         GenerationOptions options;
         options.sampling = sampling;
         options.json_constraint = constraint ? &*constraint : nullptr;
-        options.spec_ngram = spec_ngram;
+        options.spec_ngram = speculative.ngram;
         options.draft_model = draft.get();
-        options.draft_tokens = draft_tokens;
+        options.draft_tokens = speculative.draft_tokens;
         options.inputs_embeds = prepared.inputs_embeds;
         options.op_trace = profile_ops.empty() ? nullptr : &op_trace;
         options.layer_trace = layer_trace.empty() ? nullptr : &trace;
@@ -761,7 +763,12 @@ int cmd_run(int argc, char** argv) {
                   << " prefill_tok/s=" << st.prefill_tok_per_s
                   << " decode_ms=" << st.decode_ms
                   << " decode_tok/s=" << st.decode_tok_per_s;
-        if (spec_ngram > 0 || draft) {
+        if (!image_paths.empty()) {
+            int64_t image_tokens = 0;
+            for (const auto& embedding : prepared.inputs_embeds) image_tokens += embedding.rows.shape[0];
+            std::cout << " image_tokens=" << image_tokens << " vision_ms=" << vision_ms;
+        }
+        if (speculative.enabled()) {
             const double rate = st.spec_proposed ? static_cast<double>(st.spec_accepted) / st.spec_proposed : 0.0;
             std::cout << " spec_proposed=" << st.spec_proposed << " spec_accepted=" << st.spec_accepted
                       << " accept_rate=" << rate;

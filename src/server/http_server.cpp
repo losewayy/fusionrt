@@ -203,16 +203,16 @@ template<class Emit>
 Completion generate(CudaContext& ctx, FusionModel& model, const BpeTokenizer& tokenizer,
                     const std::vector<int32_t>& prompt, const agent::GenerationParams& params,
                     int limit, std::optional<bool> graph, bool reuse_prefix, Emit emit,
-                    const JsonConstraint* constraint = nullptr, std::span<const InputEmbedding> embeds = {}) {
+                    const JsonConstraint* constraint, std::span<const InputEmbedding> embeds,
+                    const ServeSpeculation& speculation) {
     StopBuffer stop{params.stops, {}, false};
     Utf8StreamDecoder utf8;
     Completion completion;
     bool connected = true;
-    GenerationOptions opts;
+    auto opts = speculation.for_inputs(embeds);
     opts.sampling = params.sampling;
     opts.reuse_prefix = reuse_prefix;
     opts.json_constraint = constraint;
-    opts.inputs_embeds = embeds;
     opts.warn_on_graph_fallback = graph.value_or(false);
     opts.on_token = [&](int32_t id) {
         if (tokenizer.is_end_of_generation(id)) {
@@ -235,7 +235,8 @@ Completion generate(CudaContext& ctx, FusionModel& model, const BpeTokenizer& to
 
 void complete(SocketHandle fd, CudaContext& ctx, FusionModel& model, const BpeTokenizer& tokenizer,
               const std::string& name, const std::vector<int32_t>& prompt, const agent::GenerationParams& params,
-              int context, std::optional<bool> graph, uint64_t request_id, std::span<const InputEmbedding> embeds = {}) {
+              int context, std::optional<bool> graph, uint64_t request_id, std::span<const InputEmbedding> embeds,
+              const ServeSpeculation& speculation) {
     const int64_t created = std::time(nullptr);
     const std::string id = "cmpl-" + std::to_string(created) + "-" + std::to_string(request_id);
     auto response = [&](JsonObject choice) {
@@ -256,7 +257,7 @@ void complete(SocketHandle fd, CudaContext& ctx, FusionModel& model, const BpeTo
     };
     Completion completion;
     try {
-        completion = generate(ctx, model, tokenizer, prompt, params, limit, graph, true, emit, nullptr, embeds);
+        completion = generate(ctx, model, tokenizer, prompt, params, limit, graph, true, emit, nullptr, embeds, speculation);
     } catch (const std::exception& e) {
         if (!params.stream) throw;
         if (connected && event(JsonObject{{"error", JsonObject{{"message", e.what()}, {"type", "server_error"}}}})) {
@@ -281,7 +282,7 @@ void complete_agent(SocketHandle fd, CudaContext& ctx, FusionModel& model, const
                     const std::string& name, agent::Protocol protocol, const agent::AgentRequest& request,
                     const agent::AgentPrompt& rendered, const std::vector<int32_t>& prompt,
                     int context, std::optional<bool> graph, uint64_t request_id, const JsonConstraint* constraint,
-                    std::span<const InputEmbedding> embeds) {
+                    std::span<const InputEmbedding> embeds, const ServeSpeculation& speculation) {
     const int64_t created = std::time(nullptr);
     const char* prefix = protocol == agent::Protocol::chat ? "chatcmpl-" :
                          protocol == agent::Protocol::responses ? "resp_" : "msg_";
@@ -304,7 +305,7 @@ void complete_agent(SocketHandle fd, CudaContext& ctx, FusionModel& model, const
                 if (constraint) response.text(text);
                 else parser.push(text);
                 return response.connected();
-            }, constraint, embeds);
+            }, constraint, embeds, speculation);
         if (!response.connected()) return;
         parser.finish();
         if ((request.choice == agent::Choice::required || request.choice == agent::Choice::named) &&
@@ -348,7 +349,7 @@ SocketHandle listen_on(const std::string& host, int port) {
 
 void serve_http(CudaContext& ctx, FusionModel& model, const BpeTokenizer& tokenizer,
                 const std::string& model_name, const std::string& host, int port, std::optional<bool> graph,
-                const VisionEncoder* vision, std::span<const Image> preset_images) {
+                const VisionEncoder* vision, std::span<const Image> preset_images, ServeSpeculation speculation) {
     if (!vision && !preset_images.empty()) throw std::invalid_argument("Preset images require --mmproj");
     [[maybe_unused]] SocketRuntime sockets;
     Socket listener(listen_on(host, port));
@@ -388,7 +389,10 @@ void serve_http(CudaContext& ctx, FusionModel& model, const BpeTokenizer& tokeni
             if (req->method == "OPTIONS") {
                 send_all(fd, std::string("HTTP/1.1 204 No Content\r\nConnection: close\r\n") + cors + "\r\n");
             } else if (req->method == "GET" && req->path == "/health") {
-                reply(fd, "200 OK", http::health_body(model_name, cfg, model.num_slots(), model.cuda_cache_memory()));
+                auto health = http::health_body(model_name, cfg, model.num_slots(), model.cuda_cache_memory());
+                health["vision"] = vision != nullptr;
+                health["speculative"] = speculation.ngram > 0 || speculation.draft != nullptr;
+                reply(fd, "200 OK", health);
             } else if (req->method == "GET" && req->path == "/v1/models") {
                 reply(fd, "200 OK", JsonObject{{"object", "list"}, {"data", JsonArray{JsonObject{
                       {"id", model_name}, {"object", "model"}, {"created", int64_t{0}}, {"owned_by", "fusionrt"}}}}});
@@ -416,7 +420,7 @@ void serve_http(CudaContext& ctx, FusionModel& model, const BpeTokenizer& tokeni
                         constraint = &json_constraints.try_emplace(root, tokenizer, cfg.vocab_size, root).first->second;
                     }
                     complete_agent(fd, ctx, model, tokenizer, model_name, *protocol, input, rendered, prompt.tokens,
-                                   context, graph, ++request_id, constraint, prompt.inputs_embeds);
+                                   context, graph, ++request_id, constraint, prompt.inputs_embeds, speculation);
                 } else {
                     const auto& text = agent::field(obj, "prompt");
                     if (!text.is_string()) throw std::invalid_argument("prompt must be a string");
@@ -435,7 +439,7 @@ void serve_http(CudaContext& ctx, FusionModel& model, const BpeTokenizer& tokeni
                         prompt = encode_vision_prompt(ctx, *vision, tokenizer, marked + text.as_string(), images, offsets, context);
                     }
                     complete(fd, ctx, model, tokenizer, model_name, prompt.tokens, params, context, graph,
-                             ++request_id, prompt.inputs_embeds);
+                             ++request_id, prompt.inputs_embeds, speculation);
                 }
             } else error(fd, "404 Not Found", "Unknown route", protocol);
         } catch (const http::PayloadTooLarge& e) {

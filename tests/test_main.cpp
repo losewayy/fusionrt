@@ -3,6 +3,7 @@
 #include "fusionrt/gguf.h"
 #include "fusionrt/models.h"
 #include "fusionrt/safetensors.h"
+#include "fusionrt/server.h"
 #include "fusionrt/tokenizer.h"
 #include "fusionrt/vision.h"
 #include "agent.h"
@@ -2419,9 +2420,8 @@ void test_stage7b_cuda_vision() {
     if (logits_a == logits_b) throw std::runtime_error("Different images produced identical logits");
     GenerationStats stats;
     auto generate = [&](const VisionPrompt& p) {
-        GenerationOptions op;
+        auto op = ServeSpeculation{4}.for_inputs(p.inputs_embeds);
         op.reuse_prefix = true;
-        op.inputs_embeds = p.inputs_embeds;
         auto ids = model.generate_cuda(ctx, p.tokens, 6, true, true, &stats, false, 0, -1, op);
         if (stats.prefilled_tokens != static_cast<int>(p.tokens.size())) throw std::runtime_error("Vision prefix reused text KV");
         return ids;
@@ -2436,6 +2436,82 @@ void test_stage7b_cuda_vision() {
     model.prefill_cached_cuda(ctx, a.tokens, true, &prefilled);
     if (prefilled != 1) throw std::runtime_error("Vision request invalidated unrelated text slot");
     std::cout << "  [PASS] mmproj vision encode and chunked CUDA splice, distinct image tokens, isolated prefix slots\n";
+}
+
+void test_gemma4v_vision() {
+    CudaContext ctx(0, 0, 32);
+    constexpr int H = 64, side = 32;
+    struct Fixture {
+        std::string path = "test-gemma4v-mmproj.gguf";
+        ~Fixture() { std::error_code ec; std::filesystem::remove(path, ec); }
+    } fixture;
+    const std::map<std::string, GgufMetaValue> meta{
+        {"general.architecture", std::string("clip")}, {"clip.vision.projector_type", std::string("gemma4v")},
+        {"clip.vision.patch_size", uint32_t{1}}, {"clip.vision.image_size", uint32_t{12}},
+        {"clip.vision.embedding_length", uint32_t{H}}, {"clip.vision.block_count", uint32_t{1}},
+        {"tokenizer.ggml.model", std::string("gemma4")},
+        {"tokenizer.ggml.tokens", std::vector<std::string>{
+            "<pad>", "<bos>", "<unk>", "<|image>", "<image|>", "<|image|>", "a", "z"}},
+        {"tokenizer.ggml.bos_token_id", uint32_t{1}}, {"tokenizer.ggml.add_bos_token", true}
+    };
+    HostTensor patch({H, 3, 1, 1}, DType::F16), projection({H, H}, DType::F16);
+    patch.data<uint16_t>()[0] = 0x3c00;
+    for (int i = 0; i < H; ++i) projection.data<uint16_t>()[i * H + i] = 0x3c00;
+    HostTensor positions({2, side, H}, DType::F32), post_norm({H}, DType::F32), clamp({1}, DType::F32);
+    for (int i = 0; i < side; ++i) {
+        positions.data<float>()[i * H + 1] = static_cast<float>(i) / side;
+        positions.data<float>()[(side + i) * H + 2] = static_cast<float>(i) / side;
+    }
+    post_norm.data<float>()[3] = 1.f;
+    clamp.data<float>()[0] = 0.25f;
+    const auto ones = make_ones_f32({H});
+    const HostTensor zero({H, H}, DType::F32);
+    const std::vector<std::pair<std::string, HostTensor>> tensors{
+        {"v.patch_embd.weight", patch}, {"v.position_embd.weight", positions},
+        {"v.blk.0.ln1.weight", ones}, {"v.blk.0.ln2.weight", ones},
+        {"v.blk.0.attn_q.weight", zero}, {"v.blk.0.attn_k.weight", zero}, {"v.blk.0.attn_v.weight", zero},
+        {"v.blk.0.attn_q_norm.weight", ones}, {"v.blk.0.attn_k_norm.weight", ones},
+        {"v.blk.0.attn_out.weight", zero}, {"v.blk.0.attn_out.output_min", clamp},
+        {"v.blk.0.attn_out.output_max", clamp}, {"v.blk.0.attn_post_norm.weight", post_norm},
+        {"v.blk.0.ffn_gate.weight", zero}, {"v.blk.0.ffn_up.weight", zero}, {"v.blk.0.ffn_down.weight", zero},
+        {"v.blk.0.ffn_post_norm.weight", ones}, {"mm.input_projection.weight", projection},
+        {"a.test.weight", zero}, {"mm.a.test.weight", zero}
+    };
+    std::string error;
+    GgufFile file;
+    BpeTokenizer tokenizer;
+    if (!GgufFile::write_v3(fixture.path, meta, tensors, &error) ||
+        !file.load(fixture.path, &error) || !tokenizer.load_from_gguf(file))
+        throw std::runtime_error("Gemma 4 vision fixture: " + error);
+    VisionEncoder encoder(ctx, fixture.path, H);
+    const auto red = decode_image_base64("UDYKMSAxCjI1NQr/AAA=");
+    const auto green = decode_image_base64("UDYKMSAxCjI1NQoA/wA=");
+    constexpr int grid = 9, count = grid * grid;
+    double diff = 0, base = 0;
+    for (const auto* image : {&red, &green}) {
+        const auto prompt = encode_vision_prompt(ctx, encoder, tokenizer, "a<image>z", {&image, 1}, 128);
+        std::vector<int32_t> expected{1, 6, 3};
+        expected.insert(expected.end(), count, 0);
+        expected.insert(expected.end(), {4, 7});
+        if (prompt.tokens != expected || prompt.inputs_embeds.size() != 1 || prompt.inputs_embeds[0].start != 3 ||
+            prompt.inputs_embeds[0].rows.shape[0] != count)
+            throw std::runtime_error("Gemma 4 vision grid or image framing");
+        const auto output = ctx.download(prompt.inputs_embeds[0].rows);
+        for (int y = 0; y < grid; ++y) for (int x = 0; x < grid; ++x) {
+            std::array<double, H> ref{image->rgb[0] > 0 ? 1.0 : -1.0, (x * 3 + 1.0) / side, (y * 3 + 1.0) / side,
+                                      0.25 / std::sqrt(0.0625 + 1e-6)};
+            const auto rms = std::sqrt(std::inner_product(ref.begin(), ref.end(), ref.begin(), 0.0) / H + 1e-6 / H);
+            for (int d = 0; d < H; ++d) {
+                const double want = ref[d] / rms;
+                const double delta = output.data<float>()[(y * grid + x) * H + d] - want;
+                diff += delta * delta;
+                base += want * want;
+            }
+        }
+    }
+    const double rel = std::sqrt(diff / base);
+    if (!(rel < 5e-4)) throw std::runtime_error("Gemma 4 vision projection relative error: " + std::to_string(rel));
+    std::cout << "  [PASS] Gemma 4 vision resizing, RGB projection, pooling and image framing rel_l2=" << rel << '\n';
 }
 #endif
 
@@ -2611,7 +2687,32 @@ void test_review_input_validation() {
             reject([&] { (void)cli::parse_integer(option, value); });
         if (cli::parse_integer(option, "4") != 4) throw std::runtime_error("CLI integer parser rejected a valid value");
     }
+    cli::SpeculativeArgs speculative;
+    if (!speculative.parse("--spec-ngram", "4")) throw std::runtime_error("Missing --spec-ngram");
+    speculative.validate(true);
+    const ServeSpeculation lookup{speculative.ngram};
+    const InputEmbedding image{};
+    const auto lookup_text = lookup.for_inputs({});
+    const auto lookup_image = lookup.for_inputs({&image, 1});
+    if (lookup_text.spec_ngram != 4 || lookup_image.spec_ngram != 0 || lookup_image.inputs_embeds.data() != &image)
+        throw std::runtime_error("Serve prompt lookup must bypass image embeddings");
+    if (!speculative.parse("--draft-model", "draft.gguf") || !speculative.parse("--draft-tokens", "6"))
+        throw std::runtime_error("Missing serve draft arguments");
+    reject([&] { speculative.validate(true); });
+    speculative.parse("--spec-ngram", "0");
+    reject([&] { speculative.validate(false); });
+    speculative.validate(true);
+    FusionModel draft(HybridModelConfig{});
+    const ServeSpeculation companion{speculative.ngram, &draft, speculative.draft_tokens};
+    const auto draft_text = companion.for_inputs({});
+    const auto draft_image = companion.for_inputs({&image, 1});
+    if (draft_text.draft_model != &draft || draft_text.draft_tokens != 6 ||
+        draft_image.draft_model || draft_image.inputs_embeds.data() != &image)
+        throw std::runtime_error("Serve draft model must bypass image embeddings");
+    speculative.draft_path.clear();
+    reject([&] { speculative.validate(true); });
     std::cout << "  [PASS] JSON nesting, schema/root and tool choice, JSON output budget, HTTP 413, and strict CLI integers\n";
+    std::cout << "  [PASS] Serve speculative flags, mode validation and multimodal bypass\n";
 }
 
 void test_review_gguf_validation() {
@@ -3814,6 +3915,7 @@ int main() {
         test_stage7a_speculative();
         test_review_speculation();
         test_stage7b_cuda_vision();
+        test_gemma4v_vision();
         test_chunked_prefill_and_k_quant_gdn();
         test_cuda_session_slots();
         test_tiered_cuda_kv();

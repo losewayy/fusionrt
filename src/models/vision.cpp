@@ -94,6 +94,80 @@ float bilinear(float x, float y, int w, int h, Sample sample) {
                 lerp(sample(x0, y1), sample(x1, y1), x - x0), y - y0);
 }
 
+// Gemma 4 budgets image tokens after pooling. Align both axes to whole pooling cells.
+constexpr int gemma4_min_image_tokens = 70;
+constexpr int gemma4_max_image_tokens = 1120;
+
+std::pair<int, int> gemma4_image_grid(const Image& image, int cell) {
+    const double w = static_cast<double>(image.width) / cell;
+    const double h = static_cast<double>(image.height) / cell;
+    int nx = std::max(1, static_cast<int>(std::round(w)));
+    int ny = std::max(1, static_cast<int>(std::round(h)));
+    if (nx * ny < gemma4_min_image_tokens) {
+        const double scale = std::sqrt(gemma4_min_image_tokens / (w * h));
+        nx = static_cast<int>(std::ceil(w * scale));
+        ny = static_cast<int>(std::ceil(h * scale));
+    } else if (nx * ny > gemma4_max_image_tokens) {
+        const double scale = std::sqrt(gemma4_max_image_tokens / (w * h));
+        nx = std::max(1, static_cast<int>(std::floor(w * scale)));
+        ny = std::max(1, static_cast<int>(std::floor(h * scale)));
+    }
+    return {nx, ny};
+}
+
+// Pillow bicubic coefficients, with antialiasing when downsampling and RGB8 rounding per pass.
+void resize_cubic_axis(const Image& src, Image& dst, bool horizontal) {
+    const int in = horizontal ? src.width : src.height;
+    const int out = horizontal ? dst.width : dst.height;
+    const int lines = horizontal ? src.height : src.width;
+    const size_t src_step = horizontal ? 3 : static_cast<size_t>(src.width) * 3;
+    const size_t dst_step = horizontal ? 3 : static_cast<size_t>(dst.width) * 3;
+    const size_t src_line = horizontal ? static_cast<size_t>(src.width) * 3 : 3;
+    const size_t dst_line = horizontal ? static_cast<size_t>(dst.width) * 3 : 3;
+    constexpr int precision = 22;
+    const double scale = static_cast<double>(in) / out;
+    const double support = std::max(1.0, scale);
+    std::vector<double> weights(static_cast<size_t>(std::ceil(4 * support)) + 1);
+    std::vector<int> fixed(weights.size());
+    for (int i = 0; i < out; ++i) {
+        const double center = (i + 0.5) * scale;
+        const int begin = std::max(0, static_cast<int>(center - 2 * support + 0.5));
+        const int end = std::min(in, static_cast<int>(center + 2 * support + 0.5));
+        double sum = 0;
+        for (int j = begin; j < end; ++j) {
+            const double x = std::abs(j + 0.5 - center) / support;
+            const double weight = x < 1 ? ((1.5 * x - 2.5) * x * x + 1) :
+                                  x < 2 ? ((-0.5 * x + 2.5) * x - 4) * x + 2 : 0;
+            weights[j - begin] = weight;
+            sum += weight;
+        }
+        for (int j = 0; j < end - begin; ++j)
+            fixed[j] = static_cast<int>(std::lround(weights[j] / sum * (1 << precision)));
+        for (int line = 0; line < lines; ++line) {
+            const auto* pixel = src.rgb.data() + line * src_line + begin * src_step;
+            std::array<int, 3> rgb{1 << (precision - 1), 1 << (precision - 1), 1 << (precision - 1)};
+            for (int j = 0; j < end - begin; ++j)
+                for (int c = 0; c < 3; ++c) rgb[c] += pixel[j * src_step + c] * fixed[j];
+            auto* target = dst.rgb.data() + line * dst_line + i * dst_step;
+            for (int c = 0; c < 3; ++c) target[c] = static_cast<uint8_t>(std::clamp(rgb[c] >> precision, 0, 255));
+        }
+    }
+}
+
+Image resize_gemma4_image(const Image& src, int width, int height) {
+    Image result{width, height, std::vector<uint8_t>(static_cast<size_t>(width) * height * 3)};
+    if (src.width == width) {
+        resize_cubic_axis(src, result, false);
+    } else if (src.height == height) {
+        resize_cubic_axis(src, result, true);
+    } else {
+        Image horizontal{width, src.height, std::vector<uint8_t>(static_cast<size_t>(width) * src.height * 3)};
+        resize_cubic_axis(src, horizontal, true);
+        resize_cubic_axis(horizontal, result, false);
+    }
+    return result;
+}
+
 void copy_rows(CudaContext& ctx, float* dst, const float* src, size_t size) {
     FUSIONRT_CUDA_CHECK(cudaMemcpyAsync(dst, src, size * sizeof(float), cudaMemcpyDeviceToDevice, ctx.stream()));
 }
@@ -132,7 +206,7 @@ VisionEncoder::VisionEncoder(CudaContext& ctx, const std::string& path, int text
     w.eps = static_cast<float>(file.get_float("clip.vision.attention.layer_norm_epsilon", 1e-6));
     w.theta = static_cast<float>(file.get_float("clip.vision.rope.freq_base", w.qwen ? 10000 : w.gemma4 ? 100 : 0));
     w.rms = qwen25 || w.gemma4 || file.get_bool("clip.vision.use_rms_norm", false);
-    w.gelu = !file.get_bool("clip.use_silu", qwen25);
+    w.gelu = w.gemma4 || !file.get_bool("clip.use_silu", qwen25);
     w.quick = !w.qwen && !w.gemma && file.find_tensor("v.class_embd") && !file.get_bool("clip.use_gelu", false);
     w.window_pattern = static_cast<int>(file.get_int("clip.vision.n_wa_pattern", 0));
     w.window = static_cast<int>(file.get_int("clip.vision.window_size", 112)) / (P * g.spatial_merge) * g.spatial_merge;
@@ -155,6 +229,7 @@ VisionEncoder::VisionEncoder(CudaContext& ctx, const std::string& path, int text
     size_t bytes = 256 + (w.gemma4 ? (static_cast<size_t>(hd) * sizeof(float) + 255) & ~size_t{255} : 0);
     for (const auto& t : file.tensors()) {
         if ((!t.name.starts_with("v.") && !t.name.starts_with("mm.")) || t.name == "v.position_embd.weight") continue;
+        if (t.name.starts_with("mm.a.")) continue;
         if (t.name.find("deepstack") != std::string::npos)
             throw std::invalid_argument("Unsupported mmproj extension tensor: " + t.name);
         const size_t n = t.shape.size() == 1 ? static_cast<size_t>(t.shape[0]) * sizeof(float) : t.nbytes;
@@ -296,13 +371,20 @@ VisionEmbedding VisionEncoder::encode(CudaContext& ctx, const Image& image, int 
         throw std::invalid_argument("Invalid RGB image");
     const int limit = std::max(1, g.image_size / (P * merge));
     int gx = limit * merge, gy = gx;
-    if (w.qwen || w.gemma4) {
+    if (w.gemma4) {
+        const auto [nx, ny] = gemma4_image_grid(image, P * merge);
+        gx = nx * merge;
+        gy = ny * merge;
+    } else if (w.qwen) {
         const int side = std::max(image.width, image.height);
         gx = std::max(1, (image.width * limit + side / 2) / side) * merge;
         gy = std::max(1, (image.height * limit + side / 2) / side) * merge;
     }
-    const int patches = gx * gy, count = patches / (merge * merge);
-    if (patches > 4096 || count >= max_tokens) throw std::invalid_argument("Image patches exceed the vision or text context");
+    const auto patch_count = static_cast<int64_t>(gx) * gy;
+    const int patch_limit = w.gemma4 ? gemma4_max_image_tokens * merge * merge : 4096;
+    if (patch_count > patch_limit || patch_count / (merge * merge) >= max_tokens)
+        throw std::invalid_argument("Image patches exceed the vision or text context");
+    const int patches = static_cast<int>(patch_count), count = patches / (merge * merge);
     const int cls = w.cls.data ? 1 : 0, rows = patches + cls;
     auto& scratch = ctx.scratch_arena();
     ArenaMark restore{scratch};
@@ -333,12 +415,23 @@ VisionEmbedding VisionEncoder::encode(CudaContext& ctx, const Image& image, int 
         ArenaMark temporary{scratch};
         HostTensor pixels({patches, 3 * P * P}, DType::F32);
         auto* dst = pixels.data<float>();
+        Image resized;
+        const Image* source = &image;
+        if (w.gemma4 && (image.width != gx * P || image.height != gy * P)) {
+            resized = resize_gemma4_image(image, gx * P, gy * P);
+            source = &resized;
+        }
         for (int y = 0; y < gy; ++y) for (int x = 0; x < gx; ++x) {
             for (int c = 0; c < 3; ++c) for (int py = 0; py < P; ++py) for (int px = 0; px < P; ++px) {
-                const auto sample = bilinear((x * P + px + 0.5f) * image.width / (gx * P) - 0.5f,
-                    (y * P + py + 0.5f) * image.height / (gy * P) - 0.5f, image.width, image.height,
-                    [&](int ix, int iy) { return image.rgb[(static_cast<size_t>(iy) * image.width + ix) * 3 + c] / 255.f; });
-                *dst++ = w.gemma4 ? sample * 2.0f - 1.0f : (sample - w.mean[c]) / w.stddev[c];
+                const int ix = x * P + px, iy = y * P + py;
+                if (w.gemma4) {
+                    *dst++ = source->rgb[(static_cast<size_t>(iy) * source->width + ix) * 3 + c] / 255.f * 2.f - 1.f;
+                    continue;
+                }
+                const auto sample = bilinear((ix + 0.5f) * image.width / (gx * P) - 0.5f,
+                    (iy + 0.5f) * image.height / (gy * P) - 0.5f, image.width, image.height,
+                    [&](int sx, int sy) { return image.rgb[(static_cast<size_t>(sy) * image.width + sx) * 3 + c] / 255.f; });
+                *dst++ = (sample - w.mean[c]) / w.stddev[c];
             }
         }
         const auto d_pixels = ctx.upload(pixels, false);
@@ -396,12 +489,11 @@ VisionEmbedding VisionEncoder::encode(CudaContext& ctx, const Image& image, int 
         } else {
             linear(x, l.q, q, rows); linear(x, l.k, k, rows); linear(x, l.v, v, rows);
         }
-        if (l.q_norm.weight.data) { auto t = alloc(rows, H); norm(q, l.q_norm, t, rows * g.heads, hd); q = t; }
-        if (l.k_norm.weight.data) { auto t = alloc(rows, H); norm(k, l.k_norm, t, rows * g.heads, hd); k = t; }
+        if (l.q_norm.weight.data) { norm(q, l.q_norm, a, rows * g.heads, hd); std::swap(q, a); }
+        if (l.k_norm.weight.data) { norm(k, l.k_norm, a, rows * g.heads, hd); std::swap(k, a); }
         if (w.v_norm.data) {
-            auto t = alloc(rows, H);
-            cuda_ops::rmsnorm_f32(v.ptr<float>(), w.v_norm.ptr<float>(), t.ptr<float>(), rows * g.heads, hd, w.eps, ctx.stream());
-            v = t;
+            cuda_ops::rmsnorm_f32(v.ptr<float>(), w.v_norm.ptr<float>(), a.ptr<float>(), rows * g.heads, hd, w.eps, ctx.stream());
+            std::swap(v, a);
         }
         if (w.theta) {
             cuda_ops::rope_2d_f32(q.ptr<float>(), gy, gx, g.heads, hd, w.theta, ctx.stream(), w.qwen);
@@ -434,19 +526,28 @@ VisionEmbedding VisionEncoder::encode(CudaContext& ctx, const Image& image, int 
         linear(a, l.o, x, rows);
         if (l.attn_post.weight.data) { norm(x, l.attn_post, a, rows, H); std::swap(x, a); }
         cuda_ops::add_residual_f32(x.ptr<float>(), hidden.ptr<float>(), hidden.ptr<float>(), rows * H, ctx.stream());
-        norm(hidden, l.ffn_norm, x, rows, H);
+        scratch.reset(temporary.mark);
         const int I = static_cast<int>(l.up.weight.shape[0]);
-        auto up = alloc(rows, I);
-        linear(x, l.up, up, rows);
-        if (l.gate.weight.data) {
-            auto gate = alloc(rows, I);
-            linear(x, l.gate, gate, rows);
-            (w.gelu ? cuda_ops::geglu_f32 : cuda_ops::swiglu_f32)(gate.ptr<float>(), up.ptr<float>(), up.ptr<float>(),
-                                                                rows * I, ctx.stream());
-        } else cuda_ops::vision_activation_f32(up.ptr<float>(), rows * I, w.gelu, w.quick, ctx.stream());
-        linear(up, l.down, a, rows);
-        if (l.ffn_post.weight.data) { norm(a, l.ffn_post, x, rows, H); std::swap(x, a); }
-        cuda_ops::add_residual_f32(a.ptr<float>(), hidden.ptr<float>(), hidden.ptr<float>(), rows * H, ctx.stream());
+        // The ViT MLP is independent across patches, so tile it to bound scratch at high resolutions.
+        const int batch = w.gemma4 ? std::min(rows, 1024) : rows;
+        for (int first = 0; first < rows; first += batch) {
+            ArenaMark tile{scratch};
+            const int n = std::min(batch, rows - first);
+            auto h = hidden.slice_dim0(first, n);
+            auto ffn_in = alloc(n, H), up = alloc(n, I);
+            norm(h, l.ffn_norm, ffn_in, n, H);
+            linear(ffn_in, l.up, up, n);
+            if (l.gate.weight.data) {
+                auto gate = alloc(n, I);
+                linear(ffn_in, l.gate, gate, n);
+                (w.gelu ? cuda_ops::geglu_f32 : cuda_ops::swiglu_f32)(gate.ptr<float>(), up.ptr<float>(), up.ptr<float>(),
+                                                                    n * I, ctx.stream());
+            } else cuda_ops::vision_activation_f32(up.ptr<float>(), n * I, w.gelu, w.quick, ctx.stream());
+            auto ffn_out = alloc(n, H);
+            linear(up, l.down, ffn_out, n);
+            if (l.ffn_post.weight.data) { norm(ffn_out, l.ffn_post, ffn_in, n, H); std::swap(ffn_in, ffn_out); }
+            cuda_ops::add_residual_f32(ffn_out.ptr<float>(), h.ptr<float>(), h.ptr<float>(), n * H, ctx.stream());
+        }
     }
     Tensor features = hidden.slice_dim0(cls, patches);
     if (w.post_norm.weight.data) { auto t = alloc(patches, H); norm(features, w.post_norm, t, patches, H); features = t; }
@@ -502,8 +603,12 @@ VisionPrompt encode_vision_prompt(CudaContext& ctx, const VisionEncoder& encoder
     VisionPrompt prompt;
     const bool qwen = qwen_projector(encoder.info().projector);
     const bool gemma = encoder.info().projector.starts_with("gemma");
-    const int32_t start = tokenizer.token_id(qwen ? "<|vision_start|>" : gemma ? "<start_of_image>" : "");
-    const int32_t end = tokenizer.token_id(qwen ? "<|vision_end|>" : gemma ? "<end_of_image>" : "");
+    const bool gemma4 = gemma4_projector(encoder.info().projector);
+    const int32_t start = tokenizer.token_id(qwen ? "<|vision_start|>" : gemma4 ? "<|image>" : gemma ? "<start_of_image>" : "");
+    const int32_t end = tokenizer.token_id(qwen ? "<|vision_end|>" : gemma4 ? "<image|>" : gemma ? "<end_of_image>" : "");
+    if (gemma4 && !images.empty() && (start < 0 || end < 0))
+        throw std::invalid_argument("Gemma 4 tokenizer must provide <|image> and <image|>");
+    // Gemma 4 uses the padding token for per-layer input lookups on projected image rows.
     const int32_t pad = std::max(0, tokenizer.token_id(qwen ? "<|image_pad|>" : "<pad>"));
     auto append = [&](std::string_view chunk, bool bos) {
         const auto ids = tokenizer.encode(std::string(chunk), bos);
